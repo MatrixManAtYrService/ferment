@@ -87,3 +87,26 @@ def test_probe_written_before_relaunch_is_stale(tmp_path):
     (result,) = read_probes(tmp_path, since=relaunched)
     assert result["stale"]
     assert not agreement([result], None)["agree"]
+
+
+def test_databases_speak_without_tls_and_only_dolt_is_versioned(tmp_path):
+    from ferment.databases import make_database
+
+    maria, dolt = make_database("mariadb", tmp_path), make_database("dolt", tmp_path)
+    # a cert minted under the fake clock would be rejected by real-time clients
+    assert "--skip-ssl" in maria.processes()[0].command
+    assert "--skip-ssl" in maria.client and "--skip-ssl" in dolt.client
+    assert not maria.versioned and dolt.versioned
+    assert f"--data-dir {tmp_path / 'dolt'}" in dolt.processes()[0].command
+    with pytest.raises(ValueError):
+        make_database("sqlite", tmp_path)
+
+
+def test_go_patch_hooks_the_one_time_now_call_site():
+    # nix/fakeable-go.nix substitutes this exact line; --replace-fail breaks
+    # the build (loudly) if a Go upgrade changes it.
+    from pathlib import Path
+
+    nix = (Path(__file__).parent.parent / "nix" / "fakeable-go.nix").read_text()
+    assert "'sec, nsec, mono := runtimeNow()'" in nix
+    assert "--replace-fail" in nix

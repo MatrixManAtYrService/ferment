@@ -16,7 +16,9 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/procompose.py` | `Process`, `render`, `WorkloadSupervisor` |
 | `ferment/server/` | `TimeController`, `create_app` (health/status/time) |
 | `ferment/clockcheck.py` | clock probes + agreement check |
+| `ferment/databases.py` | MariaDB / Dolt processes; Dolt checkpoints, log, diff, restore |
 | `ferment/config.py` | `~/.config/ferment/config.toml` |
+| `nix/fakeable-go.nix` | overlay: `fermentGo`, `fermentFakeable` (Go that obeys FAKETIME) |
 
 ## Dev environment (nix)
 
@@ -30,5 +32,9 @@ README.md: users only need uv.
   `ferment.ssh` so it works on every provider.
 - Faked processes get one shared offset (`FakeClock.env`), never libfaketime's
   start-at mode.
+- A Go program inside the faked tree must be built with `fermentFakeable`;
+  otherwise it silently runs on real time (stock Dolt's `NOW()` does).
+- No TLS between real-time and faked processes: certs minted under the fake
+  clock look not-yet-valid or expired to everyone else.
 - A provider that isn't built raises `NotImplementedError`, not a half-working
   implementation.

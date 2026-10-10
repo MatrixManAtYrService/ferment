@@ -23,6 +23,12 @@ ferment provides the pieces that make that practical:
   armed as a timer inside the guest, so a forgotten VM goes away on its own.
 - **faked time** (`ferment.faketime`): libfaketime in *offset* mode, so every
   process in the tree agrees on the time no matter when it started.
+- **fakeable Go** (`nix/fakeable-go.nix`, the flake's `overlays.default`):
+  libfaketime can't reach Go programs, so this patches Go's `time.Now()` to
+  honor the same `FAKETIME` offset. `fermentFakeable pkgs.dolt` gives a Dolt
+  whose `NOW()` and commit dates follow the fake clock.
+- **databases** (`ferment.databases`): MariaDB, or Dolt for checkpoints,
+  history, diffs between checkpoints, and hard restores.
 - **process-compose supervision** (`ferment.procompose`): one parent for the
   whole workload, so the whole workload shares one clock.
 - **time control** (`ferment.server`): a FastAPI app factory whose `/time`
@@ -48,8 +54,10 @@ change and given to every process, including ones spawned much later.
 
 libfaketime only affects programs that read the clock through libc. The JVM,
 Python, MariaDB, and coreutils do; Go binaries (process-compose, Grafana,
-Loki, Prometheus) don't. ferment uses that split on purpose: the supervisor
-and observability stay on real time, the workload is faked.
+Loki, Prometheus, Dolt) don't. ferment uses that split on purpose: the
+supervisor and observability stay on real time, the workload is faked. A Go
+program that belongs in the workload (Dolt) is rebuilt with ferment's patched
+Go toolchain, which reads the same `FAKETIME` offset.
 
 ## Development
 
