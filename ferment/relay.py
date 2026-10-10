@@ -9,6 +9,10 @@ URLs that work on the client work unchanged on the VM (package mirrors behind
 a VPN, say). Traffic flows only while some client session holds the forwards
 (`forwards()`, passed to ssh.run); otherwise connections are refused.
 
+The VM ports are fixed, so sessions share them: while one holds a relay,
+another's -R fails to bind (a warning) and its traffic rides on the first.
+If the first disconnects, the second loses the relay mid-whatever.
+
 NixOS guests only.
 """
 
@@ -69,13 +73,6 @@ def install_script(relays: list[Relay], *, socat: str = "nixpkgs#socat", inputs_
     if inputs_from:
         build += f" --inputs-from {shlex.quote(inputs_from)}"
     lines += [
-        # A session whose client vanished keeps its -R port bound, swallowing relayed
-        # traffic (lima's ssh-over-vsock never reports the disconnect). Have sshd drop them.
-        "if ! grep -q '^ClientAliveInterval' /etc/ssh/sshd_config; then",
-        "  tmp=$(mktemp)",
-        "  { printf 'ClientAliveInterval 5\\nClientAliveCountMax 3\\n'; cat /etc/ssh/sshd_config; } > \"$tmp\"",
-        '  sudo install -m 644 "$tmp" /etc/ssh/sshd_config && rm -f "$tmp"',
-        "fi",
         # A store symlink until now; a real file lasts until the next NixOS activation.
         'if [ -L /etc/hosts ]; then sudo cp --remove-destination "$(readlink -f /etc/hosts)" /etc/hosts; fi',
         "printf '%s\\n' "

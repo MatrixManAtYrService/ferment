@@ -108,7 +108,8 @@ class Forward:
         return ["-L", f"127.0.0.1:{self.local}:127.0.0.1:{self.remote}"]
 
 
-def tunnel_argv(target: SshTarget, forwards: list[Forward]) -> list[str]:
+def tunnel_argv(target: SshTarget, forwards: list[Forward], *, strict: bool = True) -> list[str]:
+    """`ssh -N` holding `forwards`; strict: exit if any of them can't be set up."""
     args = target.argv()
     host = args.pop()  # ssh options must precede the destination
     args += [
@@ -121,7 +122,7 @@ def tunnel_argv(target: SshTarget, forwards: list[Forward]) -> list[str]:
         "-o",
         "ControlPath=none",
         "-o",
-        "ExitOnForwardFailure=yes",
+        f"ExitOnForwardFailure={'yes' if strict else 'no'}",
         "-o",
         "ServerAliveInterval=15",
         "-o",
@@ -133,9 +134,14 @@ def tunnel_argv(target: SshTarget, forwards: list[Forward]) -> list[str]:
     return args
 
 
-def hold_tunnel(target: SshTarget, forwards: list[Forward]) -> int:
-    """Run the tunnel in the foreground until ssh exits (or ctrl-c)."""
+def hold_tunnel(target: SshTarget, forwards: list[Forward], best_effort: list[Forward] | None = None) -> int:
+    """Run the tunnel in the foreground until ssh exits (or ctrl-c).
+
+    `best_effort` forwards ride a second ssh process, so one that can't be
+    set up (a relay port another session holds) doesn't take `forwards` down.
+    """
     proc = subprocess.Popen(tunnel_argv(target, forwards))
+    side = subprocess.Popen(tunnel_argv(target, best_effort, strict=False)) if best_effort else None
 
     # Closing the terminal (SIGHUP) or being killed (SIGTERM) is a detach too:
     # route both through the same cleanup as ctrl-c.
@@ -151,3 +157,7 @@ def hold_tunnel(target: SshTarget, forwards: list[Forward]) -> int:
         proc.wait()
         print("tunnel closed", file=sys.stderr)
         return 0
+    finally:
+        if side is not None:
+            side.terminate()
+            side.wait()

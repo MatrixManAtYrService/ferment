@@ -64,6 +64,11 @@ def test_tunnel_options_precede_destination():
     assert "127.0.0.1:18443:nexus:443" in argv
     # never ride a shared control master: the tunnel must die with its process
     assert "ControlMaster=no" in argv
+    assert "ExitOnForwardFailure=yes" in argv
+    # best-effort (relays): a port another session holds is not fatal
+    assert "ExitOnForwardFailure=no" in tunnel_argv(
+        target, [Forward(0, 18443, reverse=True, dest="n:443")], strict=False
+    )
 
 
 def test_commands_can_carry_forwards():
@@ -87,8 +92,6 @@ def test_relays_get_their_own_loopback_address_and_port():
     assert "127.77.0.1 mirror.example # ferment-relay" in script
     assert "--inputs-from path:/vm 'nixpkgs#socat'" in script
     assert "TCP-LISTEN:8080,bind=127.77.0.2,reuseaddr,fork TCP:127.0.0.1:18441" in script
-    # dead sessions must not keep holding the relay ports
-    assert "ClientAliveInterval" in script
     # [] still clears earlier relays, without touching nix or a pristine /etc/hosts
     empty = relay.install_script([])
     assert "systemctl stop 'ferment-relay-*'" in empty and "socat" not in empty and "cp " not in empty
@@ -206,3 +209,15 @@ def test_authorize_key_goes_through_limas_own_ssh_config(monkeypatch, tmp_path):
     assert "ssh-ed25519 AAAA teammate" in script and "grep -qxF" in script  # idempotent
     with pytest.raises(Exception, match="public key"):
         p.authorize_key("mine", "-----BEGIN OPENSSH PRIVATE KEY-----")
+
+
+def test_lima_create_makes_sshd_drop_vanished_clients(monkeypatch, tmp_path):
+    from ferment.vm.base import VMSpec
+
+    p = _lima("mac", monkeypatch, tmp_path)
+    new = {"name": "new", "status": "Running", "dir": "/h/.lima/new", "sshConfigFile": "/h/.lima/new/ssh.config"}
+    started = lambda: any(s.startswith("limactl start") for s, _ in p.lima.scripts)  # noqa: E731
+    monkeypatch.setattr(p, "_instances", lambda: {"new": dict(new)} if started() else {})
+    p.create(VMSpec(name="new", ttl=dt.timedelta(hours=1)))
+    guest = [s for s, _ in p.lima.scripts if s.startswith("ssh -F /h/.lima/new/ssh.config lima-new")]
+    assert any("ClientAliveInterval" in s for s in guest)

@@ -43,6 +43,17 @@ IMAGES = [
 
 RECORD = "ferment.json"
 
+# vz carries ssh over vsock and the guest never learns that a client went away:
+# sessions linger, keeping their -R ports bound. Have sshd probe and drop them.
+# Each vsock connection runs a fresh `sshd -i`, so this applies to the next one.
+SSHD_KEEPALIVE = """\
+if ! grep -q '^ClientAliveInterval' /etc/ssh/sshd_config; then
+  tmp=$(mktemp)
+  { printf 'ClientAliveInterval 5\\nClientAliveCountMax 3\\n'; cat /etc/ssh/sshd_config; } > "$tmp"
+  sudo install -m 644 "$tmp" /etc/ssh/sshd_config && rm -f "$tmp"
+fi
+"""
+
 
 def lima_config(spec: VMSpec) -> dict:
     return {
@@ -142,6 +153,11 @@ class LimaProvider(Provider):
         path = shlex.quote(f"{inst['dir']}/{RECORD}")
         self.lima.run(f"cat > {path}", input=json.dumps(record, indent=2) + "\n")
 
+    def _guest(self, inst: dict, script: str) -> None:
+        """Run `script` in the guest with Lima's own key, which only the Lima host holds."""
+        cfg = shlex.quote(inst["sshConfigFile"])
+        self.lima.run(f"ssh -F {cfg} lima-{shlex.quote(inst['name'])} -- {shlex.quote(script)}")
+
     def _info(self, inst: dict) -> VMInfo:
         record = inst["record"] or {}
         deadline = record.get("delete_after")
@@ -175,6 +191,7 @@ class LimaProvider(Provider):
         record = {"delete_after": (utcnow() + spec.ttl).isoformat(), "labels": spec.labels}
         self._write_record(inst, record)
         inst["record"] = record
+        self._guest(inst, SSHD_KEEPALIVE)
         for key in spec.authorized_keys:
             self.authorize_key(spec.name, key)
         return self._info(inst)
@@ -192,19 +209,17 @@ class LimaProvider(Provider):
         self._write_record(inst, record)
 
     def authorize_key(self, name: str, public_key: str) -> None:
-        """Let `public_key` log in to the VM. Goes through Lima's own key,
-        which only the Lima host holds."""
+        """Let `public_key` log in to the VM."""
         inst = self._instance(name)
         key = public_key.strip()
         if not key.startswith("ssh-"):
             raise ProviderError("that doesn't look like an ssh public key")
         q, keys = shlex.quote(key), "~/.ssh/authorized_keys"
-        install = (
+        self._guest(
+            inst,
             f"mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch {keys} && "
-            f"(grep -qxF {q} {keys} || echo {q} >> {keys}) && chmod 600 {keys}"
+            f"(grep -qxF {q} {keys} || echo {q} >> {keys}) && chmod 600 {keys}",
         )
-        cfg = shlex.quote(inst["sshConfigFile"])
-        self.lima.run(f"ssh -F {cfg} lima-{shlex.quote(name)} -- {shlex.quote(install)}")
 
     def ssh_target(self, name: str) -> SshTarget:
         inst = self._instance(name)
