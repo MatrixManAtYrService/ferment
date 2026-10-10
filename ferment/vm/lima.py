@@ -1,9 +1,16 @@
-"""Local VMs via Lima (macOS vz, or qemu on Linux), booting a NixOS image.
+"""VMs via Lima (macOS vz, or qemu on Linux), booting a NixOS image.
 
 Free and fast to iterate on, and close enough to a cloud VM for everything
 above the provider: the VM is reached only over ssh (Lima's own port
 forwarding and home-directory mounts are switched off so nothing works here
 that would not work in the cloud).
+
+The Lima host can be this machine or another one (`host`: an ssh
+destination). Remotely, every limactl call runs over ssh, and clients reach
+the VM's sshd by jumping through the host (ProxyJump), the same shape as
+reaching a cloud VM through a bastion or IAP. Either way the client logs in to
+the VM with its own key (`authorized_keys` on the spec, or `authorize_key`
+later), never with Lima's.
 
 Lima has no labels or instance metadata, so ferment keeps its own record in
 the instance directory: <lima instance dir>/ferment.json. Only instances that
@@ -14,9 +21,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import shlex
 import subprocess
-from pathlib import Path
 
+from ferment.identity import client_key
 from ferment.vm.base import Provider, ProviderError, SshTarget, VMInfo, VMSpec, utcnow
 
 # Same image pixiebox runs on (nixos-lima v0.0.5): NixOS, nix preinstalled.
@@ -58,75 +66,84 @@ def lima_config(spec: VMSpec) -> dict:
     }
 
 
+class LimaHost:
+    """Where limactl runs: here (host=None) or over ssh on `host`.
+
+    Commands are shell scripts; remotely they're interpreted by the login
+    shell of the host (often zsh on macOS), so keep them POSIX.
+    """
+
+    def __init__(self, host: str | None, limactl: str = "limactl"):
+        self.host = host or None
+        self.limactl = limactl
+
+    def run(self, script: str, *, input: str | None = None, capture: bool = True) -> str:
+        argv = ["ssh", "-o", "BatchMode=yes", self.host, "--", script] if self.host else ["bash", "-c", script]
+        try:
+            result = subprocess.run(argv, input=input, text=True, capture_output=capture, check=True)
+        except FileNotFoundError as e:
+            raise ProviderError(f"{argv[0]} not found: {e}")
+        except subprocess.CalledProcessError as e:
+            where = f" on {self.host}" if self.host else ""
+            detail = (e.stderr or "").strip() if capture else f"exit {e.returncode}"
+            raise ProviderError(f"{script.split()[0]}{where} failed: {detail}")
+        return result.stdout if capture else ""
+
+    def limactl_cmd(self, *args: str) -> str:
+        return " ".join(shlex.quote(a) for a in (self.limactl, *args))
+
+
 class LimaProvider(Provider):
     name = "lima"
 
-    def __init__(self, cpus: int | None = None, memory_gib: int | None = None, disk_gib: int | None = None):
+    def __init__(
+        self,
+        host: str | None = None,
+        limactl: str = "limactl",
+        cpus: int | None = None,
+        memory_gib: int | None = None,
+        disk_gib: int | None = None,
+    ):
+        self.lima = LimaHost(host, limactl)
         self.defaults = {k: v for k, v in {"cpus": cpus, "memory_gib": memory_gib, "disk_gib": disk_gib}.items() if v}
 
-    # -- limactl ------------------------------------------------------------
+    # -- host-side state ----------------------------------------------------
 
-    def _limactl(self, *args: str, capture: bool = True) -> str:
-        cmd = ["limactl", *args]
-        try:
-            result = subprocess.run(cmd, check=True, text=True, capture_output=capture)
-        except FileNotFoundError:
-            raise ProviderError("limactl not found; install Lima (https://lima-vm.io)")
-        except subprocess.CalledProcessError as e:
-            detail = (e.stderr or "").strip()
-            raise ProviderError(f"{' '.join(cmd)} failed: {detail}")
-        return result.stdout if capture else ""
-
-    def _instances(self) -> list[dict]:
-        out = self._limactl("list", "--format", "json")
-        return [json.loads(line) for line in out.splitlines() if line.strip()]
-
-    @staticmethod
-    def _record(inst: dict) -> dict | None:
-        path = Path(inst.get("dir", "")) / RECORD
-        if not path.exists():
-            return None
-        return json.loads(path.read_text())
+    def _instances(self) -> dict[str, dict]:
+        """name -> limactl's instance info, plus `record` (ferment.json, or None)."""
+        out = self.lima.run(
+            self.lima.limactl_cmd("list", "--format", "json")
+            + "; echo ---records---; "
+            + 'find "${LIMA_HOME:-$HOME/.lima}" -mindepth 2 -maxdepth 2 -name '
+            + RECORD
+            + ' | while read -r f; do printf "%s\t" "$(basename "$(dirname "$f")")"; tr -d "\n" < "$f"; echo; done'
+        )
+        listing, _, records = out.partition("---records---")
+        instances = {}
+        for line in listing.splitlines():
+            if line.strip():
+                inst = json.loads(line)
+                instances[inst["name"]] = {**inst, "record": None}
+        for line in records.splitlines():
+            if "\t" in line:
+                name, raw = line.split("\t", 1)
+                if name in instances:
+                    instances[name]["record"] = json.loads(raw)
+        return instances
 
     def _instance(self, name: str) -> dict:
-        for inst in self._instances():
-            if inst.get("name") == name and self._record(inst) is not None:
-                return inst
-        raise ProviderError(f"no lima VM named {name!r} managed by ferment")
-
-    # -- Provider -----------------------------------------------------------
-
-    def create(self, spec: VMSpec) -> VMInfo:
-        for key, value in self.defaults.items():
-            setattr(spec, key, value)
-        if any(inst.get("name") == spec.name for inst in self._instances()):
-            raise ProviderError(f"a lima instance named {spec.name!r} already exists")
-
-        import yaml
-
-        cfg = yaml.safe_dump(lima_config(spec), sort_keys=False)
-        # limactl reads the template from stdin with "-"; output streams to the
-        # terminal (first boot downloads the image, which takes a while).
-        try:
-            subprocess.run(
-                ["limactl", "start", "--tty=false", f"--name={spec.name}", "-"],
-                input=cfg,
-                text=True,
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            raise ProviderError(f"limactl start {spec.name} failed (exit {e.returncode})")
-
-        delete_after = utcnow() + spec.ttl
-        inst = next(i for i in self._instances() if i.get("name") == spec.name)
-        self._write_record(inst, {"delete_after": delete_after.isoformat(), "labels": spec.labels})
-        return self._info(inst)
+        inst = self._instances().get(name)
+        if inst is None or inst["record"] is None:
+            where = f" on {self.lima.host}" if self.lima.host else ""
+            raise ProviderError(f"no lima VM named {name!r} managed by ferment{where}")
+        return inst
 
     def _write_record(self, inst: dict, record: dict) -> None:
-        (Path(inst["dir"]) / RECORD).write_text(json.dumps(record, indent=2) + "\n")
+        path = shlex.quote(f"{inst['dir']}/{RECORD}")
+        self.lima.run(f"cat > {path}", input=json.dumps(record, indent=2) + "\n")
 
     def _info(self, inst: dict) -> VMInfo:
-        record = self._record(inst) or {}
+        record = inst["record"] or {}
         deadline = record.get("delete_after")
         return VMInfo(
             name=inst["name"],
@@ -136,22 +153,75 @@ class LimaProvider(Provider):
             labels=record.get("labels", {}),
         )
 
+    # -- Provider -----------------------------------------------------------
+
+    def create(self, spec: VMSpec) -> VMInfo:
+        for key, value in self.defaults.items():
+            setattr(spec, key, value)
+        if spec.name in self._instances():
+            raise ProviderError(f"a lima instance named {spec.name!r} already exists")
+
+        import yaml
+
+        cfg = yaml.safe_dump(lima_config(spec), sort_keys=False)
+        # limactl reads the template from stdin with "-"; its progress streams
+        # to the terminal (first boot downloads the image, which takes a while).
+        self.lima.run(
+            self.lima.limactl_cmd("start", "--tty=false", f"--name={spec.name}", "-"),
+            input=cfg,
+            capture=False,
+        )
+        inst = self._instances()[spec.name]
+        record = {"delete_after": (utcnow() + spec.ttl).isoformat(), "labels": spec.labels}
+        self._write_record(inst, record)
+        inst["record"] = record
+        for key in spec.authorized_keys:
+            self.authorize_key(spec.name, key)
+        return self._info(inst)
+
     def list(self) -> list[VMInfo]:
-        return [self._info(inst) for inst in self._instances() if self._record(inst) is not None]
+        return [self._info(inst) for inst in self._instances().values() if inst["record"] is not None]
 
     def delete(self, name: str) -> None:
         self._instance(name)  # refuse to delete instances ferment didn't make
-        self._limactl("delete", "--force", name)
+        self.lima.run(self.lima.limactl_cmd("delete", "--force", name))
 
     def set_deadline(self, name: str, delete_after: dt.datetime) -> None:
         inst = self._instance(name)
-        record = self._record(inst) or {}
-        record["delete_after"] = delete_after.isoformat()
+        record = {**inst["record"], "delete_after": delete_after.isoformat()}
         self._write_record(inst, record)
+
+    def authorize_key(self, name: str, public_key: str) -> None:
+        """Let `public_key` log in to the VM. Goes through Lima's own key,
+        which only the Lima host holds."""
+        inst = self._instance(name)
+        key = public_key.strip()
+        if not key.startswith("ssh-"):
+            raise ProviderError("that doesn't look like an ssh public key")
+        q, keys = shlex.quote(key), "~/.ssh/authorized_keys"
+        install = (
+            f"mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch {keys} && "
+            f"(grep -qxF {q} {keys} || echo {q} >> {keys}) && chmod 600 {keys}"
+        )
+        cfg = shlex.quote(inst["sshConfigFile"])
+        self.lima.run(f"ssh -F {cfg} lima-{shlex.quote(name)} -- {shlex.quote(install)}")
 
     def ssh_target(self, name: str) -> SshTarget:
         inst = self._instance(name)
         if inst.get("status") != "Running":
             raise ProviderError(f"lima VM {name!r} is {inst.get('status')}, not Running")
-        # Lima writes a complete ssh config (key, user, port) per instance.
-        return SshTarget(host=f"lima-{name}", config_file=inst["sshConfigFile"])
+        cfg = shlex.quote(inst["sshConfigFile"])
+        user = self.lima.run(f"awk '$1 == \"User\" {{print $2; exit}}' {cfg}").strip()
+        key, _ = client_key()
+        options = {
+            "IdentityFile": str(key),
+            "IdentitiesOnly": "yes",
+            # Ephemeral VM on the host's loopback: its host key is new every
+            # time and the port gets reused. Lima itself does the same.
+            "StrictHostKeyChecking": "no",
+            "UserKnownHostsFile": "/dev/null",
+            "LogLevel": "ERROR",
+        }
+        if self.lima.host:
+            options["ProxyJump"] = self.lima.host
+        return SshTarget(host="127.0.0.1", port=inst["sshLocalPort"], user=user, options=options)

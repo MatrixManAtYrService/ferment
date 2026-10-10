@@ -25,6 +25,8 @@ class VMSpec:
     memory_gib: int = 8
     disk_gib: int = 50
     labels: dict[str, str] = field(default_factory=dict)
+    # Public keys allowed to ssh in as the VM's user (at least the creator's).
+    authorized_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -106,4 +108,10 @@ class Provider(ABC):
         """Move the delete-me date (extend, or shorten)."""
 
     @abstractmethod
-    def ssh_target(self, name: str) -> SshTarget: ...
+    def ssh_target(self, name: str) -> SshTarget:
+        """How this client reaches the VM, logging in with its own key
+        (ferment.identity.client_key)."""
+
+    @abstractmethod
+    def authorize_key(self, name: str, public_key: str) -> None:
+        """Let another public key log in (sharing a VM with a teammate)."""

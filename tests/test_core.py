@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import os
 import time
 
@@ -110,3 +111,68 @@ def test_go_patch_hooks_the_one_time_now_call_site():
     nix = (Path(__file__).parent.parent / "nix" / "fakeable-go.nix").read_text()
     assert "'sec, nsec, mono := runtimeNow()'" in nix
     assert "--replace-fail" in nix
+
+
+class FakeLimaHost:
+    """Stands in for limactl (local or over ssh): records scripts, replays output."""
+
+    def __init__(self, host):
+        self.host, self.limactl, self.scripts = host, "limactl", []
+
+    def limactl_cmd(self, *args):
+        return " ".join(("limactl", *args))
+
+    def run(self, script, *, input=None, capture=True):
+        self.scripts.append((script, input))
+        if script.startswith("limactl list"):
+            listing = [
+                {
+                    "name": "mine",
+                    "status": "Running",
+                    "dir": "/h/.lima/mine",
+                    "sshLocalPort": 6022,
+                    "sshConfigFile": "/h/.lima/mine/ssh.config",
+                },
+                {"name": "notmine", "status": "Running", "dir": "/h/.lima/notmine"},
+            ]
+            record = {"delete_after": "2026-10-13T00:00:00+00:00", "labels": {"ferment-owner": "me"}}
+            return "\n".join(json.dumps(i) for i in listing) + "\n---records---\nmine\t" + json.dumps(record) + "\n"
+        if script.startswith("awk"):
+            return "lima\n"
+        return ""
+
+
+def _lima(host, monkeypatch, tmp_path):
+    from ferment.vm import lima
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    p = lima.LimaProvider(host=host)
+    p.lima = FakeLimaHost(host)
+    return p
+
+
+def test_lima_lists_only_its_own_instances(monkeypatch, tmp_path):
+    p = _lima("mac", monkeypatch, tmp_path)
+    (vm,) = p.list()
+    assert vm.name == "mine" and vm.labels == {"ferment-owner": "me"}
+    with pytest.raises(Exception, match="managed by ferment on mac"):
+        p.delete("notmine")
+
+
+def test_remote_lima_target_jumps_through_the_host_with_ferments_key(monkeypatch, tmp_path):
+    remote = _lima("matt@mac", monkeypatch, tmp_path).ssh_target("mine")
+    assert (remote.host, remote.port, remote.user) == ("127.0.0.1", 6022, "lima")
+    assert remote.options["ProxyJump"] == "matt@mac"
+    assert remote.options["IdentityFile"].startswith(str(tmp_path))  # ferment's key, not ~/.ssh
+    local = _lima(None, monkeypatch, tmp_path).ssh_target("mine")
+    assert "ProxyJump" not in local.options
+
+
+def test_authorize_key_goes_through_limas_own_ssh_config(monkeypatch, tmp_path):
+    p = _lima("mac", monkeypatch, tmp_path)
+    p.authorize_key("mine", "ssh-ed25519 AAAA teammate\n")
+    script = p.lima.scripts[-1][0]
+    assert script.startswith("ssh -F /h/.lima/mine/ssh.config lima-mine")
+    assert "ssh-ed25519 AAAA teammate" in script and "grep -qxF" in script  # idempotent
+    with pytest.raises(Exception, match="public key"):
+        p.authorize_key("mine", "-----BEGIN OPENSSH PRIVATE KEY-----")

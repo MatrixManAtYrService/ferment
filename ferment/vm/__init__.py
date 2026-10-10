@@ -14,7 +14,7 @@ class NotImplementedProvider(Provider):
     def _no(self, *_args, **_kwargs):
         raise NotImplementedError(f"the {self.name!r} VM provider is not implemented yet")
 
-    create = list = delete = set_deadline = ssh_target = _no  # type: ignore[assignment]
+    create = list = delete = set_deadline = ssh_target = authorize_key = _no  # type: ignore[assignment]
 
 
 def get_provider(name: str, **options) -> Provider:
