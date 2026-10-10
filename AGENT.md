@@ -10,7 +10,8 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | Module | What |
 |---|---|
 | `ferment/vm/` | provider contract (`base.py`), `lima.py`, placeholders for gcp/aws |
-| `ferment/ssh.py` | run, push_dir (tar over ssh), tunnels (`Forward`, -L and -R) |
+| `ferment/ssh.py` | run (optionally holding forwards), push_dir (tar over ssh), tunnels (`Forward`, -L and -R) |
+| `ferment/relay.py` | make a client-reachable `host:port` appear on a NixOS VM under its own name (`-R` + /etc/hosts + socat) |
 | `ferment/lifetime.py` | durations, in-guest poweroff timer |
 | `ferment/faketime.py` | `FakeClock`: libfaketime offset-mode env |
 | `ferment/procompose.py` | `Process`, `render`, `WorkloadSupervisor` |

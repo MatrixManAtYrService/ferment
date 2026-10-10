@@ -22,10 +22,36 @@ from ferment.vm.base import SshTarget
 PUSH_EXCLUDES = [".git", ".venv", ".direnv", "__pycache__", "*.pyc", ".pytest_cache", ".ruff_cache", "result"]
 
 
-def run(target: SshTarget, command: str, *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    """Run a shell command on the VM (as the ssh user; prefix sudo yourself)."""
+def argv(target: SshTarget, forwards: list[Forward] | None = None) -> list[str]:
+    """ssh to the VM, carrying `forwards` for as long as the session lasts.
+
+    A forward that can't be set up (say another session already holds the
+    same -R port) is a warning, not a failure: the other session's forward
+    leads to the same place.
+    """
+    args = target.argv()
+    if not forwards:
+        return args
+    host = args.pop()
+    args += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    for fwd in forwards:
+        args += fwd.ssh_args()
+    args.append(host)
+    return args
+
+
+def run(
+    target: SshTarget,
+    command: str,
+    *,
+    check: bool = True,
+    capture: bool = False,
+    forwards: list[Forward] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a shell command on the VM (as the ssh user; prefix sudo yourself),
+    with `forwards` held open while it runs."""
     return subprocess.run(
-        [*target.argv(), "--", command],
+        [*argv(target, forwards), "--", command],
         check=check,
         text=True,
         capture_output=capture,

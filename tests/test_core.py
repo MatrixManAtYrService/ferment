@@ -66,6 +66,36 @@ def test_tunnel_options_precede_destination():
     assert "ControlMaster=no" in argv
 
 
+def test_commands_can_carry_forwards():
+    from ferment import ssh
+
+    target = SshTarget(host="vm", user="me")
+    assert ssh.argv(target) == ["ssh", "me@vm"]
+    argv = ssh.argv(target, [Forward(0, 18440, reverse=True, dest="mirror:443")])
+    assert argv[-1] == "me@vm" and "127.0.0.1:18440:mirror:443" in argv
+    # a relay another session already holds must not abort this one
+    assert "ExitOnForwardFailure=yes" not in argv
+
+
+def test_relays_get_their_own_loopback_address_and_port():
+    from ferment import relay
+
+    a, b = relay.relays(["mirror.example:443", "cache.example:8080"])
+    assert (a.address, a.vm_port, b.address, b.vm_port) == ("127.77.0.1", 18440, "127.77.0.2", 18441)
+    assert relay.forwards([a])[0].ssh_args() == ["-R", "127.0.0.1:18440:mirror.example:443"]
+    script = relay.install_script([a, b], inputs_from="path:/vm")
+    assert "127.77.0.1 mirror.example # ferment-relay" in script
+    assert "--inputs-from path:/vm 'nixpkgs#socat'" in script
+    assert "TCP-LISTEN:8080,bind=127.77.0.2,reuseaddr,fork TCP:127.0.0.1:18441" in script
+    # dead sessions must not keep holding the relay ports
+    assert "ClientAliveInterval" in script
+    # [] still clears earlier relays, without touching nix or a pristine /etc/hosts
+    empty = relay.install_script([])
+    assert "systemctl stop 'ferment-relay-*'" in empty and "socat" not in empty and "cp " not in empty
+    with pytest.raises(ValueError):
+        relay.relays(["no-port"])
+
+
 def test_durations():
     assert parse_duration("72h") == dt.timedelta(hours=72)
     with pytest.raises(ValueError):
