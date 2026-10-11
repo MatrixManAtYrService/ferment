@@ -1,6 +1,8 @@
 """SQL databases a fermenter's workload runs on.
 
-Both speak the MySQL protocol on 127.0.0.1:<port>.
+Both speak the MySQL protocol on 127.0.0.1:<port>. On a split fermenter
+(docs/split-vms.md) MySQL also listens on the workload VM's private network
+(`bind`), and the control VM reaches it there (`reached_at`): checkpoints, SQL.
 
 - MySQL 8.4 (the default): the line production runs, so services, their
   migrations, and their queries behave as they do in production. Root over
@@ -16,6 +18,7 @@ as not yet valid.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import os
 import shlex
@@ -87,11 +90,30 @@ class MariaDB(Database):
 
 class MySQL(Database):
     """MySQL 8.4 from FERMENT_MYSQL_BIN (by path: MariaDB's packages also
-    install `mysql`/`mysqldump` names)."""
+    install `mysql`/`mysqldump` names).
 
-    def __init__(self, state_dir: Path, port: int = 3306, bin_dir: str | None = None):
+    `host`: where clients connect. `bind`: where the server listens; off
+    loopback, root may also log in from elsewhere (no password: the sandbox is
+    a private network between a fermenter's VMs)."""
+
+    def __init__(
+        self,
+        state_dir: Path,
+        port: int = 3306,
+        bin_dir: str | None = None,
+        host: str = "127.0.0.1",
+        bind: str = "127.0.0.1",
+    ):
         super().__init__("mysql", state_dir, port)
         self.bin = bin_dir if bin_dir is not None else os.environ.get("FERMENT_MYSQL_BIN", "")
+        self.host = host
+        self.bind = bind
+
+    def reached_at(self, host: str) -> MySQL:
+        """The same server, as a client on another machine reaches it."""
+        other = copy.copy(self)
+        other.host = host
+        return other
 
     @property
     def data_dir(self) -> Path:
@@ -101,7 +123,7 @@ class MySQL(Database):
         return str(Path(self.bin) / name) if self.bin else name
 
     def client_args(self, port: int | None = None) -> list[str]:
-        return [self.tool("mysql"), "--no-defaults", "-h", "127.0.0.1", "-P", str(port or self.port), "-uroot"]
+        return [self.tool("mysql"), "--no-defaults", "-h", self.host, "-P", str(port or self.port), "-uroot"]
 
     @property
     def client(self) -> str:
@@ -116,7 +138,11 @@ class MySQL(Database):
         d = shlex.quote(str(self.data_dir))
         init = shlex.quote(str(self._init_file))
         mysqld = shlex.quote(self.tool("mysqld"))
-        sql = "CREATE USER IF NOT EXISTS 'root'@'127.0.0.1'; GRANT ALL ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;"
+        hosts = ["127.0.0.1"] + (["%"] if self.bind != "127.0.0.1" else [])
+        sql = " ".join(
+            f"CREATE USER IF NOT EXISTS 'root'@'{h}'; GRANT ALL ON *.* TO 'root'@'{h}' WITH GRANT OPTION;"
+            for h in hosts
+        )
         return (
             f"mkdir -p {shlex.quote(str(self.state_dir))}; echo {shlex.quote(sql)} > {init}; "
             f"[ -d {d}/mysql ] || {mysqld} --no-defaults --initialize-insecure --datadir={d} >/dev/null 2>&1"
@@ -133,7 +159,7 @@ class MySQL(Database):
     def _server_args(self, port: int, socket: Path) -> list[str]:
         return [
             self.tool("mysqld"), "--no-defaults", f"--datadir={self.data_dir}", f"--port={port}",
-            f"--socket={socket}", "--bind-address=127.0.0.1", "--mysqlx=OFF",
+            f"--socket={socket}", f"--bind-address={self.bind}", "--mysqlx=OFF",
             f"--pid-file={self.state_dir / f'mysql84.{port}.pid'}", f"--init-file={self._init_file}",
         ]  # fmt: skip
 
@@ -151,9 +177,7 @@ class MySQL(Database):
     # -- for the archive -----------------------------------------------------------
 
     def connect(self, port: int | None = None, database: str | None = None) -> pymysql.Connection:
-        return pymysql.connect(
-            host="127.0.0.1", port=port or self.port, user="root", database=database, autocommit=True
-        )
+        return pymysql.connect(host=self.host, port=port or self.port, user="root", database=database, autocommit=True)
 
     def databases(self, port: int | None = None) -> list[str]:
         with self.connect(port) as conn, conn.cursor() as cur:
@@ -181,7 +205,7 @@ class MySQL(Database):
 
     def dump(self, database: str, port: int, out: Path, *, routines: bool, extra: list[str] = ()) -> None:  # type: ignore[assignment]
         """Tables (with data and triggers), or only the stored routines."""
-        args = [self.tool("mysqldump"), "--no-defaults", "-h", "127.0.0.1", "-P", str(port), "-uroot",
+        args = [self.tool("mysqldump"), "--no-defaults", "-h", self.host, "-P", str(port), "-uroot",
                 "--single-transaction", "--set-gtid-purged=OFF", "--no-tablespaces", *extra]  # fmt: skip
         if routines:
             args += ["--routines", "--no-create-info", "--no-data", "--skip-triggers"]
@@ -200,9 +224,11 @@ class MySQL(Database):
             raise DatabaseError(f"loading {database}: {result.stderr.strip()[-2000:]}")
 
 
-def make_database(kind: str, state_dir: Path, port: int = 3306) -> Database:
+def make_database(kind: str, state_dir: Path, port: int = 3306, bind: str = "127.0.0.1") -> Database:
+    """`bind`: MySQL's listen address (MariaDB stays on loopback: a split
+    fermenter needs MySQL)."""
     if kind == "mysql":
-        return MySQL(state_dir, port)
+        return MySQL(state_dir, port, bind=bind)
     if kind == "mariadb":
         return MariaDB(state_dir, port)
     raise ValueError(f"unknown database {kind!r} (mysql, mariadb)")

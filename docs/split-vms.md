@@ -1,6 +1,7 @@
 # Design: a fermenter is two VMs
 
-Status: proposed (2026-10-11). Nothing here is built yet.
+Status (2026-10-11): steps 1 and 2 are built (see [Steps](#steps)); new
+fermenters are split by default.
 
 ## Problem
 
@@ -45,7 +46,7 @@ control VM — real time (NTP)                    workload VM — fake time
   builds (Maven, uv, nix)               private   process-compose: MySQL, services,
   Dolt archive, server SQLite           network     Airflow, ...
   Loki, Prometheus, Grafana                       system clock set by the agent
-  relay endpoints, socat port proxies             no outbound TLS, no internet
+  relay endpoints                                 no outbound TLS
 ```
 
 **The control VM** is what "the fermenter" means to clients. It runs the
@@ -87,7 +88,7 @@ The agent is the same `ferment` package with a different entry point
 | Process logs | `logs/<name>.log` on the VM | written on the workload VM; control pulls them from the agent by offset (as `fmnt process-log` does now) |
 | Loki ingestion | n/a | control stamps lines with real receive time and adds `fake_time` as a field. Not Alloy on the workload VM: it would stamp lines with the fake clock, and Loki would reject them. |
 | Metrics | n/a | Prometheus on control scrapes the workload VM. Scrape time is Prometheus's clock, so it's real time automatically. |
-| Client ports (`attach -L`) | VM loopback | control runs socat port proxies to the workload VM (the same trick as relays), so an older attach's forwards keep working |
+| Client ports (`attach -L`) | VM loopback | unchanged: attach forwards only the server's port, which is on control. Once it forwards workload ports, control proxies them (socat, as relays do), so older attaches keep working |
 | Relays (`-R`) | VM | control VM only; the workload doesn't build, so it needs no mirror |
 | Delete-me timer | in-guest `--on-active` timer (monotonic, so clock changes don't move it) | the same timer armed on both VMs; the provider records one deadline for the pair |
 | `fermenter ssh` | the VM | control by default; `--workload` jumps through control |
@@ -95,11 +96,25 @@ The agent is the same `ferment` package with a different entry point
 ### Provider changes
 
 `Provider.create` makes both VMs and a private network between them. On Lima,
-that's the `user-v2` network, which supports VM-to-VM traffic (still to be
-verified with vz). On GCP it would be one VPC with no external IP on the
+that's the `user-v2` network: with vz and the NixOS image it's each VM's only
+NIC, the VMs reach each other as `lima-<instance>.internal`, and both still
+reach the internet. On GCP it would be one VPC with no external IP on the
 workload instance, and the control instance as its bastion. `ssh_target(name)`
-returns the control VM. A new `workload_target(name)` jumps through it. Only
-the workload VM gets `GUEST_CLOCK_FREE`; the control VM keeps timesyncd.
+returns the control VM; `workload_target(name)` reaches the workload VM
+through it (a ProxyCommand), and `workload_host(name)` is its address as the
+control VM sees it. Only the workload VM gets `GUEST_CLOCK_FREE`; the control
+VM keeps timesyncd.
+
+The provider also sets up what the two VMs need from each other: the control
+VM gets its own key, trusted on the workload VM, and `ssh fermenter-workload`
+reaching it (deploy copies software that way); the workload VM's firewall
+lets the control VM in on any port (the agent, MySQL). Both are re-applied
+after a reboot with the rest of the guest state.
+
+The agent and MySQL listen on the private network with no authentication:
+anything else on the Lima host's user-v2 network (other Lima VMs) could reach
+them. Fine for a sandbox; a GCP fermenter's firewall rules should admit only
+its control instance.
 
 Sizing on a 24 GiB Mac: about 4 GiB for control (a Maven build plus
 Loki/Prometheus/Grafana) and 8 GiB for the workload. That still fits one
@@ -146,15 +161,20 @@ fermenter at a time, as today.
 
 Each step leaves a working fermenter.
 
-1. **Agent on one VM.** Move clock setting, process-compose, process logs and
-   the offline database behind `ferment-agent`, and have the server call it
-   over localhost. No behavior change. This proves the API.
-2. **Second VM.** The provider creates the pair and its private network. Deploy
-   copies the runtime to the workload VM, the server talks to the agent over
-   the private network, socat proxies cover client ports, and artifacts move
-   between the VMs.
-3. **Archive across the network.** Dolt stays on control, with commit dates
-   set explicitly.
+1. **Agent on one VM** (done). Move clock setting, process-compose, process
+   logs and the offline database behind the agent (`ferment.agent`), and have
+   the server call it over localhost. No behavior change. This proves the API.
+2. **Second VM** (done). The provider creates the pair and its private
+   network. Deploy builds on control, then copies the runtime closure
+   (`nix copy` of a `nix develop --profile`), the source and the venv to the
+   same paths on the workload VM, which runs the agent from them without
+   fetching anything. The server talks to the agent over the private network,
+   reaches MySQL there for SQL and checkpoints (the archive already works
+   across the network: the agent runs the offline mysqld, control dumps it),
+   and uploads build artifacts to the agent by content hash. `--one-vm` still
+   makes a single-VM fermenter (the agent on localhost).
+3. **Dolt commit dates.** Dolt now runs on control, so its commits carry real
+   dates; set them to the checkpoint's fake time explicitly.
 4. **Delete the single-VM clock code.** That's `GuestClock`'s offset and
    `observe`, plus the heartbeat time field (kept as optional input, and
    ignored, so older clients still work).
@@ -162,8 +182,10 @@ Each step leaves a working fermenter.
 
 ## Open questions
 
-- Does `user-v2` on Lima vz give stable addresses between VMs across reboots,
-  or do we need names via `/etc/hosts`?
+- `user-v2` names resolve, but the workload's firewall rule admits the
+  control VM by its address at the workload's last boot. If the control VM
+  rebooted and got a new address, a redeploy wouldn't notice; re-applying
+  the workload's guest state would.
 - Should the workload VM's clock be resynced to control's (plus the offset)
   after the host sleeps? Fake time losing a few minutes while the laptop slept
   is arguably correct, so the proposal is no for now.

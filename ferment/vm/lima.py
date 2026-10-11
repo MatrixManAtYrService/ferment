@@ -12,6 +12,13 @@ reaching a cloud VM through a bastion or IAP. Either way the client logs in to
 the VM with its own key (`authorized_keys` on the spec, or `authorize_key`
 later), never with Lima's.
 
+A split fermenter (docs/split-vms.md) is two instances, NAME (control, on
+real time) and NAME-workload (the fake clock), both on Lima's user-v2
+network, where each reaches the other as lima-<instance>.internal. Clients
+reach the workload VM through the control VM, and the control VM reaches it
+as `fermenter-workload` with a key of its own. Commands take the fermenter's
+name; the workload instance comes along (extend, share, rm).
+
 Lima has no labels or instance metadata, so ferment keeps its own record in
 the instance directory: <lima instance dir>/ferment.json. Only instances that
 carry one are listed as ferment's. The record is also the source of truth for
@@ -31,7 +38,7 @@ import sys
 
 from ferment.identity import client_key
 from ferment.lifetime import deadline_script
-from ferment.vm.base import Provider, ProviderError, SshTarget, VMInfo, VMSpec, utcnow
+from ferment.vm.base import WORKLOAD_SSH_HOST, Provider, ProviderError, SshTarget, VMInfo, VMSpec, utcnow
 
 # Same image pixiebox runs on (nixos-lima v0.0.5): NixOS, nix preinstalled.
 IMAGES = [
@@ -82,8 +89,42 @@ fi
 """
 
 
-def lima_config(spec: VMSpec) -> dict:
-    return {
+WORKLOAD_SUFFIX = "-workload"
+CONTROL_KEY = "~/.ssh/ferment_workload"
+
+
+def control_ssh_script(workload: str) -> str:
+    """On the control VM: a key of its own, and `ssh fermenter-workload`
+    reaching the workload VM with it. Prints the public key."""
+    entry = (
+        f"Host {WORKLOAD_SSH_HOST}\n  HostName lima-{workload}.internal\n  IdentityFile {CONTROL_KEY}\n"
+        "  IdentitiesOnly yes\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n"
+    )
+    return f"""\
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+[ -f {CONTROL_KEY} ] || ssh-keygen -q -t ed25519 -N '' -C ferment-control -f {CONTROL_KEY}
+touch ~/.ssh/config && chmod 600 ~/.ssh/config
+grep -q '^Host {WORKLOAD_SSH_HOST}$' ~/.ssh/config || printf {shlex.quote(entry)} >> ~/.ssh/config
+cat {CONTROL_KEY}.pub
+"""
+
+
+def trust_control_script(control: str) -> str:
+    """On the workload VM: let the control VM through NixOS's firewall, on any
+    port (the agent, the database). A runtime rule, re-applied after a reboot
+    with the rest of the guest state."""
+    return f"""\
+ip=$(getent hosts lima-{control}.internal | awk '{{print $1; exit}}')
+if [ -n "$ip" ] && ! sudo iptables -C nixos-fw -s "$ip" -j nixos-fw-accept 2>/dev/null; then
+  sudo iptables -I nixos-fw -s "$ip" -j nixos-fw-accept
+fi
+"""
+
+
+def lima_config(spec: VMSpec, *, private_network: bool = False) -> dict:
+    """`private_network`: on Lima's user-v2 network, where instances reach
+    each other (lima-<name>.internal) and still reach the internet."""
+    cfg = {
         "vmType": "vz",
         "images": IMAGES,
         "cpus": spec.cpus,
@@ -102,6 +143,9 @@ def lima_config(spec: VMSpec) -> dict:
         ],
         "containerd": {"system": False, "user": False},
     }
+    if private_network:
+        cfg["networks"] = [{"lima": "user-v2"}]
+    return cfg
 
 
 class LimaHost:
@@ -141,12 +185,23 @@ class LimaProvider(Provider):
         cpus: int | None = None,
         memory_gib: int | None = None,
         disk_gib: int | None = None,
+        control_cpus: int | None = None,
+        control_memory_gib: int | None = None,
+        control_disk_gib: int | None = None,
     ):
+        """cpus, memory_gib, disk_gib: the VM that runs the workload (the only
+        VM, or a split fermenter's workload VM). control_*: a split
+        fermenter's control VM (the server, builds, the archive)."""
         self.lima = LimaHost(host, limactl)
         # Names whose guest rebooted since last seen (noticed by ssh_target):
         # callers may need to restart whatever they ran there.
         self.rebooted: set[str] = set()
         self.defaults = {k: v for k, v in {"cpus": cpus, "memory_gib": memory_gib, "disk_gib": disk_gib}.items() if v}
+        self.control_defaults = {
+            k: v
+            for k, v in {"cpus": control_cpus, "memory_gib": control_memory_gib, "disk_gib": control_disk_gib}.items()
+            if v
+        }
 
     # -- host-side state ----------------------------------------------------
 
@@ -172,12 +227,28 @@ class LimaProvider(Provider):
                     instances[name]["record"] = json.loads(raw)
         return instances
 
-    def _instance(self, name: str) -> dict:
-        inst = self._instances().get(name)
+    def _instance(self, name: str, instances: dict[str, dict] | None = None) -> dict:
+        """A fermenter's (control or only) instance, by the fermenter's name."""
+        inst = (instances if instances is not None else self._instances()).get(name)
         if inst is None or inst["record"] is None:
             where = f" on {self.lima.host}" if self.lima.host else ""
             raise ProviderError(f"no lima VM named {name!r} managed by ferment{where}")
+        if inst["record"].get("role") == "workload":
+            control = inst["record"].get("control")
+            raise ProviderError(f"{name!r} is the workload VM of fermenter {control!r}; use {control!r}")
         return inst
+
+    def _pair(self, name: str) -> tuple[dict, dict | None]:
+        """A fermenter's instance and, if it's split, its workload instance."""
+        instances = self._instances()
+        inst = self._instance(name, instances)
+        workload = inst["record"].get("workload")
+        if workload is None:
+            return inst, None
+        winst = instances.get(workload)
+        if winst is None or winst["record"] is None:
+            raise ProviderError(f"fermenter {name!r} has lost its workload VM {workload!r}")
+        return inst, winst
 
     def _write_record(self, inst: dict, record: dict) -> None:
         path = shlex.quote(f"{inst['dir']}/{RECORD}")
@@ -191,7 +262,13 @@ class LimaProvider(Provider):
     def _apply_guest_state(self, inst: dict) -> str:
         """Put recorded guest state in place (idempotent); returns the boot id."""
         record = inst["record"]
-        script = SSHD_KEEPALIVE + GUEST_CLOCK_FREE + _keys_script(record.get("authorized_keys", []))
+        script = SSHD_KEEPALIVE + _keys_script(record.get("authorized_keys", []))
+        if record.get("role") == "control":  # keeps real time, and reaches its workload VM
+            script += control_ssh_script(record["workload"])
+        else:  # runs the workload, at its clock
+            script += GUEST_CLOCK_FREE
+            if record.get("role") == "workload":
+                script += trust_control_script(record["control"])
         if record.get("delete_after"):
             script += deadline_script(dt.datetime.fromisoformat(record["delete_after"])) + "\n"
         return self._guest(inst, script + "cat /proc/sys/kernel/random/boot_id").strip().splitlines()[-1]
@@ -231,15 +308,10 @@ class LimaProvider(Provider):
 
     # -- Provider -----------------------------------------------------------
 
-    def create(self, spec: VMSpec) -> VMInfo:
-        for key, value in self.defaults.items():
-            setattr(spec, key, value)
-        if spec.name in self._instances():
-            raise ProviderError(f"a lima instance named {spec.name!r} already exists")
-
+    def _start(self, spec: VMSpec, *, private_network: bool) -> dict:
         import yaml
 
-        cfg = yaml.safe_dump(lima_config(spec), sort_keys=False)
+        cfg = yaml.safe_dump(lima_config(spec, private_network=private_network), sort_keys=False)
         # limactl reads the template from stdin with "-"; its progress streams
         # to the terminal (first boot downloads the image, which takes a while).
         self.lima.run(
@@ -247,49 +319,122 @@ class LimaProvider(Provider):
             input=cfg,
             capture=False,
         )
-        inst = self._instances()[spec.name]
-        inst["record"] = {
+        return self._instances()[spec.name]
+
+    def _finish(self, inst: dict, record: dict) -> None:
+        inst["record"] = record
+        record["boot_id"] = self._apply_guest_state(inst)
+        self._write_record(inst, record)
+
+    def create(self, spec: VMSpec) -> VMInfo:
+        for key, value in self.defaults.items():
+            setattr(spec.workload or spec, key, value)
+        if spec.workload:
+            for key, value in self.control_defaults.items():
+                setattr(spec, key, value)
+        workload = f"{spec.name}{WORKLOAD_SUFFIX}" if spec.workload else None
+        existing = self._instances()
+        for name in filter(None, (spec.name, workload)):
+            if name in existing:
+                raise ProviderError(f"a lima instance named {name!r} already exists")
+        record = {
             "delete_after": (utcnow() + spec.ttl).isoformat(),
             "labels": spec.labels,
             "authorized_keys": [_check_key(k) for k in spec.authorized_keys],
         }
-        inst["record"]["boot_id"] = self._apply_guest_state(inst)
-        self._write_record(inst, inst["record"])
+        inst = self._start(spec, private_network=workload is not None)
+        if workload is None:
+            self._finish(inst, record)
+            return self._info(inst)
+
+        w = spec.workload
+        winst = self._start(
+            VMSpec(name=workload, ttl=spec.ttl, cpus=w.cpus, memory_gib=w.memory_gib, disk_gib=w.disk_gib),
+            private_network=True,
+        )
+        self._finish(inst, {**record, "role": "control", "workload": workload})
+        control_key = self._guest(inst, control_ssh_script(workload)).strip().splitlines()[-1]
+        self._finish(
+            winst,
+            {
+                **record,
+                "authorized_keys": [*record["authorized_keys"], _check_key(control_key)],
+                "role": "workload",
+                "control": spec.name,
+            },
+        )
         return self._info(inst)
 
     def list(self) -> list[VMInfo]:
-        return [self._info(inst) for inst in self._instances().values() if inst["record"] is not None]
+        return [
+            self._info(inst)
+            for inst in self._instances().values()
+            if inst["record"] is not None and inst["record"].get("role") != "workload"
+        ]
 
     def delete(self, name: str) -> None:
-        self._instance(name)  # refuse to delete instances ferment didn't make
-        self.lima.run(self.lima.limactl_cmd("delete", "--force", name))
+        # Only fermenters ferment made, and a split one's workload VM with it.
+        instances = self._instances()
+        inst = self._instance(name, instances)
+        names = [name]
+        workload = inst["record"].get("workload")
+        if workload in instances:
+            names.append(workload)
+        self.lima.run(self.lima.limactl_cmd("delete", "--force", *names))
 
     def set_deadline(self, name: str, delete_after: dt.datetime) -> None:
-        inst = self._instance(name)
-        inst["record"]["delete_after"] = delete_after.isoformat()
-        self._write_record(inst, inst["record"])
-        self._guest(inst, deadline_script(delete_after))
+        for inst in filter(None, self._pair(name)):
+            inst["record"]["delete_after"] = delete_after.isoformat()
+            self._write_record(inst, inst["record"])
+            self._guest(inst, deadline_script(delete_after))
 
     def authorize_key(self, name: str, public_key: str) -> None:
-        """Let `public_key` log in to the VM (recorded, so it survives reboots)."""
-        inst = self._instance(name)
+        """Let `public_key` log in to the fermenter's VMs (recorded, so it survives reboots)."""
         key = _check_key(public_key)
-        self._sync_guest(inst)  # adopt pre-existing keys before adding to the record
-        keys = inst["record"].setdefault("authorized_keys", [])
-        if key not in keys:
-            keys.append(key)
-        self._guest(inst, _keys_script([key]))
-        self._write_record(inst, inst["record"])
+        for inst in filter(None, self._pair(name)):
+            self._sync_guest(inst)  # adopt pre-existing keys before adding to the record
+            keys = inst["record"].setdefault("authorized_keys", [])
+            if key not in keys:
+                keys.append(key)
+            self._guest(inst, _keys_script([key]))
+            self._write_record(inst, inst["record"])
+
+    def _running(self, inst: dict) -> str:
+        """Check it's up, re-apply guest state after a reboot; returns its ssh user."""
+        if inst.get("status") != "Running":
+            raise ProviderError(f"lima VM {inst['name']!r} is {inst.get('status')}, not Running")
+        self._sync_guest(inst)
+        cfg = shlex.quote(inst["sshConfigFile"])
+        return self.lima.run(f"awk '$1 == \"User\" {{print $2; exit}}' {cfg}").strip()
 
     def ssh_target(self, name: str) -> SshTarget:
         inst = self._instance(name)
-        if inst.get("status") != "Running":
-            raise ProviderError(f"lima VM {name!r} is {inst.get('status')}, not Running")
-        self._sync_guest(inst)
-        cfg = shlex.quote(inst["sshConfigFile"])
-        user = self.lima.run(f"awk '$1 == \"User\" {{print $2; exit}}' {cfg}").strip()
+        user = self._running(inst)
+        options = self._client_options()
+        if self.lima.host:
+            options["ProxyJump"] = self.lima.host
+        return SshTarget(host="127.0.0.1", port=inst["sshLocalPort"], user=user, options=options)
+
+    def workload_host(self, name: str) -> str | None:
+        workload = self._instance(name)["record"].get("workload")
+        return f"lima-{workload}.internal" if workload else None
+
+    def workload_target(self, name: str) -> SshTarget | None:
+        _, winst = self._pair(name)
+        if winst is None:
+            return None
+        user = self._running(winst)
+        # Through the control VM: its sshd forwards to the workload VM's
+        # address on their private network (ssh -W). A ProxyCommand rather
+        # than ProxyJump, so the hop gets the same options (key, host keys).
+        hop = self.ssh_target(name).argv()
+        hop[-1:-1] = ["-W", "%h:%p"]
+        options = {**self._client_options(), "ProxyCommand": " ".join(shlex.quote(a) for a in hop)}
+        return SshTarget(host=f"lima-{winst['name']}.internal", user=user, options=options)
+
+    def _client_options(self) -> dict[str, str]:
         key, _ = client_key()
-        options = {
+        return {
             "IdentityFile": str(key),
             "IdentitiesOnly": "yes",
             # Ephemeral VM on the host's loopback: its host key is new every
@@ -298,9 +443,6 @@ class LimaProvider(Provider):
             "UserKnownHostsFile": "/dev/null",
             "LogLevel": "ERROR",
         }
-        if self.lima.host:
-            options["ProxyJump"] = self.lima.host
-        return SshTarget(host="127.0.0.1", port=inst["sshLocalPort"], user=user, options=options)
 
 
 def _check_key(public_key: str) -> str:

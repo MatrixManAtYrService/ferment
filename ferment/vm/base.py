@@ -17,6 +17,22 @@ def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
 
+# On a split fermenter's control VM, `ssh fermenter-workload` reaches the
+# workload VM (the provider sets that up), so whatever runs there (deploy
+# scripts, the server) needn't know how the provider names or addresses it.
+WORKLOAD_SSH_HOST = "fermenter-workload"
+
+
+@dataclass
+class WorkloadSpec:
+    """The second VM of a split fermenter (docs/split-vms.md): it runs the
+    workload at the fake date, next to a control VM that stays on real time."""
+
+    cpus: int = 4
+    memory_gib: int = 8
+    disk_gib: int = 50
+
+
 @dataclass
 class VMSpec:
     name: str
@@ -27,6 +43,9 @@ class VMSpec:
     labels: dict[str, str] = field(default_factory=dict)
     # Public keys allowed to ssh in as the VM's user (at least the creator's).
     authorized_keys: list[str] = field(default_factory=list)
+    # Given: this VM is the control VM, and the provider also makes the
+    # workload VM, on a private network with it. None: one VM does both.
+    workload: WorkloadSpec | None = None
 
 
 @dataclass
@@ -115,3 +134,13 @@ class Provider(ABC):
     @abstractmethod
     def authorize_key(self, name: str, public_key: str) -> None:
         """Let another public key log in (sharing a VM with a teammate)."""
+
+    def workload_host(self, name: str) -> str | None:
+        """Where the control VM reaches the workload VM (a name or address on
+        their private network); None if the fermenter is one VM."""
+        return None
+
+    def workload_target(self, name: str) -> SshTarget | None:
+        """How this client reaches the workload VM (through the control VM);
+        None if the fermenter is one VM."""
+        return None

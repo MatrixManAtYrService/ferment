@@ -396,3 +396,103 @@ def test_relay_session_retries_until_it_holds_the_port(tmp_path, capsys):
     assert "port held by another session" in err
     assert err.strip().endswith("relay nexus: up")
     assert attempts.read_text().strip() == "3"
+
+
+class FakePairHost(FakeLimaHost):
+    """limactl with a split fermenter's two instances (fx, fx-workload); keeps a record per instance."""
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.started: list[str] = []
+        self.records: dict[str, dict] = {}
+
+    def instances(self):
+        out = {}
+        for name in self.started:
+            out[name] = {
+                "name": name,
+                "status": "Running",
+                "dir": f"/h/.lima/{name}",
+                "sshLocalPort": 6022 + len(out),
+                "sshConfigFile": f"/h/.lima/{name}/ssh.config",
+                "record": self.records.get(name),
+            }
+        return out
+
+    def run(self, script, *, input=None, capture=True):
+        self.scripts.append((script, input))
+        if script.startswith("limactl start"):
+            self.started.append(script.split("--name=")[1].split()[0])
+            return ""
+        if script.startswith("cat >"):
+            name = script.split("/h/.lima/")[1].split("/")[0]
+            self.records[name] = json.loads(input)
+            return ""
+        if "boot_id" in script:
+            return self.boot + "\n"
+        if "ssh-keygen" in script:
+            return "ssh-ed25519 CONTROLKEY ferment-control\n"
+        if script.startswith("awk"):
+            return "lima\n"
+        return ""
+
+
+def _pair(monkeypatch, tmp_path, host=None):
+    from ferment.vm.base import VMSpec, WorkloadSpec
+
+    p = _lima(host, monkeypatch, tmp_path)
+    p.lima = FakePairHost(host)
+    monkeypatch.setattr(p, "_instances", p.lima.instances)
+    p.create(
+        VMSpec(name="fx", ttl=dt.timedelta(hours=1), authorized_keys=["ssh-ed25519 ME me"], workload=WorkloadSpec())
+    )
+    return p
+
+
+def test_split_fermenter_is_two_vms_on_a_private_network(monkeypatch, tmp_path):
+    p = _pair(monkeypatch, tmp_path)
+    assert p.lima.started == ["fx", "fx-workload"]
+    starts = [i for s, i in p.lima.scripts if s.startswith("limactl start")]
+    assert all("user-v2" in cfg for cfg in starts)
+    control, workload = p.lima.records["fx"], p.lima.records["fx-workload"]
+    assert (control["role"], control["workload"]) == ("control", "fx-workload")
+    assert (workload["role"], workload["control"]) == ("workload", "fx")
+    # The control VM reaches the workload VM with a key of its own; clients with theirs.
+    assert workload["authorized_keys"] == ["ssh-ed25519 ME me", "ssh-ed25519 CONTROLKEY ferment-control"]
+    to = lambda name: "\n".join(s for s, _ in p.lima.scripts if f" lima-{name} " in s)  # noqa: E731
+    assert "CAP_SYS_TIME" in to("fx-workload") and "CAP_SYS_TIME" not in to("fx")  # control keeps real time
+    assert "Host fermenter-workload" in to("fx") and "lima-fx-workload.internal" in to("fx")
+    assert "iptables" in to("fx-workload") and "lima-fx.internal" in to("fx-workload")  # its firewall lets control in
+
+
+def test_split_fermenter_is_listed_reached_and_removed_by_one_name(monkeypatch, tmp_path):
+    p = _pair(monkeypatch, tmp_path, host="matt@mac")
+    assert [vm.name for vm in p.list()] == ["fx"]
+    assert p.workload_host("fx") == "lima-fx-workload.internal"
+    t = p.workload_target("fx")
+    assert (t.host, t.user) == ("lima-fx-workload.internal", "lima")
+    hop = t.options["ProxyCommand"]
+    assert "-W %h:%p" in hop and "ProxyJump=matt@mac" in hop and "-p 6022" in hop  # through the control VM
+    assert t.options["IdentityFile"] == p.ssh_target("fx").options["IdentityFile"]
+    with pytest.raises(Exception, match="workload VM of fermenter 'fx'"):
+        p.delete("fx-workload")
+    p.delete("fx")
+    assert p.lima.scripts[-1][0] == "limactl delete --force fx fx-workload"
+
+
+def test_one_vm_fermenters_have_no_workload_vm(monkeypatch, tmp_path):
+    p = _lima(None, monkeypatch, tmp_path)
+    assert p.workload_host("mine") is None and p.workload_target("mine") is None
+
+
+def test_mysql_on_a_private_network_is_reached_from_the_control_vm(tmp_path):
+    from ferment.databases import MySQL
+
+    workload = MySQL(tmp_path, bin_dir="/m", bind="0.0.0.0")
+    (proc,) = workload.processes()
+    grants = lambda m: m.processes()[0].command.split(" > ")[0]  # noqa: E731  (the init file's SQL, shell-quoted)
+    assert "--bind-address=0.0.0.0" in proc.command and "%" in grants(workload)
+    assert "-h 127.0.0.1" in workload.client  # services on the workload VM: loopback
+    control = workload.reached_at("lima-fx-workload.internal")
+    assert "-h lima-fx-workload.internal" in control.client and workload.host == "127.0.0.1"
+    assert "%" not in grants(MySQL(tmp_path, bin_dir="/m"))  # loopback only

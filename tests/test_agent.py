@@ -1,5 +1,6 @@
 import contextlib
 import datetime as dt
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -142,3 +143,24 @@ def test_logs_are_read_where_the_workload_runs(agent, tmp_path):
     assert client.log("svc", 9) == ("started\n", 17)
     assert client.log("../etc/passwd") == ("", 0)
     assert client.log("nope") == ("", 0)
+
+
+def test_artifacts_are_uploaded_once_and_checked(tmp_path):
+    app = create_agent_app(Supervisor(tmp_path), artifacts=tmp_path / "remote")
+    jar = tmp_path / "svc-1.0.jar"
+    jar.write_bytes(b"PK" + b"x" * 3_000_000)
+    with TestClient(app) as http:
+        client = AgentClient("http://fx-workload:8402", http=http, connect_for=0)
+        remote = client.place(str(jar))
+        assert remote.startswith(str(tmp_path / "remote")) and remote.endswith("/svc-1.0.jar")
+        assert Path(remote).read_bytes() == jar.read_bytes()
+        methods, request = [], http.request
+        http.request = lambda method, *a, **k: methods.append(method) or request(method, *a, **k)  # type: ignore[method-assign]
+        assert client.place(str(jar)) == remote and methods == ["GET"]  # already there: nothing sent
+        http.request = request  # type: ignore[method-assign]
+        bad = http.request("PUT", f"/artifacts/{'0' * 64}/svc.jar", content=b"nope")
+        assert bad.status_code == 422 and "hash" in bad.json()["detail"]
+        assert http.get("/artifacts/xyz/../../etc").status_code in (404, 422)
+
+    local = AgentClient("http://127.0.0.1:8402", connect_for=0)
+    assert local.place(str(jar)) == str(jar)  # same machine: used where it is

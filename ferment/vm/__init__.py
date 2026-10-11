@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ferment.vm.base import Provider, ProviderError, SshTarget, VMInfo, VMSpec
+from ferment.vm.base import Provider, ProviderError, SshTarget, VMInfo, VMSpec, WorkloadSpec
 
 
 class NotImplementedProvider(Provider):
@@ -27,4 +27,4 @@ def get_provider(name: str, **options) -> Provider:
     raise ProviderError(f"unknown VM provider {name!r} (known: lima, gcp, aws)")
 
 
-__all__ = ["Provider", "ProviderError", "SshTarget", "VMInfo", "VMSpec", "get_provider"]
+__all__ = ["Provider", "ProviderError", "SshTarget", "VMInfo", "VMSpec", "WorkloadSpec", "get_provider"]

@@ -10,6 +10,8 @@ GET    /logs/{name}        a process's output from byte `offset` on
 POST   /db/offline         run mysqld on the live data dir (workload stopped): {port}
 DELETE /db/offline         stop it
 GET    /probes             clock probe readings (ferment.clockcheck), `since` a fake time
+GET    /artifacts/{sha256}/{filename}   {path, exists}: where a built artifact is (or would be) kept
+PUT    /artifacts/{sha256}/{filename}   upload it (body: the file); checked against its hash
 
 Blocking handlers are plain `def`s (FastAPI runs them in a thread); one lock
 serializes everything that starts or stops processes.
@@ -19,12 +21,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
+import re
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from ferment.clockcheck import read_probes
@@ -41,11 +45,16 @@ class Launch(BaseModel):
     processes: list[dict]
 
 
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,200}$")
+
+
 def create_agent_app(
     supervisor: WorkloadSupervisor,
     *,
     database: MySQL | None = None,
     probes: Path | None = None,
+    artifacts: Path | None = None,
     set_system_time: Callable[[dt.datetime], None] = sudo_date,
     system_now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
     current_boot: Callable[[], str] = boot_id,
@@ -129,5 +138,38 @@ def create_agent_app(
         if probes is None:
             return []
         return read_probes(probes, since=since)
+
+    # Built artifacts (jars, ...) come from the control VM, which builds them;
+    # kept by content hash, so a re-deploy of the same build sends nothing.
+
+    def artifact_path(sha256: str, filename: str) -> Path:
+        if artifacts is None:
+            raise HTTPException(404, "this agent doesn't keep artifacts")
+        if not SHA256.match(sha256) or not FILENAME.match(filename):
+            raise HTTPException(422, "expected /artifacts/<sha256 hex>/<plain file name>")
+        return artifacts / sha256 / filename
+
+    @app.get("/artifacts/{sha256}/{filename}")
+    def artifact(sha256: str, filename: str):
+        path = artifact_path(sha256, filename)
+        return {"path": str(path), "exists": path.is_file()}
+
+    @app.put("/artifacts/{sha256}/{filename}")
+    async def upload_artifact(sha256: str, filename: str, request: Request):
+        path = artifact_path(sha256, filename)
+        if path.is_file():
+            return {"path": str(path), "exists": True}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{filename}.part")
+        digest = hashlib.sha256()
+        with tmp.open("wb") as f:
+            async for chunk in request.stream():
+                digest.update(chunk)
+                f.write(chunk)
+        if digest.hexdigest() != sha256:
+            tmp.unlink()
+            raise HTTPException(422, f"upload doesn't match its hash (got {digest.hexdigest()})")
+        tmp.replace(path)
+        return {"path": str(path), "exists": True}
 
     return app

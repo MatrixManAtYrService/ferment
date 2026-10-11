@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -37,6 +40,9 @@ class AgentClient:
         (tests pass the agent app's TestClient)."""
         self.http = http or httpx.Client(base_url=url, timeout=timeout)
         self.connect_for = connect_for
+        # On this machine: it reads our files where they are (see `place`).
+        self.local = urlsplit(url).hostname in ("127.0.0.1", "localhost")
+        self._digests: dict[tuple[str, int, int], str] = {}
         self._lock = threading.Lock()
         self._sample: tuple[dt.datetime, float, str] | None = None  # (agent now, our monotonic, boot id)
 
@@ -134,6 +140,27 @@ class AgentClient:
             yield port
         finally:
             self._request("DELETE", "/db/offline")
+
+    def place(self, local_path: str) -> str:
+        """Where the workload's machine has this file (a built artifact),
+        uploading it first if it lacks it."""
+        if self.local:
+            return local_path
+        path = Path(local_path)
+        st = path.stat()
+        key = (str(path), st.st_size, st.st_mtime_ns)
+        if key not in self._digests:
+            digest = hashlib.sha256()
+            with path.open("rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    digest.update(chunk)
+            self._digests[key] = digest.hexdigest()
+        where = f"/artifacts/{self._digests[key]}/{path.name}"
+        found = self._request("GET", where)
+        if not found["exists"]:
+            with path.open("rb") as f:
+                found = self._request("PUT", where, content=iter(lambda: f.read(1 << 20), b""))
+        return found["path"]
 
     def probes(self, since: dt.datetime | None = None) -> list[dict]:
         return self._request("GET", "/probes", params={"since": since.isoformat()} if since else None)

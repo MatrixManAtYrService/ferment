@@ -39,8 +39,10 @@ README.md: users only need uv.
 
 - Providers stop at "here's an ssh target". Anything above that goes through
   `ferment.ssh` so it works on every provider.
-- Time is the VM's system clock. Don't add per-process time shims; providers
-  must keep the guest's clock from being synced back (see vm/lima.py).
+- Time is the workload VM's system clock. Don't add per-process time shims;
+  providers must keep that guest's clock from being synced back (see
+  vm/lima.py), and nothing that needs real time (builds, TLS, observability)
+  runs there: it goes on the control VM (docs/split-vms.md).
 - Services run on MySQL; Dolt only stores checkpoint history.
 - No TLS between real-time and faked processes: certs minted under the fake
   clock look not-yet-valid or expired to everyone else.
