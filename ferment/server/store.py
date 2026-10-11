@@ -279,12 +279,16 @@ class Store:
     def builds(self, limit: int = 50) -> list[dict]:
         return self._rows("SELECT * FROM builds ORDER BY id DESC LIMIT ?", limit)
 
-    def fail_unfinished_builds(self) -> None:
-        """At server start: builds that were running when it stopped never finished."""
+    def running_builds(self) -> list[dict]:
+        return self._rows("SELECT * FROM builds WHERE status = 'running' ORDER BY id")
+
+    def fail_unlaunched_builds(self) -> None:
+        """At server start: builds still 'queued' never got a process. Running
+        ones did, and outlive the server; the Builder adopts them."""
         with self.lock:
             self.db.execute(
-                "UPDATE builds SET status = 'failed', finished_at = ?, error = 'server restarted mid-build' "
-                "WHERE status IN ('queued', 'running')",
+                "UPDATE builds SET status = 'failed', finished_at = ?, error = 'server restarted before it started' "
+                "WHERE status = 'queued'",
                 (_now(),),
             )
 

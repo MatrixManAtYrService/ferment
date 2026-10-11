@@ -174,3 +174,53 @@ def test_attached_client_fetches_for_the_vm(upstream, tmp_path, monkeypatch):
         fulfiller.fulfill(bad)
         failed = client.get(f"/source-requests/{bad['id']}").json()
         assert failed["status"] == "failed" and "no branch or tag" in failed["error"]
+
+
+def _built(upstream, tmp_path):
+    url = str(upstream)
+    c1 = sources.resolve(url, "development")
+    vm = SourceStore(tmp_path / "vm")
+    vm.receive("svc", sources.bundle(sources.fetch(url, c1), c1))
+    return c1, vm, Store(tmp_path / "vm" / "f.db")
+
+
+def test_builds_outlive_the_server_that_started_them(upstream, tmp_path):
+    c1, vm, store = _built(upstream, tmp_path)
+    first = Builder(store, vm, tmp_path / "vm" / "logs", watch=False)
+    b = first.request("svc", c1, "sleep 1; mkdir -p target && cp pom.txt target/svc-1.jar", "target/*.jar", "me")
+    assert b["status"] == "running"
+    del first  # the server restarts mid-build
+
+    second = Builder(store, vm, tmp_path / "vm" / "logs", watch=False)
+    assert store.build(b["id"])["status"] == "running"  # adopted, not failed
+    deadline = time.time() + 10
+    while store.build(b["id"])["status"] == "running" and time.time() < deadline:
+        second.reap()
+        time.sleep(0.1)
+    assert store.build(b["id"])["status"] == "succeeded"
+
+
+def test_a_killed_build_fails_with_a_reason(upstream, tmp_path):
+    import os
+    import signal
+
+    c1, vm, store = _built(upstream, tmp_path)
+    builder = Builder(store, vm, tmp_path / "vm" / "logs", watch=False)
+    b = builder.request("svc", c1, "sleep 30", None, "me")
+    pid_file = tmp_path / "vm" / "logs" / f"build-{b['id']}.pid"
+    deadline = time.time() + 5
+    while not pid_file.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+    time.sleep(0.2)
+    builder.reap()
+    done = store.build(b["id"])
+    assert done["status"] == "failed" and "without reporting" in done["error"]
+
+
+def test_old_style_running_builds_are_failed_at_startup(upstream, tmp_path):
+    c1, vm, store = _built(upstream, tmp_path)
+    bid = store.add_build(name="svc", commit=c1, command="x", artifact_glob=None, who="me", log_path="")
+    store.update_build(bid, status="running")  # a build from before builds had pid files
+    Builder(store, vm, tmp_path / "vm" / "logs", watch=False)
+    assert "old build" in store.build(bid)["error"]

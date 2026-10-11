@@ -19,7 +19,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/clockcheck.py` | clock probes + agreement check |
 | `ferment/sources.py` | client side of shipping code: resolve refs, mirror, incremental git bundles |
 | `ferment/fulfill.py` | `SourceFulfiller`: an attached client fetching code the VM asked for (source requests) |
-| `ferment/server/sources.py`, `builds.py` | VM side: bare repos from bundles, worktrees, builds (real time, SOURCE_DATE_EPOCH = commit time, cached per input) |
+| `ferment/server/sources.py`, `builds.py` | VM side: bare repos from bundles, worktrees, builds (real time, SOURCE_DATE_EPOCH = commit time, cached per input; each a script in its own systemd unit that outlives the server, finished via an exit-status file) |
 | `ferment/databases.py` | MariaDB / Dolt processes; Dolt checkpoints, log, diff, restore |
 | `ferment/config.py` | `~/.config/ferment/config.toml` |
 | `nix/fakeable-go.nix` | overlay: `fermentGo`, `fermentFakeable` (Go that obeys FAKETIME) |
