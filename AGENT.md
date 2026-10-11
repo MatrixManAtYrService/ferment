@@ -15,7 +15,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/lifetime.py` | durations, in-guest poweroff timer |
 | `ferment/faketime.py` | `FakeClock`: libfaketime offset-mode env |
 | `ferment/procompose.py` | `Process`, `render`, `WorkloadSupervisor` |
-| `ferment/server/` | `TimeController`, `create_app` (health/status/time) |
+| `ferment/server/` | `TimeController` (clock, checkpoints, restore), `create_app` (routes, event log), `store.py` (SQLite: sessions, events, checkpoints) |
 | `ferment/clockcheck.py` | clock probes + agreement check |
 | `ferment/databases.py` | MariaDB / Dolt processes; Dolt checkpoints, log, diff, restore |
 | `ferment/config.py` | `~/.config/ferment/config.toml` |
@@ -37,5 +37,7 @@ README.md: users only need uv.
   otherwise it silently runs on real time (stock Dolt's `NOW()` does).
 - No TLS between real-time and faked processes: certs minted under the fake
   clock look not-yet-valid or expired to everyone else.
+- Store schema changes are new entries appended to `store.MIGRATIONS`; never
+  edit an existing one (fermenters in the field are at older versions).
 - A provider that isn't built raises `NotImplementedError`, not a half-working
   implementation.

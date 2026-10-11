@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import getpass
 import os
+import socket
 import sys
 
 import httpx
 
 # A clock change restarts the whole workload and waits for readiness.
 DEFAULT_TIMEOUT = 600.0
+
+WHO_HEADER = "X-Ferment-User"
+
+
+def whoami() -> str:
+    """How this client signs its requests: FERMENT_USER, else user@host."""
+    return os.environ.get("FERMENT_USER") or f"{getpass.getuser()}@{socket.gethostname()}"
 
 
 def server_request(
@@ -24,7 +33,7 @@ def server_request(
     if method is None:
         method = "POST" if json is not None else "GET"
     try:
-        response = httpx.request(method, url, params=params, json=json, timeout=timeout)
+        response = httpx.request(method, url, params=params, json=json, timeout=timeout, headers={WHO_HEADER: whoami()})
     except httpx.ConnectError:
         print(
             f"Error: cannot reach the fermenter at {base_url}.\n"

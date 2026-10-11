@@ -12,6 +12,7 @@ import shlex
 import signal
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,14 +135,27 @@ def tunnel_argv(target: SshTarget, forwards: list[Forward], *, strict: bool = Tr
     return args
 
 
-def hold_tunnel(target: SshTarget, forwards: list[Forward], best_effort: list[Forward] | None = None) -> int:
+def hold_tunnel(
+    target: SshTarget,
+    forwards: list[Forward],
+    best_effort: list[Forward] | None = None,
+    on_detach: Callable[[], None] | None = None,
+) -> int:
     """Run the tunnel in the foreground until ssh exits (or ctrl-c).
 
     `best_effort` forwards ride a second ssh process, so one that can't be
     set up (a relay port another session holds) doesn't take `forwards` down.
+    `on_detach` runs on ctrl-c/SIGTERM/SIGHUP while the tunnel is still up
+    (e.g. to say goodbye to the server through it).
     """
-    proc = subprocess.Popen(tunnel_argv(target, forwards))
-    side = subprocess.Popen(tunnel_argv(target, best_effort, strict=False)) if best_effort else None
+    # Own sessions: a terminal's ctrl-c reaches only us, so the tunnel is
+    # still there while on_detach runs; then we stop it.
+    proc = subprocess.Popen(tunnel_argv(target, forwards), start_new_session=True)
+    side = (
+        subprocess.Popen(tunnel_argv(target, best_effort, strict=False), start_new_session=True)
+        if best_effort
+        else None
+    )
 
     # Closing the terminal (SIGHUP) or being killed (SIGTERM) is a detach too:
     # route both through the same cleanup as ctrl-c.
@@ -153,11 +167,15 @@ def hold_tunnel(target: SshTarget, forwards: list[Forward], best_effort: list[Fo
     try:
         return proc.wait()
     except KeyboardInterrupt:
-        proc.terminate()
-        proc.wait()
+        if on_detach is not None:
+            try:
+                on_detach()
+            except Exception as e:  # best effort; never block detaching
+                print(f"on detach: {e}", file=sys.stderr)
         print("tunnel closed", file=sys.stderr)
         return 0
     finally:
-        if side is not None:
-            side.terminate()
-            side.wait()
+        for p in (proc, side):
+            if p is not None and p.poll() is None:
+                p.terminate()
+                p.wait()

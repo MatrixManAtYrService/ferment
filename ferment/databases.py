@@ -8,14 +8,17 @@ which one they got. Both run inside the faked tree:
   patched Go toolchain (nix/fakeable-go.nix: `fermentFakeable pkgs.dolt`),
   which honors the same FAKETIME offset.
 
-Dolt adds version control: checkpoints (a commit across every database),
-history, diffs between checkpoints, and hard restores to one. Commits made
-under a fake clock carry fake dates, so history reads in the workload's time.
+Dolt adds version control: it can be one part of a fermenter checkpoint (a
+commit and tag in every database; see ferment.server.store), diffs between
+checkpoints, and hard restores to one. Commits made under a fake clock carry
+fake dates, so history reads in the workload's time.
 """
 
 from __future__ import annotations
 
+import os
 import shlex
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -112,42 +115,58 @@ class Dolt(Database):
             )
         ]
 
-    # -- checkpoints ----------------------------------------------------------
+    # -- snapshots (one part of a fermenter checkpoint) --------------------------
+    #
+    # Each database is its own dolt repo under data_dir, committed and tagged
+    # together. Running: through SQL. Stopped (clock changes, restores: the
+    # whole workload is down, so every store is cut at the same moment):
+    # through the dolt CLI, run under the workload's fake clock so commit
+    # dates read in workload time.
 
-    def checkpoint(self, message: str, tag: str | None = None) -> dict[str, str | None]:
-        """Commit every database's working set; returns {database: commit hash}.
+    def _offline_databases(self) -> list[str]:
+        return sorted(p.parent.name for p in self.data_dir.glob("*/.dolt"))
 
-        A database with nothing to commit keeps its current head (and still
-        gets the tag, so a tag always names a consistent cross-database state).
-        """
-        out: dict[str, str | None] = {}
-        for db in self.databases():
-            with self.connect(db) as conn, conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM dolt_status")
-                if cur.fetchone()[0]:
-                    cur.execute("CALL DOLT_COMMIT('-Am', %s)", (message,))
-                cur.execute("SELECT HASHOF('HEAD')")
-                head = cur.fetchone()[0]
-                if tag:
-                    cur.execute("CALL DOLT_TAG(%s, 'HEAD')", (tag,))
-                out[db] = head
-        return out
+    def _cli(self, db: str, *args: str, env: dict[str, str]) -> str:
+        result = subprocess.run(
+            ["dolt", *args], cwd=self.data_dir / db, env={**os.environ, **env}, text=True, capture_output=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"dolt {' '.join(args)} in {db}: {result.stderr.strip() or result.stdout.strip()}")
+        return result.stdout
 
-    def log(self, limit: int = 20) -> dict[str, list[dict]]:
-        out = {}
-        for db in self.databases():
-            with self.connect(db) as conn, conn.cursor(pymysql.cursors.DictCursor) as cur:
-                cur.execute("SELECT commit_hash, date, message FROM dolt_log LIMIT %s", (limit,))
-                commits = cur.fetchall()
-                cur.execute("SELECT tag_name, tag_hash FROM dolt_tags")
-                tags: dict[str, list[str]] = {}
-                for t in cur.fetchall():
-                    tags.setdefault(t["tag_hash"], []).append(t["tag_name"])
-                out[db] = [{**c, "date": str(c["date"]), "tags": tags.get(c["commit_hash"], [])} for c in commits]
-        return out
+    def snapshot(self, message: str, tags: list[str], *, running: bool, env: dict[str, str]) -> dict[str, str]:
+        """Commit (even if nothing changed) and tag every database; returns
+        {"dolt:<db>": commit hash}."""
+        parts = {}
+        if running:
+            for db in self.databases():
+                with self.connect(db) as conn, conn.cursor() as cur:
+                    cur.execute("CALL DOLT_COMMIT('-A', '--allow-empty', '-m', %s)", (message,))
+                    for tag in tags:
+                        cur.execute("CALL DOLT_TAG(%s, 'HEAD')", (tag,))
+                    cur.execute("SELECT HASHOF('HEAD')")
+                    parts[f"dolt:{db}"] = cur.fetchone()[0]
+            return parts
+        for db in self._offline_databases():
+            self._cli(db, "add", "-A", env=env)
+            self._cli(db, "commit", "--allow-empty", "-m", message, env=env)
+            for tag in tags:
+                self._cli(db, "tag", tag, env=env)
+            out = self._cli(db, "sql", "-r", "csv", "-q", "SELECT HASHOF('HEAD') AS h", env=env)
+            parts[f"dolt:{db}"] = out.strip().splitlines()[-1]
+        return parts
+
+    def restore(self, parts: dict[str, str], *, env: dict[str, str]) -> None:
+        """Hard-reset each database to its part's commit. Workload must be stopped.
+        Databases created after the checkpoint are left alone (not dropped)."""
+        for store, ref in parts.items():
+            kind, _, db = store.partition(":")
+            if kind == "dolt" and (self.data_dir / db / ".dolt").exists():
+                self._cli(db, "reset", "--hard", ref, env=env)
 
     def diff(self, from_ref: str, to_ref: str = "WORKING") -> dict[str, list[dict]]:
-        """Per database: which tables changed between two refs, and how much."""
+        """Per database: which tables changed between two refs, and how much.
+        Checkpoint names and `ckpt-<id>` are dolt tags, so they work as refs."""
         out = {}
         for db in self.databases():
             with self.connect(db) as conn, conn.cursor(pymysql.cursors.DictCursor) as cur:
@@ -157,17 +176,6 @@ class Dolt(Database):
                     out[db] = [{"error": str(e)}]
                     continue
                 out[db] = [{k: (str(v) if v is not None else None) for k, v in row.items()} for row in cur.fetchall()]
-        return out
-
-    def restore(self, ref: str) -> dict[str, str]:
-        """Hard-reset every database to `ref` (a hash or tag), discarding later
-        changes. Services that cache state should be restarted afterwards."""
-        out = {}
-        for db in self.databases():
-            with self.connect(db) as conn, conn.cursor() as cur:
-                cur.execute("CALL DOLT_RESET('--hard', %s)", (ref,))
-                cur.execute("SELECT HASHOF('HEAD')")
-                out[db] = cur.fetchone()[0]
         return out
 
 

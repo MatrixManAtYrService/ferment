@@ -31,9 +31,12 @@ ferment provides the pieces that make that practical:
   history, diffs between checkpoints, and hard restores.
 - **process-compose supervision** (`ferment.procompose`): one parent for the
   whole workload, so the whole workload shares one clock.
-- **time control** (`ferment.server`): a FastAPI app factory whose `/time`
-  endpoint restarts the workload under a new date, while the server itself
-  stays on real time.
+- **time control and checkpoints** (`ferment.server`): a FastAPI app factory
+  whose `/time` endpoint restarts the workload under a new date while the
+  server itself stays on real time. Checkpoints span every versioned store
+  (one external checkpoint, one internal commit each), are taken
+  automatically on clock changes, and restore data and clock together. A
+  SQLite file on the VM records them, plus who is attached and who did what.
 - **clock checks** (`ferment.clockcheck`): probes for the JVM, Python, a SQL
   database, and coreutils, and a checker that tells you whether they agree.
 - **config** (`ferment.config`): `~/.config/ferment/config.toml`, initialized
