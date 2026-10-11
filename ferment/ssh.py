@@ -148,10 +148,17 @@ class _Supervised(threading.Thread):
 
     RETRY = 15.0
 
-    def __init__(self, target: SshTarget, forwards: list[Forward], label: str):
+    def __init__(
+        self,
+        target: SshTarget,
+        forwards: list[Forward],
+        label: str,
+        report: Callable[[str, str, str], None] | None = None,
+    ):
         super().__init__(daemon=True)
         self.argv = tunnel_argv(target, forwards, strict=True)
         self.label = label
+        self.report = report
         self.stopping = threading.Event()
         self.proc: subprocess.Popen | None = None
         self.state = ""
@@ -159,7 +166,10 @@ class _Supervised(threading.Thread):
     def _say(self, state: str, msg: str) -> None:
         if state != self.state:
             self.state = state
-            print(f"{self.label}: {msg}", file=sys.stderr)
+            if self.report is not None:
+                self.report(self.label, state, msg)
+            else:
+                print(f"{self.label}: {msg}", file=sys.stderr)
 
     def run(self) -> None:
         while not self.stopping.is_set():
@@ -194,6 +204,7 @@ def hold_tunnel(
     forwards: list[Forward],
     best_effort: list[Forward] | None = None,
     on_detach: Callable[[], None] | None = None,
+    report: Callable[[str, str, str], None] | None = None,
 ) -> int:
     """Run the tunnel in the foreground until ssh exits (or ctrl-c).
 
@@ -201,12 +212,14 @@ def hold_tunnel(
     can't be set up doesn't take `forwards` down, and it keeps retrying until
     it can, reporting as it goes. `on_detach` runs on ctrl-c/SIGTERM/SIGHUP
     while the tunnel is still up (e.g. to say goodbye to the server through it).
+    `report(label, state, message)` hears the best-effort forwards' states
+    (up, busy, lost, failed) instead of their being printed.
     """
     # Own sessions: a terminal's ctrl-c reaches only us, so the tunnel is
     # still there while on_detach runs; then we stop it.
     proc = subprocess.Popen(tunnel_argv(target, forwards), start_new_session=True)
     side = (
-        _Supervised(target, best_effort, "relay " + ", ".join(f.label or f.dest or "" for f in best_effort))
+        _Supervised(target, best_effort, "relay " + ", ".join(f.label or f.dest or "" for f in best_effort), report)
         if best_effort
         else None
     )

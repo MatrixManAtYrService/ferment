@@ -71,7 +71,6 @@ class Run:
                     b.count(m.source, total * i // ticks - m.lines)
                 if mid == fail and i >= ticks // 2:
                     b.finish(mid, ok=False, detail="exited with status 1 (see its log)")
-                    self.say("failed", f"{m.label}: failed")
                 elif i == ticks:
                     b.finish(mid)
 
@@ -87,13 +86,11 @@ class Run:
     def clock(self, at: str) -> None:
         target = dt.datetime.fromisoformat(at)
         self.board.set_clock((target - dt.datetime.now(dt.UTC)).total_seconds())
-        self.board.set_fact("clock", at[:19].replace("T", " "), "fake time")
 
     def __call__(self) -> None:
         b, say, pause = self.board, self.say, self.pause
 
         # -- create ----------------------------------------------------------------
-        b.set_fact("fermenter", "demo", "fermenter")
         b.set_fact("data", "none yet", "data date")
         b.set_service("fermenter", label="fermenter", port=8400, state="starting")
         b.set_service("grafana", label="grafana", port=3000, state="down")

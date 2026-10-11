@@ -19,6 +19,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/server/` | `TimeController` (clock, checkpoints, restore), `create_app` (routes, event log), `store.py` (SQLite: sessions, events, checkpoints) |
 | `ferment/board.py` | `Board`: what attached people see (facts, services, milestones with log-line progress, feed); one model for the terminal, the web page, and status |
 | `ferment/server/board.py` | `board_router`: `GET /board` snapshot, `GET /board/stream` server-sent events |
+| `ferment/boardview.py` | `BoardView` (Rich: board pinned at the bottom, feed scrolling above; plain lines when not a terminal), `Follower` (keeps it current; falls back to /broadcasts on servers without a board) |
 | `ferment/fakeboard.py` | a board replaying a scripted run, for building renderers without a VM (`python -m ferment.fakeboard`) |
 | `ferment/clockcheck.py` | clock probes + agreement check |
 | `ferment/sources.py` | client side of shipping code: resolve refs, mirror, incremental git bundles |
