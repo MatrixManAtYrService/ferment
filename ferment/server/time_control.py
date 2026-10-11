@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -35,6 +36,15 @@ class Versioned(Protocol):
     def snapshot(self, message: str, tags: list[str], *, running: bool) -> dict[str, str]: ...
 
     def restore(self, parts: dict[str, str]) -> None: ...
+
+
+# Told each step of a clock change, restore, or relaunch as it finishes:
+# stop, checkpoint, restore, clock, start, ready (only those that apply).
+Step = Callable[[str], None]
+
+
+def _nothing(_step: str) -> None:
+    pass
 
 
 class Stack(Protocol):
@@ -101,7 +111,9 @@ class TimeController:
             parts=parts,
         )
 
-    def set_time(self, target: dt.datetime, wait_ready: bool = True, who: str = "unknown") -> dict:
+    def set_time(
+        self, target: dt.datetime, wait_ready: bool = True, who: str = "unknown", step: Step = _nothing
+    ) -> dict:
         """Restart the workload with the clock reading `target`; first
         checkpoint where it was (if anything is versioned)."""
         if target.tzinfo is None:
@@ -109,6 +121,7 @@ class TimeController:
         checkpoint = None
         with self.lock:
             self.supervisor.stop()
+            step("stop")
             if self.versioned:
                 try:
                     checkpoint = self._checkpoint(
@@ -121,9 +134,12 @@ class TimeController:
                 except Exception:
                     self._launch()  # don't leave the workload down
                     raise
+                step("checkpoint")
             self.clock.set(target)
+            step("clock")
             self._launch()
-            ready = self.supervisor.wait_ready() if wait_ready else None
+            step("start")
+            ready = self._wait_ready(step) if wait_ready else None
         return {**self.status(), "ready": ready, "checkpoint": checkpoint}
 
     def checkpoint(self, message: str, name: str | None = None, who: str = "unknown") -> dict:
@@ -131,7 +147,7 @@ class TimeController:
         with self.lock:
             return self._checkpoint(message=message, kind="manual", who=who, name=name, running=self.supervisor.running)
 
-    def restore(self, ref: str, wait_ready: bool = True, who: str = "unknown") -> dict:
+    def restore(self, ref: str, wait_ready: bool = True, who: str = "unknown", step: Step = _nothing) -> dict:
         """Put every versioned store back to checkpoint `ref` (id or name) and
         the clock back to the date it was taken at. The state being left is
         checkpointed first, so a restore can itself be undone."""
@@ -142,25 +158,38 @@ class TimeController:
             raise CheckpointError(f"checkpoint {ref!r} has no versioned data to restore (only a clock reading)")
         with self.lock:
             self.supervisor.stop()
+            step("stop")
             left = self._checkpoint(
                 message=f"before restoring checkpoint {cp['id']}", kind="before-restore", who=who, name=None,
                 running=False,
             )  # fmt: skip
+            step("checkpoint")
             for store in self.versioned:
                 store.restore(cp["parts"])
+            step("restore")
             self.clock.set(dt.datetime.fromisoformat(cp["fake_time"]))
+            step("clock")
             self._launch()
-            ready = self.supervisor.wait_ready() if wait_ready else None
+            step("start")
+            ready = self._wait_ready(step) if wait_ready else None
         return {**self.status(), "ready": ready, "restored": cp, "previous": left}
 
-    def relaunch(self, wait_ready: bool = True, timeout: float = 600.0) -> dict:
+    def relaunch(self, wait_ready: bool = True, timeout: float = 600.0, step: Step = _nothing) -> dict:
         """Restart the workload on the same clock (e.g. after the set of
         deployed services changed)."""
         with self.lock:
             self.supervisor.stop()
+            step("stop")
             self._launch()
-            ready = self.supervisor.wait_ready(timeout) if wait_ready else None
+            step("start")
+            ready = self._wait_ready(step, timeout) if wait_ready else None
         return {**self.status(), "ready": ready}
+
+    def _wait_ready(self, step: Step, timeout: float = 300.0) -> bool:
+        ready = self.supervisor.wait_ready(timeout)
+        if ready:
+            step("ready")
+        return ready
 
     def stop(self) -> None:
         with self.lock:

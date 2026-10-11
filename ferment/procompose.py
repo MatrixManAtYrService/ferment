@@ -139,15 +139,19 @@ class WorkloadSupervisor:
             for p in data.get("data", [])
         ]
 
+    def is_ready(self, p: dict) -> bool:
+        """One process (from `processes`): running, and ready if it has a probe.
+        "-" means no probe, but also "probe hasn't run yet" (initial delay),
+        so probed processes must say Ready."""
+        return p["status"] == "Running" and (p["is_ready"] == "Ready" or p["name"] not in self.probed)
+
+    def all_ready(self, procs: list[dict]) -> bool:
+        return bool(procs) and all(self.is_ready(p) for p in procs)
+
     def wait_ready(self, timeout: float = 300.0) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            procs = self.processes()
-            # "-" means no probe, but also "probe hasn't run yet" (initial
-            # delay), so probed processes must say Ready.
-            if procs and all(
-                p["status"] == "Running" and (p["is_ready"] == "Ready" or (p["name"] not in self.probed)) for p in procs
-            ):
+            if self.all_ready(self.processes()):
                 return True
             time.sleep(1)
         return False

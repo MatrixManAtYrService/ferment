@@ -141,7 +141,7 @@ class BoardView:
         badge = {
             "connecting": ("  connecting…", "yellow"),
             "lost": ("  lost the fermenter; reconnecting…", "bold red"),
-            "legacy": ("  (this fermenter's server predates boards: feed only)", "dim"),
+            "legacy": ("  (this fermenter's server has no board: feed only)", "dim"),
         }.get(conn)
         if badge:
             t.append(*badge)
@@ -208,6 +208,8 @@ class BoardView:
             spin = self._spinners.setdefault(m.id, Spinner("dots", style="yellow"))
             if m.progress is None:
                 bar, count = ProgressBar(total=None, width=24, pulse=True), f"{m.lines} lines" if m.lines else ""
+                if m.detail:
+                    count = m.detail
             else:
                 bar = ProgressBar(total=100, completed=m.progress * 100, width=24)
                 count = f"{m.progress:>4.0%}  {m.lines}/~{m.expected} lines"

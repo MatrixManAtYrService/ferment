@@ -20,9 +20,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ferment.archive import DoltArchive
+from ferment.board import Board, Service
 from ferment.client import WHO_HEADER
 from ferment.databases import Database
+from ferment.server import clock as clock_mod
 from ferment.server import logs
+from ferment.server.board import Publisher, Steps, board_router
 from ferment.server.builds import Builder
 from ferment.server.sources import SourceStore, SourceStoreError
 from ferment.server.time_control import CheckpointError, TimeController
@@ -86,15 +89,25 @@ def create_app(
     title: str = "fermenter",
     database: Database | None = None,
     before_deploy: Callable[[str, dict, Callable[[str], None]], None] | None = None,
+    services: Callable[[], list[Service]] | None = None,
 ) -> FastAPI:
     """`before_deploy(name, build, say)` runs before a service is (re)deployed,
-    e.g. its schema migrations; raising stops the deploy."""
+    e.g. its schema migrations; raising stops the deploy. `services` lists
+    what people can open or connect to, for the board (ferment.board); their
+    up/down state comes from the workload process of the same name."""
     store = controller.store
     log_path = controller.state_dir / "logs" / "fermenter.jsonl"
     logs.configure(log_path)
+    # The VM's own clock reads the fake date: the board is stamped in real time.
+    board = Board(now=clock_mod.real_now)
+    publisher = Publisher(board, controller, services)
 
     def broadcast(event: str, who_: str, message: str, **fields) -> None:
         logs.broadcast(event, who_, message, **fields)
+        publisher.post(event, who_, message, controller.clock.now().isoformat(timespec="seconds"), fields)
+
+    def steps(group: str, keys: list[str], **labels: str) -> Steps:
+        return Steps(board, group, keys, labels)
 
     sources = SourceStore(controller.state_dir)
     builder = Builder(store, sources, controller.state_dir / "logs" / "builds", broadcast=broadcast)
@@ -102,11 +115,19 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         controller.resume()
+        started = steps("server started", ["ready"])
+        publisher.await_ready(started.ids["ready"])
+        publisher.refresh()
+        publisher.start()
         yield
+        publisher.stop()
         controller.stop()
 
     app = FastAPI(title=title, lifespan=lifespan)
     app.state.controller = controller
+    app.state.board = board
+    app.state.publisher = publisher
+    app.include_router(board_router(board))
 
     # Every state-changing request lands in the event log, with who sent it.
     @app.middleware("http")
@@ -144,7 +165,9 @@ def create_app(
             raise HTTPException(422, "give a timezone, e.g. 2026-10-03T00:00:00Z")
         w = who(request)
         broadcast("clock_change", w, f"{w} is moving the clock to {req.at.isoformat()} (workload restarting)")
-        out = controller.set_time(req.at, who=w)
+        keys = ["stop", *(["checkpoint"] if controller.versioned else []), "clock", "start", "ready"]
+        s = steps(f"clock to {req.at.isoformat()[:19].replace('T', ' ')} ({w})", keys)
+        out = _stepped(s, lambda: controller.set_time(req.at, who=w, step=s))
         broadcast("clock_changed", w, f"clock is now {out['fake_now'][:19]} (set by {w})")
         return out
 
@@ -164,7 +187,8 @@ def create_app(
     def restore(ref: str, request: Request):
         w = who(request)
         broadcast("restore", w, f"{w} is restoring checkpoint {ref} (workload restarting)")
-        out = controller.restore(ref, who=w)
+        s = steps(f"restore {ref} ({w})", ["stop", "checkpoint", "restore", "clock", "start", "ready"])
+        out = _stepped(s, lambda: controller.restore(ref, who=w, step=s))
         broadcast("restored", w, f"restored checkpoint {ref}; clock is now {out['fake_now'][:19]} (by {w})")
         return out
 
@@ -318,22 +342,28 @@ def create_app(
     progress: dict[str, dict] = {}
 
     def run_deploy(name: str, b: dict, w: str) -> None:
-        steps: list[str] = []
+        said: list[str] = []
+        keys = [*(["prepare"] if before_deploy is not None else []), "stop", "start", "ready"]
+        s = steps(f"deploy {name} @ {b['commit_sha'][:12]} ({w})", keys, ready=f"{name} ready")
 
         def say(msg: str) -> None:
-            steps.append(msg)
-            progress[name] = {**progress[name], "steps": list(steps)}
+            said.append(msg)
+            progress[name] = {**progress[name], "steps": list(said)}
+            s.note("prepare", msg)
 
         try:
             if before_deploy is not None:
                 progress[name]["state"] = "preparing"
                 before_deploy(name, b, say)
+                s("prepare")
             store.deploy(name, b["id"], w)
             progress[name]["state"] = "starting"
-            controller.relaunch(wait_ready=False)
+            controller.relaunch(wait_ready=False, step=s)
+            publisher.await_ready(s.ids["ready"], name)
             progress[name]["state"] = "started"
             broadcast("deployed", w, f"{name} @ {b['commit_sha'][:12]} deployed by {w}; starting")
         except Exception as e:  # report it rather than lose it in a thread
+            s.fail(str(e))
             progress[name] = {**progress[name], "state": "failed", "error": str(e)}
             broadcast("deploy_failed", w, f"deploying {name} failed: {e}")
 
@@ -376,7 +406,8 @@ def create_app(
             raise HTTPException(404, f"{name} isn't deployed")
         w = who(request)
         broadcast("undeployed", w, f"{w} undeployed {name} (workload restarting)")
-        return controller.relaunch()
+        s = steps(f"undeploy {name} ({w})", ["stop", "start", "ready"])
+        return _stepped(s, lambda: controller.relaunch(step=s))
 
     @app.get("/builds/{build_id}/log")
     def build_log(build_id: int, offset: int = 0):
@@ -387,6 +418,19 @@ def create_app(
         _mount_database(app, controller, database)
 
     return app
+
+
+def _stepped(s: Steps, run: Callable[[], dict]) -> dict:
+    """Run a controller operation reported through `s`: an error, or a
+    workload that never got ready, fails the step it stopped at."""
+    try:
+        out = run()
+    except Exception as e:
+        s.fail(str(e))
+        raise
+    if out.get("ready") is False:
+        s.fail("not ready in time (see fmnt status)")
+    return out
 
 
 def _mount_database(app: FastAPI, controller: TimeController, database: Database) -> None:

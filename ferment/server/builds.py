@@ -169,7 +169,14 @@ class Builder:
             self.store.update_build(build_id, status="failed", error=f"couldn't start: {detail.strip()}")
             return self.store.build(build_id)  # type: ignore[return-value]
         self.store.update_build(build_id, status="running")
-        self.broadcast("build_started", who, f"{who} started build {build_id}: {name} @ {commit[:12]}")
+        self.broadcast(
+            "build_started",
+            who,
+            f"{who} started build {build_id}: {name} @ {commit[:12]}",
+            build_id=build_id,
+            name=name,
+            commit=commit,
+        )
         return self.store.build(build_id)  # type: ignore[return-value]
 
     # -- watching ----------------------------------------------------------------
@@ -221,6 +228,9 @@ class Builder:
             f"build_{done['status']}",
             done["who"],
             f"build {build_id} ({done['name']} @ {done['commit_sha'][:12]}) {done['status']}: {outcome}",
+            build_id=build_id,
+            name=done["name"],
+            commit=done["commit_sha"],
         )
 
     def log(self, build_id: int, offset: int = 0) -> tuple[str, int]:

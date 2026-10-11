@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as dt
 import threading
 from collections import deque
+from collections.abc import Callable
 from typing import Literal
 
 from pydantic import BaseModel, computed_field
@@ -31,8 +32,8 @@ ServiceState = Literal["unknown", "down", "starting", "up"]
 MilestoneState = Literal["pending", "running", "done", "failed"]
 
 
-def _now() -> str:
-    return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
 
 
 class Fact(BaseModel):
@@ -94,7 +95,11 @@ class Snapshot(BaseModel):
 
 
 class Board:
-    def __init__(self, feed_limit: int = 500):
+    """`now` stamps the feed and milestones. On a fermenter, whose own clock
+    reads the fake date, that's ferment.server.clock.real_now."""
+
+    def __init__(self, feed_limit: int = 500, now: Callable[[], dt.datetime] = _utcnow):
+        self._now_fn = now
         self._changed = threading.Condition()
         self.version = 0
         self.fake_offset: float | None = None
@@ -103,6 +108,9 @@ class Board:
         self.milestones: dict[str, Milestone] = {}
         self.feed: deque[FeedEntry] = deque(maxlen=feed_limit)
         self.feed_seq = 0
+
+    def _now(self) -> str:
+        return self._now_fn().isoformat(timespec="seconds")
 
     def _bump(self) -> None:
         # caller holds self._changed
@@ -143,8 +151,10 @@ class Board:
     def set_fact(self, key: str, value: str, label: str | None = None) -> None:
         with self._changed:
             old = self.facts.get(key)
-            self.facts[key] = Fact(key=key, label=label or (old.label if old else key), value=value)
-            self._bump()
+            new = Fact(key=key, label=label or (old.label if old else key), value=value)
+            if new != old:
+                self.facts[key] = new
+                self._bump()
 
     def drop_fact(self, key: str) -> None:
         with self._changed:
@@ -153,17 +163,28 @@ class Board:
 
     def set_clock(self, offset: float | None) -> None:
         with self._changed:
-            self.fake_offset = offset
-            self._bump()
+            if offset != self.fake_offset:
+                self.fake_offset = offset
+                self._bump()
 
     def set_service(self, name: str, **fields) -> Service:
         """Add a service or change some of its fields."""
         with self._changed:
             old = self.services.get(name)
             base = old.model_dump() if old else {"name": name, "label": name}
-            self.services[name] = svc = Service(**{**base, **fields})
-            self._bump()
+            svc = Service(**{**base, **fields})
+            if svc != old:
+                self.services[name] = svc
+                self._bump()
             return svc
+
+    def set_services(self, services: list[Service]) -> None:
+        """Exactly these services, in this order."""
+        with self._changed:
+            new = {s.name: s for s in services}
+            if list(new.items()) != list(self.services.items()):
+                self.services = new
+                self._bump()
 
     # -- milestones ---------------------------------------------------------------
 
@@ -181,7 +202,7 @@ class Board:
     def start(self, mid: str, detail: str | None = None) -> None:
         with self._changed:
             m = self.milestones[mid]
-            m.state, m.started, m.detail = "running", _now(), detail
+            m.state, m.started, m.detail = "running", self._now(), detail
             self._bump()
 
     def count(self, source: str, n: int = 1) -> None:
@@ -198,8 +219,18 @@ class Board:
     def finish(self, mid: str, ok: bool = True, detail: str | None = None) -> None:
         with self._changed:
             m = self.milestones[mid]
-            m.state, m.finished, m.detail = ("done" if ok else "failed"), _now(), detail
+            m.state, m.finished = ("done" if ok else "failed"), self._now()
+            if detail is not None:
+                m.detail = detail
             self._bump()
+
+    def note(self, mid: str, detail: str) -> None:
+        """What a running milestone is doing now (e.g. which migration)."""
+        with self._changed:
+            m = self.milestones[mid]
+            if m.detail != detail:
+                m.detail = detail
+                self._bump()
 
     def actuals(self) -> dict[str, int]:
         """Lines each finished milestone took: estimates for the next run."""
@@ -212,7 +243,7 @@ class Board:
         with self._changed:
             self.feed_seq += 1
             entry = FeedEntry(
-                seq=self.feed_seq, real_time=_now(), event=event, message=message, who=who, fake_time=fake_time
+                seq=self.feed_seq, real_time=self._now(), event=event, message=message, who=who, fake_time=fake_time
             )
             self.feed.append(entry)
             self._bump()

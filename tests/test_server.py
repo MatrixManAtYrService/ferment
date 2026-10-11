@@ -23,11 +23,20 @@ class Supervisor:
     def start(self, config):
         self.running = True
 
+    def __init__(self):
+        self.procs = []  # what process-compose would report while running
+
     def wait_ready(self, timeout=300.0):
         return True
 
     def processes(self):
-        return []
+        return self.procs if self.running else []
+
+    def is_ready(self, p):
+        return p["status"] == "Running" and p["is_ready"] in ("Ready", "-")
+
+    def all_ready(self, procs):
+        return bool(procs) and all(self.is_ready(p) for p in procs)
 
 
 class FakeDolt:
@@ -232,3 +241,72 @@ def test_attached_clients_time_corrects_the_servers_real_time(setup):
         assert abs((tc.clock.real_now() - late).total_seconds()) < 1
         assert client.post(f"/sessions/{sid}/heartbeat", json={"client_time": late.isoformat()}).status_code == 200
         assert client.get("/status").json()["real_time_checked"]["samples"] == 2
+
+
+def test_the_board_follows_what_happens(setup):
+    import time as _time
+
+    from ferment.board import Service
+
+    tc, _ = setup
+    sup = tc.supervisor
+    sup.procs = [{"name": "db", "status": "Running", "is_ready": "Ready"}]
+
+    def hook(name, build, say):
+        say(f"migrating {name}")
+        if name == "broken":
+            raise RuntimeError("migration 1.41 failed")
+
+    for name in ("svc", "broken"):
+        bid = tc.store.add_build(name=name, commit="c" * 40, command="x", artifact_glob=None, who="me", log_path="")
+        tc.store.update_build(bid, status="succeeded", artifact="/a.jar")
+
+    def services():
+        return [Service(name="fermenter", label="fermenter", port=8400, state="up"), Service(name="svc", label="svc")]
+
+    def board(client):
+        client.app.state.publisher.refresh()
+        b = client.get("/board").json()
+        return b, {m["label"]: m for m in b["milestones"]}, {s["name"]: s["state"] for s in b["services"]}
+
+    def settle(client, check):
+        deadline = _time.time() + 5
+        while True:
+            b, ms, svcs = board(client)
+            if check(b, ms, svcs) or _time.time() > deadline:
+                return b, ms, svcs
+            _time.sleep(0.05)
+
+    with TestClient(create_app(tc, before_deploy=hook, services=services)) as client:
+        b, ms, svcs = board(client)
+        assert ms["workload ready"]["state"] == "done" and ms["workload ready"]["group"] == "server started"
+        assert svcs == {"fermenter": "up", "svc": "down"}
+        assert {f["key"]: f["value"] for f in b["facts"]}["workload"] == "1/1 ready"
+
+        client.post("/sessions", json={"client": "laptop"}, headers={"X-Ferment-User": "carol"})
+        client.post("/time", json={"at": "2026-10-03T00:00:00Z"}, headers={"X-Ferment-User": "carol"})
+        b, ms, svcs = board(client)
+        clock = [m for m in b["milestones"] if m["group"].startswith("clock to 2026-10-03 00:00:00")]
+        assert [m["label"] for m in clock] == ["workload stopped", "checkpointed", "clock set", "workload started",
+                                               "workload ready"]  # fmt: skip
+        assert {m["state"] for m in clock} == {"done"}
+        assert {f["key"]: f["value"] for f in b["facts"]}["attached"] == "carol"
+        assert round(b["fake_offset"] / 86400) == round((tc.clock.now() - tc.clock.real_now()).total_seconds() / 86400)
+        feed = [e["message"] for e in b["feed"]]
+        assert "carol is moving the clock to 2026-10-03T00:00:00+00:00 (workload restarting)" in feed
+        assert all(e["fake_time"].startswith("2026-10-0") for e in b["feed"] if e["event"] == "clock_changed")
+
+        # A deploy: migrations, a restart, then waiting for the service itself.
+        sup.procs.append({"name": "svc", "status": "Running", "is_ready": "Not Ready"})
+        client.put("/deployments/svc", json={"build_id": 1})
+        b, ms, svcs = settle(client, lambda b, ms, svcs: ms.get("svc ready", {}).get("state") == "running")
+        assert ms["prepared"]["state"] == "done" and ms["prepared"]["detail"] == "migrating svc"
+        assert svcs["svc"] == "starting"
+        sup.procs[-1]["is_ready"] = "Ready"
+        b, ms, svcs = board(client)
+        assert ms["svc ready"]["state"] == "done" and svcs["svc"] == "up"
+
+        client.put("/deployments/broken", json={"build_id": 2})
+        b, ms, svcs = settle(client, lambda b, ms, svcs: any(m["state"] == "failed" for m in b["milestones"]))
+        (failed,) = [m for m in b["milestones"] if m["state"] == "failed"]
+        assert failed["group"].startswith("deploy broken") and "1.41" in failed["detail"]

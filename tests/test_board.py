@@ -101,7 +101,7 @@ def test_wait_returns_when_the_board_changes():
     assert b.wait(v, timeout=5) > v
 
 
-def _collect(board: Board, done, after=None, keepalive=0.05) -> list[str]:
+def _collect(board: Board, done, after=None, keepalive=0.05, min_interval=0.0) -> list[str]:
     """Chunks the stream sends until `done(chunks)`."""
 
     async def go():
@@ -110,7 +110,7 @@ def _collect(board: Board, done, after=None, keepalive=0.05) -> list[str]:
         async def disconnected():
             return done(out)
 
-        async for chunk in events(board, after, disconnected, keepalive):
+        async for chunk in events(board, after, disconnected, keepalive, min_interval):
             out.append(chunk)
         return out
 
@@ -132,6 +132,21 @@ def test_stream_sends_the_board_then_only_new_feed():
     assert ": keepalive\n\n" in rest  # quiet until the post
     later = [_data(c) for c in rest if c.startswith("id:")]
     assert [e["message"] for e in later[0]["feed"]] == ["after"]
+
+
+def test_stream_sends_quick_changes_together():
+    b = Board()
+
+    def burst():
+        for i in range(20):
+            b.post("e", f"m{i}")
+
+    threading.Timer(0.05, burst).start()
+    chunks = _collect(
+        b, lambda out: sum(len(_data(c)["feed"]) for c in out if c.startswith("id:")) == 20, min_interval=0.3
+    )
+    updates = [c for c in chunks if c.startswith("id:")]
+    assert len(updates) <= 3  # the first board, then the burst in one or two
 
 
 def test_stream_resumes_after_a_seq():
