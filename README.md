@@ -37,6 +37,11 @@ ferment provides the pieces that make that practical:
   (one external checkpoint, one internal commit each), are taken
   automatically on clock changes, and restore data and clock together. A
   SQLite file on the VM records them, plus who is attached and who did what.
+- **sources and builds** (`ferment.sources`, `ferment.server`): the client
+  resolves a branch to a commit, mirrors the repo, and sends the VM a git
+  bundle of only the commits it lacks; the VM builds in a real git checkout
+  on real time, with `SOURCE_DATE_EPOCH` set to the commit's time, and keeps
+  successful builds per (source, commit, command).
 - **clock checks** (`ferment.clockcheck`): probes for the JVM, Python, a SQL
   database, and coreutils, and a checker that tells you whether they agree.
 - **config** (`ferment.config`): `~/.config/ferment/config.toml`, initialized

@@ -7,6 +7,7 @@ What lives here is what the server knows that no workload database does:
 - checkpoints  named points in the workload's history, each spanning every
                versioned store (one external checkpoint = N internal commits)
 - checkpoint_parts   store -> internal ref, per checkpoint
+- builds       what was built from which commit, how, and how it went
 
 The server runs on real time, so rows carry real time; anything that happened
 "in the workload" also carries the fake time it happened at.
@@ -57,6 +58,23 @@ MIGRATIONS = [
         ref         TEXT NOT NULL,          -- that store's own commit/snapshot id
         PRIMARY KEY (checkpoint_id, store)
     );
+    """,
+    """
+    CREATE TABLE builds (
+        id          INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL,          -- the source (service) built
+        commit_sha  TEXT NOT NULL,
+        command     TEXT NOT NULL,
+        artifact_glob TEXT,
+        status      TEXT NOT NULL,          -- queued | running | succeeded | failed
+        artifact    TEXT,                   -- path of what the glob matched
+        log_path    TEXT NOT NULL,
+        who         TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        finished_at TEXT,
+        error       TEXT
+    );
+    CREATE INDEX builds_by_input ON builds (name, commit_sha, command);
     """,
 ]
 
@@ -199,3 +217,50 @@ class Store:
     def checkpoints(self, limit: int = 50) -> list[dict]:
         ids = [r["id"] for r in self._rows("SELECT id FROM checkpoints ORDER BY id DESC LIMIT ?", limit)]
         return [self.checkpoint(str(i)) for i in ids]  # type: ignore[misc]
+
+    # -- builds -----------------------------------------------------------------
+
+    def add_build(
+        self, *, name: str, commit: str, command: str, artifact_glob: str | None, who: str, log_path: str
+    ) -> int:
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO builds (name, commit_sha, command, artifact_glob, status, log_path, who, requested_at) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
+                (name, commit, command, artifact_glob, log_path, who, _now()),
+            )
+            return int(cur.lastrowid)
+
+    def update_build(self, build_id: int, **fields) -> None:
+        if fields.get("status") in ("succeeded", "failed"):
+            fields["finished_at"] = _now()
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self.lock:
+            self.db.execute(f"UPDATE builds SET {cols} WHERE id = ?", (*fields.values(), build_id))
+
+    def build(self, build_id: int) -> dict | None:
+        rows = self._rows("SELECT * FROM builds WHERE id = ?", build_id)
+        return rows[0] if rows else None
+
+    def find_build(self, name: str, commit: str, command: str) -> dict | None:
+        """The latest build of exactly these inputs that succeeded or is still going."""
+        rows = self._rows(
+            "SELECT * FROM builds WHERE name = ? AND commit_sha = ? AND command = ? "
+            "AND status IN ('queued', 'running', 'succeeded') ORDER BY id DESC LIMIT 1",
+            name,
+            commit,
+            command,
+        )
+        return rows[0] if rows else None
+
+    def builds(self, limit: int = 50) -> list[dict]:
+        return self._rows("SELECT * FROM builds ORDER BY id DESC LIMIT ?", limit)
+
+    def fail_unfinished_builds(self) -> None:
+        """At server start: builds that were running when it stopped never finished."""
+        with self.lock:
+            self.db.execute(
+                "UPDATE builds SET status = 'failed', finished_at = ?, error = 'server restarted mid-build' "
+                "WHERE status IN ('queued', 'running')",
+                (_now(),),
+            )

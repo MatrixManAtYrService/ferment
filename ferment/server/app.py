@@ -12,11 +12,14 @@ import subprocess
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ferment.client import WHO_HEADER
 from ferment.databases import Database, Dolt
+from ferment.server.builds import Builder
+from ferment.server.sources import SourceStore, SourceStoreError
 from ferment.server.time_control import CheckpointError, TimeController
 
 
@@ -34,6 +37,13 @@ class NewSession(BaseModel):
     relays: list[str] = []
 
 
+class NewBuild(BaseModel):
+    name: str
+    commit: str
+    command: str
+    artifact: str | None = None  # glob, relative to the checkout
+
+
 class Sql(BaseModel):
     sql: str
     database: str | None = None
@@ -47,6 +57,8 @@ def who(request: Request) -> str:
 
 def create_app(controller: TimeController, title: str = "fermenter", database: Database | None = None) -> FastAPI:
     store = controller.store
+    sources = SourceStore(controller.state_dir)
+    builder = Builder(store, sources, controller.state_dir / "logs" / "builds")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -72,7 +84,8 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
         return response
 
     @app.exception_handler(CheckpointError)
-    async def checkpoint_error(_request: Request, exc: CheckpointError):
+    @app.exception_handler(SourceStoreError)
+    async def bad_request(_request: Request, exc: Exception):
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @app.get("/health")
@@ -126,6 +139,38 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
     def close_session(session_id: int):
         store.close_session(session_id)
         return {"ok": True}
+
+    # -- source and builds ------------------------------------------------------
+
+    @app.get("/sources/{name}")
+    def source(name: str):
+        return {"commits": sources.commits(name)}
+
+    @app.post("/sources/{name}")
+    async def upload_source(name: str, request: Request):
+        """Body: a git bundle (ferment.sources.bundle)."""
+        data = await request.body()
+        return {"received": await run_in_threadpool(sources.receive, name, data)}
+
+    @app.post("/builds")
+    def request_build(req: NewBuild, request: Request):
+        return builder.request(req.name, req.commit, req.command, req.artifact, who(request))
+
+    @app.get("/builds")
+    def builds(limit: int = 50):
+        return store.builds(limit)
+
+    @app.get("/builds/{build_id}")
+    def build(build_id: int):
+        b = store.build(build_id)
+        if b is None:
+            raise HTTPException(404, f"no build {build_id}")
+        return b
+
+    @app.get("/builds/{build_id}/log")
+    def build_log(build_id: int, offset: int = 0):
+        text, next_offset = builder.log(build_id, offset)
+        return {"text": text, "offset": next_offset}
 
     if database is not None:
         _mount_database(app, database)

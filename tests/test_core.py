@@ -279,3 +279,21 @@ def test_unset_clock_starts_on_real_time(tmp_path):
     assert sup.started is not None
     assert tc.state.offset_seconds == 0
     assert (tmp_path / "time.json").exists()
+
+
+def test_server_request_sends_raw_bodies_and_who(monkeypatch):
+    import httpx
+
+    from ferment import client
+
+    sent = {}
+
+    def fake(method, url, **kw):
+        sent.update(method=method, **kw)
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(httpx, "request", fake)
+    monkeypatch.setenv("FERMENT_USER", "tester")
+    client.server_request("http://f", "/sources/x", content=b"# v2 git bundle\n")
+    assert sent["method"] == "POST" and sent["content"] == b"# v2 git bundle\n"
+    assert sent["headers"] == {client.WHO_HEADER: "tester"}

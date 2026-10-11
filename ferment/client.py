@@ -26,14 +26,17 @@ def server_request(
     params: dict | None = None,
     json: dict | None = None,
     method: str | None = None,
+    content: bytes | None = None,
 ) -> dict:
-    """POST when a json body is given, GET otherwise; exit non-zero on failure."""
+    """POST when a body (json, or raw `content`) is given, GET otherwise; exit non-zero on failure."""
     url = f"{base_url}{path}"
     timeout = float(os.environ.get("FERMENT_TIMEOUT", DEFAULT_TIMEOUT))
     if method is None:
-        method = "POST" if json is not None else "GET"
+        method = "POST" if json is not None or content is not None else "GET"
     try:
-        response = httpx.request(method, url, params=params, json=json, timeout=timeout, headers={WHO_HEADER: whoami()})
+        response = httpx.request(
+            method, url, params=params, json=json, content=content, timeout=timeout, headers={WHO_HEADER: whoami()}
+        )
     except httpx.ConnectError:
         print(
             f"Error: cannot reach the fermenter at {base_url}.\n"
