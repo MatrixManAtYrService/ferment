@@ -124,6 +124,10 @@ def tunnel_argv(target: SshTarget, forwards: list[Forward], *, strict: bool = Tr
         "ControlMaster=no",
         "-o",
         "ControlPath=none",
+        # Nobody is there to answer a password prompt (and attach's display
+        # would hide it): a key the VM doesn't trust fails right away.
+        "-o",
+        "BatchMode=yes",
         "-o",
         f"ExitOnForwardFailure={'yes' if strict else 'no'}",
         "-o",
