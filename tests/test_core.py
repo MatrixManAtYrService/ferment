@@ -151,6 +151,7 @@ class FakeLimaHost:
 
     def __init__(self, host):
         self.host, self.limactl, self.scripts = host, "limactl", []
+        self.boot, self.record = "boot-1", None
 
     def limactl_cmd(self, *args):
         return " ".join(("limactl", *args))
@@ -168,10 +169,18 @@ class FakeLimaHost:
                 },
                 {"name": "notmine", "status": "Running", "dir": "/h/.lima/notmine"},
             ]
-            record = {"delete_after": "2026-10-13T00:00:00+00:00", "labels": {"ferment-owner": "me"}}
+            record = self.record or {"delete_after": "2026-10-13T00:00:00+00:00", "labels": {"ferment-owner": "me"}}
             return "\n".join(json.dumps(i) for i in listing) + "\n---records---\nmine\t" + json.dumps(record) + "\n"
         if script.startswith("awk"):
             return "lima\n"
+        if script.startswith("cat") and "user.pub" in script:
+            return "ssh-ed25519 LIMAKEY lima\n"
+        if "authorized_keys 2>/dev/null" in script:
+            return "ssh-ed25519 LIMAKEY lima\nssh-ed25519 OLD someone\n"
+        if "boot_id" in script:
+            return self.boot + "\n"
+        if script.startswith("cat >"):
+            self.record = json.loads(input)
         return ""
 
 
@@ -204,7 +213,7 @@ def test_remote_lima_target_jumps_through_the_host_with_ferments_key(monkeypatch
 def test_authorize_key_goes_through_limas_own_ssh_config(monkeypatch, tmp_path):
     p = _lima("mac", monkeypatch, tmp_path)
     p.authorize_key("mine", "ssh-ed25519 AAAA teammate\n")
-    script = p.lima.scripts[-1][0]
+    script = next(s for s, _ in reversed(p.lima.scripts) if "teammate" in s)
     assert script.startswith("ssh -F /h/.lima/mine/ssh.config lima-mine")
     assert "ssh-ed25519 AAAA teammate" in script and "grep -qxF" in script  # idempotent
     with pytest.raises(Exception, match="public key"):
@@ -221,3 +230,52 @@ def test_lima_create_makes_sshd_drop_vanished_clients(monkeypatch, tmp_path):
     p.create(VMSpec(name="new", ttl=dt.timedelta(hours=1)))
     guest = [s for s, _ in p.lima.scripts if s.startswith("ssh -F /h/.lima/new/ssh.config lima-new")]
     assert any("ClientAliveInterval" in s for s in guest)
+
+
+def test_lima_restores_keys_and_deadline_after_a_reboot(monkeypatch, tmp_path, capsys):
+    p = _lima(None, monkeypatch, tmp_path)
+    p.ssh_target("mine")  # first look: adopts existing non-lima keys, records the boot
+    assert p.lima.record["boot_id"] == "boot-1"
+    assert p.lima.record["authorized_keys"] == ["ssh-ed25519 OLD someone"]
+    assert "mine" not in p.rebooted
+
+    p.lima.scripts.clear()
+    p.ssh_target("mine")  # same boot: nothing re-applied
+    assert not any("ferment-deadline" in s for s, _ in p.lima.scripts)
+
+    p.lima.boot = "boot-2"  # the guest rebooted
+    p.ssh_target("mine")
+    applied = "\n".join(s for s, _ in p.lima.scripts)
+    assert "ssh-ed25519 OLD someone" in applied
+    assert "ClientAliveInterval" in applied and "ferment-deadline" in applied
+    assert p.lima.record["boot_id"] == "boot-2"
+    assert "mine" in p.rebooted
+    assert "rebooted since last seen" in capsys.readouterr().err
+
+
+def test_unset_clock_starts_on_real_time(tmp_path):
+    from ferment.server.time_control import TimeController
+
+    class Stack:
+        def processes(self):
+            return []
+
+    class Supervisor:
+        def __init__(self):
+            self.started = None
+
+        def stop(self):
+            pass
+
+        def start(self, config):
+            self.started = config
+
+        def processes(self):
+            return []
+
+    sup = Supervisor()
+    tc = TimeController(Stack(), sup, "/lib/libfaketime.so.1", tmp_path)
+    tc.resume()
+    assert sup.started is not None
+    assert tc.state.offset_seconds == 0
+    assert (tmp_path / "time.json").exists()

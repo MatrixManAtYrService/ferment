@@ -14,7 +14,11 @@ later), never with Lima's.
 
 Lima has no labels or instance metadata, so ferment keeps its own record in
 the instance directory: <lima instance dir>/ferment.json. Only instances that
-carry one are listed as ferment's.
+carry one are listed as ferment's. The record is also the source of truth for
+guest state a reboot can lose (transient systemd units, files NixOS resets at
+boot): the trusted keys and the delete-me date. Every `ssh_target` compares
+the guest's boot id with the recorded one and re-applies them on a change,
+through Lima's own key, which no reboot locks out.
 """
 
 from __future__ import annotations
@@ -23,8 +27,10 @@ import datetime as dt
 import json
 import shlex
 import subprocess
+import sys
 
 from ferment.identity import client_key
+from ferment.lifetime import deadline_script
 from ferment.vm.base import Provider, ProviderError, SshTarget, VMInfo, VMSpec, utcnow
 
 # Same image pixiebox runs on (nixos-lima v0.0.5): NixOS, nix preinstalled.
@@ -46,6 +52,9 @@ RECORD = "ferment.json"
 # vz carries ssh over vsock and the guest never learns that a client went away:
 # sessions linger, keeping their -R ports bound. Have sshd probe and drop them.
 # Each vsock connection runs a fresh `sshd -i`, so this applies to the next one.
+# /etc/ssh/sshd_config is a nix-store symlink on NixOS: this replaces it with a
+# real file, which lasts until the next activation (i.e. a reboot), and
+# _sync_guest re-applies it after one.
 SSHD_KEEPALIVE = """\
 if ! grep -q '^ClientAliveInterval' /etc/ssh/sshd_config; then
   tmp=$(mktemp)
@@ -116,6 +125,9 @@ class LimaProvider(Provider):
         disk_gib: int | None = None,
     ):
         self.lima = LimaHost(host, limactl)
+        # Names whose guest rebooted since last seen (noticed by ssh_target):
+        # callers may need to restart whatever they ran there.
+        self.rebooted: set[str] = set()
         self.defaults = {k: v for k, v in {"cpus": cpus, "memory_gib": memory_gib, "disk_gib": disk_gib}.items() if v}
 
     # -- host-side state ----------------------------------------------------
@@ -153,10 +165,40 @@ class LimaProvider(Provider):
         path = shlex.quote(f"{inst['dir']}/{RECORD}")
         self.lima.run(f"cat > {path}", input=json.dumps(record, indent=2) + "\n")
 
-    def _guest(self, inst: dict, script: str) -> None:
+    def _guest(self, inst: dict, script: str) -> str:
         """Run `script` in the guest with Lima's own key, which only the Lima host holds."""
         cfg = shlex.quote(inst["sshConfigFile"])
-        self.lima.run(f"ssh -F {cfg} lima-{shlex.quote(inst['name'])} -- {shlex.quote(script)}")
+        return self.lima.run(f"ssh -F {cfg} lima-{shlex.quote(inst['name'])} -- {shlex.quote(script)}")
+
+    def _apply_guest_state(self, inst: dict) -> str:
+        """Put recorded guest state in place (idempotent); returns the boot id."""
+        record = inst["record"]
+        script = SSHD_KEEPALIVE + _keys_script(record.get("authorized_keys", []))
+        if record.get("delete_after"):
+            script += deadline_script(dt.datetime.fromisoformat(record["delete_after"])) + "\n"
+        return self._guest(inst, script + "cat /proc/sys/kernel/random/boot_id").strip().splitlines()[-1]
+
+    def _sync_guest(self, inst: dict) -> None:
+        """Re-apply recorded guest state if the guest booted since we last looked."""
+        record = inst["record"]
+        boot_id = self._guest(inst, "cat /proc/sys/kernel/random/boot_id").strip()
+        if record.get("boot_id") == boot_id:
+            return
+        if "authorized_keys" not in record:
+            # Made before keys were recorded: adopt whatever ferment had added.
+            lima_key = self.lima.run('cat "${LIMA_HOME:-$HOME/.lima}/_config/user.pub"').strip()
+            present = self._guest(inst, "cat ~/.ssh/authorized_keys 2>/dev/null || true").splitlines()
+            record["authorized_keys"] = [k.strip() for k in present if k.startswith("ssh-") and k.strip() != lima_key]
+        rebooted = "boot_id" in record
+        record["boot_id"] = self._apply_guest_state(inst)
+        self._write_record(inst, record)
+        if rebooted:
+            print(
+                f"ferment: {inst['name']} rebooted since last seen; restored ssh keys, "
+                "sshd keepalive and the delete-me timer",
+                file=sys.stderr,
+            )
+            self.rebooted.add(inst["name"])
 
     def _info(self, inst: dict) -> VMInfo:
         record = inst["record"] or {}
@@ -188,12 +230,13 @@ class LimaProvider(Provider):
             capture=False,
         )
         inst = self._instances()[spec.name]
-        record = {"delete_after": (utcnow() + spec.ttl).isoformat(), "labels": spec.labels}
-        self._write_record(inst, record)
-        inst["record"] = record
-        self._guest(inst, SSHD_KEEPALIVE)
-        for key in spec.authorized_keys:
-            self.authorize_key(spec.name, key)
+        inst["record"] = {
+            "delete_after": (utcnow() + spec.ttl).isoformat(),
+            "labels": spec.labels,
+            "authorized_keys": [_check_key(k) for k in spec.authorized_keys],
+        }
+        inst["record"]["boot_id"] = self._apply_guest_state(inst)
+        self._write_record(inst, inst["record"])
         return self._info(inst)
 
     def list(self) -> list[VMInfo]:
@@ -205,26 +248,26 @@ class LimaProvider(Provider):
 
     def set_deadline(self, name: str, delete_after: dt.datetime) -> None:
         inst = self._instance(name)
-        record = {**inst["record"], "delete_after": delete_after.isoformat()}
-        self._write_record(inst, record)
+        inst["record"]["delete_after"] = delete_after.isoformat()
+        self._write_record(inst, inst["record"])
+        self._guest(inst, deadline_script(delete_after))
 
     def authorize_key(self, name: str, public_key: str) -> None:
-        """Let `public_key` log in to the VM."""
+        """Let `public_key` log in to the VM (recorded, so it survives reboots)."""
         inst = self._instance(name)
-        key = public_key.strip()
-        if not key.startswith("ssh-"):
-            raise ProviderError("that doesn't look like an ssh public key")
-        q, keys = shlex.quote(key), "~/.ssh/authorized_keys"
-        self._guest(
-            inst,
-            f"mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch {keys} && "
-            f"(grep -qxF {q} {keys} || echo {q} >> {keys}) && chmod 600 {keys}",
-        )
+        key = _check_key(public_key)
+        self._sync_guest(inst)  # adopt pre-existing keys before adding to the record
+        keys = inst["record"].setdefault("authorized_keys", [])
+        if key not in keys:
+            keys.append(key)
+        self._guest(inst, _keys_script([key]))
+        self._write_record(inst, inst["record"])
 
     def ssh_target(self, name: str) -> SshTarget:
         inst = self._instance(name)
         if inst.get("status") != "Running":
             raise ProviderError(f"lima VM {name!r} is {inst.get('status')}, not Running")
+        self._sync_guest(inst)
         cfg = shlex.quote(inst["sshConfigFile"])
         user = self.lima.run(f"awk '$1 == \"User\" {{print $2; exit}}' {cfg}").strip()
         key, _ = client_key()
@@ -240,3 +283,18 @@ class LimaProvider(Provider):
         if self.lima.host:
             options["ProxyJump"] = self.lima.host
         return SshTarget(host="127.0.0.1", port=inst["sshLocalPort"], user=user, options=options)
+
+
+def _check_key(public_key: str) -> str:
+    key = public_key.strip()
+    if not key.startswith("ssh-"):
+        raise ProviderError("that doesn't look like an ssh public key")
+    return key
+
+
+def _keys_script(keys: list[str]) -> str:
+    """Shell that makes sure each key is in ~/.ssh/authorized_keys (idempotent)."""
+    f = "~/.ssh/authorized_keys"
+    lines = [f"mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch {f} && chmod 600 {f}"]
+    lines += [f"grep -qxF {shlex.quote(k)} {f} || echo {shlex.quote(k)} >> {f}" for k in keys]
+    return "\n".join(lines) + "\n"

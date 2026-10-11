@@ -31,17 +31,24 @@ def parse_duration(text: str) -> dt.timedelta:
     return {"m": dt.timedelta(minutes=n), "h": dt.timedelta(hours=n), "d": dt.timedelta(days=n)}[unit]
 
 
-def arm_guest_deadline(target: SshTarget, delete_after: dt.datetime) -> None:
-    """(Re)arm the in-guest poweroff timer for `delete_after`.
+def deadline_script(delete_after: dt.datetime) -> str:
+    """Shell (run as a sudo-capable guest user) that (re)arms the in-guest
+    poweroff timer for `delete_after`.
 
-    Uses a transient systemd timer relative to now (the guest clock is the
-    real one; only the workload processes are time-faked).
+    A transient systemd timer relative to now (the guest clock is the real
+    one; only workload processes are time-faked). Transient units don't
+    survive a reboot, so providers re-arm it when they notice one. A deadline
+    already past powers off within a minute.
     """
     seconds = max(60, int((delete_after - utcnow()).total_seconds()))
-    ssh.run(
-        target,
+    return (
         f"sudo systemctl stop {GUARD_UNIT}.timer {GUARD_UNIT}.service 2>/dev/null; "
         f"sudo systemctl reset-failed {GUARD_UNIT}.timer {GUARD_UNIT}.service 2>/dev/null; "
         f"sudo systemd-run --quiet --unit={GUARD_UNIT} --on-active={seconds}s "
-        f"--description='ferment delete-me deadline {delete_after.isoformat()}' systemctl poweroff",
+        f"--description='ferment delete-me deadline {delete_after.isoformat()}' systemctl poweroff"
     )
+
+
+def arm_guest_deadline(target: SshTarget, delete_after: dt.datetime) -> None:
+    """(Re)arm the in-guest poweroff timer over ssh."""
+    ssh.run(target, deadline_script(delete_after))

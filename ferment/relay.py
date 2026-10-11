@@ -19,6 +19,7 @@ NixOS guests only.
 from __future__ import annotations
 
 import shlex
+import socket
 from dataclasses import dataclass
 
 from ferment import ssh
@@ -52,6 +53,17 @@ def relays(specs: list[str]) -> list[Relay]:
             raise ValueError(f"relay {spec!r}: expected host:port")
         out.append(Relay(host, int(port), f"{LOOPBACK_NET}.{i + 1}", FIRST_VM_PORT + i))
     return out
+
+
+def reachable(relay: Relay, timeout: float = 2.0) -> bool:
+    """Can this machine reach the relay's destination? Only a client that can
+    should offer the relay: the VM's port goes to whichever session binds it
+    first, and one that leads nowhere would black-hole everyone's traffic."""
+    try:
+        with socket.create_connection((relay.host, relay.port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def forwards(relays: list[Relay]) -> list[Forward]:

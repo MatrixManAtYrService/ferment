@@ -61,11 +61,15 @@ class TimeController:
         """On server start: bring the workload back with the clock it had.
 
         The offset persists, so fake time keeps advancing in step with real
-        time, including across a server or VM restart.
+        time, including across a server or VM restart. A fermenter that never
+        had its clock set starts on real time (offset 0), so it's usable
+        right away; setting a date later just moves the clock.
         """
-        if self.state is not None:
-            with self.lock:
-                self._launch(self.state.clock)
+        if self.state is None:
+            self.set_time(dt.datetime.now(dt.UTC), wait_ready=False)
+            return
+        with self.lock:
+            self._launch(self.state.clock)
 
     def set_time(self, target: dt.datetime, wait_ready: bool = True) -> dict:
         if target.tzinfo is None:
