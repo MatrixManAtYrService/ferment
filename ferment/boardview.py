@@ -136,8 +136,9 @@ class BoardView:
         t = Text(self.title, "bold")
         if snap is not None and snap.fake_offset is not None:
             fake = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=snap.fake_offset)
-            t.append("  fake ", "dim").append(fake.strftime("%Y-%m-%d %H:%M:%S %a"), "bold magenta")
-        t.append("  real ", "dim").append(dt.datetime.now().strftime("%H:%M:%S"))
+            # Fake dates are set in UTC, so that's how they read; real time is local.
+            t.append("  fake ", "dim").append(fake.strftime("%Y-%m-%d %H:%M:%S %a UTC"), "bold magenta")
+        t.append("  real ", "dim").append(dt.datetime.now().astimezone().strftime("%H:%M:%S %Z"))
         badge = {
             "connecting": ("  connecting…", "yellow"),
             "lost": ("  lost the fermenter; reconnecting…", "bold red"),
