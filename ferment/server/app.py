@@ -36,6 +36,18 @@ class NewCheckpoint(BaseModel):
 class NewSession(BaseModel):
     client: str
     relays: list[str] = []
+    fetches: list[str] = []  # git hosts this client can fetch from on the VM's behalf
+
+
+class NewSourceRequest(BaseModel):
+    name: str
+    repo: str
+    ref: str
+
+
+class FinishSourceRequest(BaseModel):
+    commit: str | None = None
+    error: str | None = None
 
 
 class NewBuild(BaseModel):
@@ -128,7 +140,7 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
 
     @app.post("/sessions")
     def open_session(req: NewSession, request: Request):
-        return {"id": store.open_session(who(request), req.client, req.relays)}
+        return {"id": store.open_session(who(request), req.client, req.relays, req.fetches)}
 
     @app.post("/sessions/{session_id}/heartbeat")
     def heartbeat(session_id: int):
@@ -164,6 +176,42 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
         """Body: a git bundle (ferment.sources.bundle)."""
         data = await request.body()
         return {"received": await run_in_threadpool(sources.receive, name, data)}
+
+    # Code the VM needs but can't fetch: an attached client that can claims
+    # the request, fetches it, and uploads a bundle to /sources/{name}.
+
+    @app.post("/source-requests")
+    def request_source(req: NewSourceRequest, request: Request):
+        return store.request_source(req.name, req.repo, req.ref, who(request))
+
+    @app.get("/source-requests")
+    def source_requests():
+        return store.claimable_source_requests()
+
+    @app.get("/source-requests/{request_id}")
+    def source_request(request_id: int):
+        r = store.source_request(request_id)
+        if r is None:
+            raise HTTPException(404, f"no source request {request_id}")
+        return r
+
+    @app.post("/source-requests/{request_id}/claim")
+    def claim_source_request(request_id: int, request: Request):
+        if not store.claim_source_request(request_id, who(request)):
+            raise HTTPException(409, "already claimed")
+        return store.source_request(request_id)
+
+    @app.post("/source-requests/{request_id}/finish")
+    def finish_source_request(request_id: int, req: FinishSourceRequest):
+        if (req.commit is None) == (req.error is None):
+            raise HTTPException(422, "give exactly one of commit or error")
+        existing = store.source_request(request_id)
+        if existing is None:
+            raise HTTPException(404, f"no source request {request_id}")
+        if req.commit is not None and not sources.has(existing["name"], req.commit):
+            raise HTTPException(422, f"commit {req.commit} hasn't been uploaded")
+        store.finish_source_request(request_id, commit=req.commit, error=req.error)
+        return store.source_request(request_id)
 
     @app.post("/builds")
     def request_build(req: NewBuild, request: Request):

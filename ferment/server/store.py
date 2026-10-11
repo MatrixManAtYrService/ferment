@@ -8,6 +8,7 @@ What lives here is what the server knows that no workload database does:
                versioned store (one external checkpoint = N internal commits)
 - checkpoint_parts   store -> internal ref, per checkpoint
 - builds       what was built from which commit, how, and how it went
+- source_requests   code the VM needs that only an attached client can fetch
 
 The server runs on real time, so rows carry real time; anything that happened
 "in the workload" also carries the fake time it happened at.
@@ -76,7 +77,28 @@ MIGRATIONS = [
     );
     CREATE INDEX builds_by_input ON builds (name, commit_sha, command);
     """,
+    """
+    ALTER TABLE sessions ADD COLUMN fetches TEXT NOT NULL DEFAULT '[]';  -- JSON list of git hosts it can fetch from
+    CREATE TABLE source_requests (
+        id          INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL,          -- source (service) name: where the bundle goes
+        repo        TEXT NOT NULL,
+        ref         TEXT NOT NULL,          -- branch, tag, or commit
+        status      TEXT NOT NULL,          -- pending | claimed | done | failed
+        commit_sha  TEXT,                   -- what ref resolved to (when done)
+        requested_by TEXT NOT NULL,
+        claimed_by  TEXT,
+        requested_at TEXT NOT NULL,
+        claimed_at  TEXT,
+        finished_at TEXT,
+        error       TEXT
+    );
+    """,
 ]
+
+# A claimed source request not finished in this long is up for grabs again
+# (the client that claimed it went away mid-fetch).
+CLAIM_TIMEOUT = dt.timedelta(minutes=10)
 
 # A session not heard from in this long is treated as gone (attach heartbeats
 # every 15s; a laptop that sleeps or loses the network just stops).
@@ -130,12 +152,12 @@ class Store:
 
     # -- sessions ---------------------------------------------------------------
 
-    def open_session(self, who: str, client: str, relays: list[str]) -> int:
+    def open_session(self, who: str, client: str, relays: list[str], fetches: list[str] = ()) -> int:  # type: ignore[assignment]
         now = _now()
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO sessions (who, client, relays, opened_at, last_seen) VALUES (?, ?, ?, ?, ?)",
-                (who, client, json.dumps(relays), now, now),
+                "INSERT INTO sessions (who, client, relays, fetches, opened_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
+                (who, client, json.dumps(relays), json.dumps(list(fetches)), now, now),
             )
             return int(cur.lastrowid)
 
@@ -157,6 +179,7 @@ class Store:
         out = []
         for r in self._rows("SELECT * FROM sessions ORDER BY id"):
             r["relays"] = json.loads(r["relays"])
+            r["fetches"] = json.loads(r["fetches"])
             r["active"] = r["closed_at"] is None and r["last_seen"] >= cutoff
             if include_gone or r["active"]:
                 out.append(r)
@@ -263,4 +286,57 @@ class Store:
                 "UPDATE builds SET status = 'failed', finished_at = ?, error = 'server restarted mid-build' "
                 "WHERE status IN ('queued', 'running')",
                 (_now(),),
+            )
+
+    # -- source requests ----------------------------------------------------------
+
+    def request_source(self, name: str, repo: str, ref: str, who: str) -> dict:
+        """Queue a fetch for an attached client; an identical open request is reused."""
+        open_ = self._rows(
+            "SELECT id FROM source_requests WHERE name = ? AND repo = ? AND ref = ? "
+            "AND status IN ('pending', 'claimed') ORDER BY id DESC LIMIT 1",
+            name,
+            repo,
+            ref,
+        )
+        if open_:
+            return self.source_request(open_[0]["id"])  # type: ignore[return-value]
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO source_requests (name, repo, ref, status, requested_by, requested_at) "
+                "VALUES (?, ?, ?, 'pending', ?, ?)",
+                (name, repo, ref, who, _now()),
+            )
+            rid = int(cur.lastrowid)
+        return self.source_request(rid)  # type: ignore[return-value]
+
+    def source_request(self, request_id: int) -> dict | None:
+        rows = self._rows("SELECT * FROM source_requests WHERE id = ?", request_id)
+        return rows[0] if rows else None
+
+    def claimable_source_requests(self) -> list[dict]:
+        cutoff = (dt.datetime.now(dt.UTC) - CLAIM_TIMEOUT).isoformat()
+        return self._rows(
+            "SELECT * FROM source_requests WHERE status = 'pending' OR (status = 'claimed' AND claimed_at < ?) "
+            "ORDER BY id",
+            cutoff,
+        )
+
+    def claim_source_request(self, request_id: int, who: str) -> bool:
+        """Atomic: exactly one client wins a request."""
+        cutoff = (dt.datetime.now(dt.UTC) - CLAIM_TIMEOUT).isoformat()
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE source_requests SET status = 'claimed', claimed_by = ?, claimed_at = ? "
+                "WHERE id = ? AND (status = 'pending' OR (status = 'claimed' AND claimed_at < ?))",
+                (who, _now(), request_id, cutoff),
+            )
+            return cur.rowcount == 1
+
+    def finish_source_request(self, request_id: int, *, commit: str | None = None, error: str | None = None) -> None:
+        status = "done" if error is None else "failed"
+        with self.lock:
+            self.db.execute(
+                "UPDATE source_requests SET status = ?, commit_sha = ?, error = ?, finished_at = ? WHERE id = ?",
+                (status, commit, error, _now(), request_id),
             )

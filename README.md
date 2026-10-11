@@ -41,7 +41,9 @@ ferment provides the pieces that make that practical:
   resolves a branch to a commit, mirrors the repo, and sends the VM a git
   bundle of only the commits it lacks; the VM builds in a real git checkout
   on real time, with `SOURCE_DATE_EPOCH` set to the commit's time, and keeps
-  successful builds per (source, commit, command).
+  successful builds per (source, commit, command). When the client applying
+  can't reach a repo either, it queues a source request and any attached
+  client that can (`ferment.fulfill`) fetches and sends it.
 - **clock checks** (`ferment.clockcheck`): probes for the JVM, Python, a SQL
   database, and coreutils, and a checker that tells you whether they agree.
 - **config** (`ferment.config`): `~/.config/ferment/config.toml`, initialized

@@ -44,6 +44,14 @@ class SourceStore:
         out = _git("for-each-ref", "--format=%(objectname)", "refs/ferment/", cwd=repo)
         return sorted(set(out.split()))
 
+    def has(self, name: str, commit: str) -> bool:
+        """Is `commit` here, as a ref or as history of one?"""
+        repo = self._repo(name)
+        if not SHA.match(commit) or not (repo / "HEAD").exists():
+            return False
+        check = subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=repo, capture_output=True)
+        return check.returncode == 0
+
     def receive(self, name: str, data: bytes) -> list[str]:
         """Unpack a bundle; returns the commits it delivered."""
         repo = self._repo(name)
@@ -65,8 +73,10 @@ class SourceStore:
         repo = self._repo(name)
         path = self.root / "worktrees" / f"{name}-{commit[:12]}"
         if not path.exists():
-            if commit not in self.commits(name):
+            if not self.has(name, commit):
                 raise SourceStoreError(f"{name} has no commit {commit}; upload a bundle first")
+            # A ref of its own, so a commit that arrived as history stays put.
+            _git("update-ref", f"refs/ferment/{commit}", commit, cwd=repo)
             path.parent.mkdir(parents=True, exist_ok=True)
             _git("worktree", "add", "--quiet", "--detach", str(path), commit, cwd=repo)
         return path
