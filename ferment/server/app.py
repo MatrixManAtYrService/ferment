@@ -9,6 +9,8 @@ from __future__ import annotations
 import datetime as dt
 import shlex
 import subprocess
+import threading
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 import httpx
@@ -58,6 +60,10 @@ class NewBuild(BaseModel):
     artifact: str | None = None  # glob, relative to the checkout
 
 
+class Deploy(BaseModel):
+    build_id: int
+
+
 class Sql(BaseModel):
     sql: str
     database: str | None = None
@@ -69,7 +75,14 @@ def who(request: Request) -> str:
     return request.headers.get(WHO_HEADER, "unknown")
 
 
-def create_app(controller: TimeController, title: str = "fermenter", database: Database | None = None) -> FastAPI:
+def create_app(
+    controller: TimeController,
+    title: str = "fermenter",
+    database: Database | None = None,
+    before_deploy: Callable[[str, dict, Callable[[str], None]], None] | None = None,
+) -> FastAPI:
+    """`before_deploy(name, build, say)` runs before a service is (re)deployed,
+    e.g. its schema migrations; raising stops the deploy."""
     store = controller.store
     log_path = controller.state_dir / "logs" / "fermenter.jsonl"
     logs.configure(log_path)
@@ -283,6 +296,78 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
         if b is None:
             raise HTTPException(404, f"no build {build_id}")
         return b
+
+    # Which build of each service the workload runs. Changing it restarts the
+    # workload (same clock) so the stack picks it up.
+
+    @app.get("/deployments")
+    def deployments():
+        return store.deployments()
+
+    # Deploys run in the background (migrations, then a workload restart);
+    # clients follow /deployments/{name}/progress and the process's log.
+    progress: dict[str, dict] = {}
+
+    def run_deploy(name: str, b: dict, w: str) -> None:
+        steps: list[str] = []
+
+        def say(msg: str) -> None:
+            steps.append(msg)
+            progress[name] = {**progress[name], "steps": list(steps)}
+
+        try:
+            if before_deploy is not None:
+                progress[name]["state"] = "preparing"
+                before_deploy(name, b, say)
+            store.deploy(name, b["id"], w)
+            progress[name]["state"] = "starting"
+            controller.relaunch(wait_ready=False)
+            progress[name]["state"] = "started"
+            broadcast("deployed", w, f"{name} @ {b['commit_sha'][:12]} deployed by {w}; starting")
+        except Exception as e:  # report it rather than lose it in a thread
+            progress[name] = {**progress[name], "state": "failed", "error": str(e)}
+            broadcast("deploy_failed", w, f"deploying {name} failed: {e}")
+
+    @app.put("/deployments/{name}", status_code=202)
+    def deploy(name: str, req: Deploy, request: Request):
+        b = store.build(req.build_id)
+        if b is None or b["name"] != name or b["status"] != "succeeded":
+            raise HTTPException(422, f"build {req.build_id} isn't a successful build of {name}")
+        if progress.get(name, {}).get("state") in ("preparing", "starting"):
+            raise HTTPException(409, f"{name} is already being deployed")
+        w = who(request)
+        progress[name] = {"name": name, "build_id": b["id"], "state": "queued", "steps": [], "who": w}
+        broadcast("deploying", w, f"{w} is deploying {name} @ {b['commit_sha'][:12]}")
+        accepted = dict(progress[name])  # the thread updates progress[name] from here on
+        threading.Thread(target=run_deploy, args=(name, b, w), daemon=True).start()
+        return accepted
+
+    @app.get("/deployments/{name}/progress")
+    def deploy_progress(name: str):
+        if name not in progress:
+            raise HTTPException(404, f"no deploy of {name} since the server started")
+        return progress[name]
+
+    @app.get("/processes/{name}/log")
+    def process_log(name: str, offset: int = 0):
+        """A workload process's output from byte `offset` on (logs/<name>.log)."""
+        path = controller.state_dir / "logs" / f"{name}.log"
+        if "/" in name or not path.exists():
+            return {"text": "", "offset": offset}
+        size = path.stat().st_size
+        offset = min(offset, size)
+        with path.open("rb") as f:
+            f.seek(offset)
+            data = f.read(1_000_000)
+        return {"text": data.decode(errors="replace"), "offset": offset + len(data)}
+
+    @app.delete("/deployments/{name}")
+    def undeploy(name: str, request: Request):
+        if not store.undeploy(name):
+            raise HTTPException(404, f"{name} isn't deployed")
+        w = who(request)
+        broadcast("undeployed", w, f"{w} undeployed {name} (workload restarting)")
+        return controller.relaunch()
 
     @app.get("/builds/{build_id}/log")
     def build_log(build_id: int, offset: int = 0):

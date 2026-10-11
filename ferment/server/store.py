@@ -9,6 +9,7 @@ What lives here is what the server knows that no workload database does:
 - checkpoint_parts   store -> internal ref, per checkpoint
 - builds       what was built from which commit, how, and how it went
 - source_requests   code the VM needs that only an attached client can fetch
+- deployments  which build of each service the workload runs
 
 The server runs on real time, so rows carry real time; anything that happened
 "in the workload" also carries the fake time it happened at.
@@ -92,6 +93,14 @@ MIGRATIONS = [
         claimed_at  TEXT,
         finished_at TEXT,
         error       TEXT
+    );
+    """,
+    """
+    CREATE TABLE deployments (
+        name        TEXT PRIMARY KEY,       -- service name; one running build per service
+        build_id    INTEGER NOT NULL REFERENCES builds(id),
+        who         TEXT NOT NULL,
+        deployed_at TEXT NOT NULL
     );
     """,
 ]
@@ -344,3 +353,25 @@ class Store:
                 "UPDATE source_requests SET status = ?, commit_sha = ?, error = ?, finished_at = ? WHERE id = ?",
                 (status, commit, error, _now(), request_id),
             )
+
+    # -- deployments --------------------------------------------------------------
+
+    def deploy(self, name: str, build_id: int, who: str) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO deployments (name, build_id, who, deployed_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET build_id = excluded.build_id, who = excluded.who, "
+                "deployed_at = excluded.deployed_at",
+                (name, build_id, who, _now()),
+            )
+
+    def undeploy(self, name: str) -> bool:
+        with self.lock:
+            return self.db.execute("DELETE FROM deployments WHERE name = ?", (name,)).rowcount == 1
+
+    def deployments(self) -> list[dict]:
+        """Each deployed service with its build (commit, artifact)."""
+        return self._rows(
+            "SELECT d.name, d.build_id, d.who, d.deployed_at, b.commit_sha, b.artifact "
+            "FROM deployments d JOIN builds b ON b.id = d.build_id ORDER BY d.name"
+        )

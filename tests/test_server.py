@@ -169,3 +169,49 @@ def test_broadcasts_let_attached_people_see_each_other(setup, monkeypatch):
         assert any("checkpointed" in m and "[loaded]" in m for m in heard)
         assert not any("mine" in m for m in heard)  # your own actions aren't echoed back
         assert bob.poll() == []  # nothing new
+
+
+def test_deploy_runs_in_the_background_and_a_failing_hook_stops_it(setup, tmp_path):
+    import time as _time
+
+    tc, _ = setup
+    calls = []
+
+    def hook(name, build, say):
+        calls.append(name)
+        say(f"migrating {name}")
+        if name == "broken":
+            raise RuntimeError("migration 1.41 failed")
+
+    store = tc.store
+    for name in ("svc", "broken"):
+        bid = store.add_build(name=name, commit="c" * 40, command="x", artifact_glob=None, who="me", log_path="")
+        store.update_build(bid, status="succeeded", artifact="/a.jar")
+
+    def wait(client, name):
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            p = client.get(f"/deployments/{name}/progress").json()
+            if p["state"] in ("started", "failed"):
+                return p
+            _time.sleep(0.05)
+        raise AssertionError(p)
+
+    with TestClient(create_app(tc, before_deploy=hook)) as client:
+        r = client.put("/deployments/svc", json={"build_id": 1})
+        assert r.status_code == 202 and r.json()["state"] == "queued"
+        done = wait(client, "svc")
+        assert done["state"] == "started" and done["steps"] == ["migrating svc"]
+        assert [d["name"] for d in client.get("/deployments").json()] == ["svc"]
+
+        client.put("/deployments/broken", json={"build_id": 2})
+        failed = wait(client, "broken")
+        assert failed["state"] == "failed" and "1.41" in failed["error"]
+        assert [d["name"] for d in client.get("/deployments").json()] == ["svc"]  # not deployed
+
+        log = tc.state_dir / "logs" / "svc.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("starting\nstarted\n")
+        first = client.get("/processes/svc/log").json()
+        assert first["text"] == "starting\nstarted\n"
+        assert client.get("/processes/svc/log", params={"offset": first["offset"]}).json()["text"] == ""

@@ -1,0 +1,15 @@
+diff --git a/sql.y b/sql.y
+index bbefd22bb..918f5fcc3 100644
+--- a/sql.y
++++ b/sql.y
+@@ -6406,6 +6406,10 @@ column_order_opt:
+   {
+     $$ = &ColumnOrder{AfterColumn: NewColIdent(string($2))}
+   }
++| AFTER all_non_reserved
++  {
++    $$ = &ColumnOrder{AfterColumn: NewColIdent(string($2))}
++  }
+ 
+ column_opt:
+   { }

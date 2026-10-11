@@ -36,6 +36,37 @@ def test_fake_clock_is_an_offset_not_a_start_time():
     assert future.env("x")["FAKETIME"] == "+86400"
 
 
+def test_process_output_is_teed_to_its_own_log(tmp_path):
+    cfg = render([Process("svc", "exec java -jar x.jar")], {}, tmp_path)
+    cmd = cfg["processes"]["svc"]["command"]
+    assert cmd.startswith(f"exec > >(tee -a {tmp_path}/svc.log) 2>&1")
+    assert cmd.endswith("exec java -jar x.jar")
+    assert cfg["shell"]["shell_command"] == "bash"
+
+
+def test_wait_ready_doesnt_count_a_probe_still_in_its_grace_period(tmp_path):
+    from ferment.procompose import WorkloadSupervisor
+
+    sup = WorkloadSupervisor(tmp_path, 1)
+    sup.probed = {"svc"}
+    states = iter(
+        [
+            [
+                {"name": "svc", "status": "Running", "is_ready": "-"},
+                {"name": "db", "status": "Running", "is_ready": "-"},
+            ],
+            [
+                {"name": "svc", "status": "Running", "is_ready": "Ready"},
+                {"name": "db", "status": "Running", "is_ready": "-"},
+            ],
+        ]
+    )
+    seen = []
+    sup.processes = lambda: (seen.append(1), next(states))[1]
+    assert sup.wait_ready(timeout=5)
+    assert len(seen) == 2  # the "-" during svc's initial delay didn't count as ready
+
+
 def test_only_faked_processes_get_the_clock(tmp_path):
     procs = [Process("db", "mariadbd"), Process("grafana", "grafana", faked=False)]
     cfg = render(procs, {"LD_PRELOAD": "lib"}, tmp_path)

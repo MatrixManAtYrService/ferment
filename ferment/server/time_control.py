@@ -192,6 +192,18 @@ class TimeController:
             ready = self.supervisor.wait_ready() if wait_ready else None
         return {**self.status(), "ready": ready, "restored": cp, "previous": left}
 
+    def relaunch(self, wait_ready: bool = True, timeout: float = 600.0) -> dict:
+        """Restart the workload on the same clock (e.g. after the set of
+        deployed services changed)."""
+        with self.lock:
+            self.supervisor.stop()
+            if self.state is None:
+                self._set_clock(dt.datetime.now(dt.UTC))
+            assert self.state is not None
+            self._launch(self.state.clock)
+            ready = self.supervisor.wait_ready(timeout) if wait_ready else None
+        return {**self.status(), "ready": ready}
+
     def stop(self) -> None:
         with self.lock:
             self.supervisor.stop()
