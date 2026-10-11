@@ -12,6 +12,8 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,6 +137,58 @@ def tunnel_argv(target: SshTarget, forwards: list[Forward], *, strict: bool = Tr
     return args
 
 
+class _Supervised(threading.Thread):
+    """Keeps `forwards` held by its own ssh, retrying until it can.
+
+    For relays: the VM's relay port goes to the first session that binds it.
+    If that's another session (or a dead one sshd hasn't reaped yet), ssh
+    exits on the bind failure (ExitOnForwardFailure) and we try again, so we
+    take over as soon as the port is free, and the user hears about it.
+    """
+
+    RETRY = 15.0
+
+    def __init__(self, target: SshTarget, forwards: list[Forward], label: str):
+        super().__init__(daemon=True)
+        self.argv = tunnel_argv(target, forwards, strict=True)
+        self.label = label
+        self.stopping = threading.Event()
+        self.proc: subprocess.Popen | None = None
+        self.state = ""
+
+    def _say(self, state: str, msg: str) -> None:
+        if state != self.state:
+            self.state = state
+            print(f"{self.label}: {msg}", file=sys.stderr)
+
+    def run(self) -> None:
+        while not self.stopping.is_set():
+            started = time.monotonic()
+            self.proc = subprocess.Popen(self.argv, start_new_session=True, stderr=subprocess.PIPE, text=True)
+            # Forwards are up once ssh has survived a moment (bind failures exit fast).
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._say("up", "up")
+                self.proc.wait()
+            if self.stopping.is_set():
+                return
+            err = self.proc.stderr.read() if self.proc.stderr else ""
+            if "forwarding failed" in err:
+                self._say("busy", f"port held by another session; retrying every {self.RETRY:.0f}s")
+            elif time.monotonic() - started > 5:
+                self._say("lost", f"lost ({err.strip() or 'ssh exited'}); retrying")
+            else:
+                self._say("failed", f"couldn't start ({err.strip() or 'ssh exited'}); retrying")
+            self.stopping.wait(self.RETRY)
+
+    def stop(self) -> None:
+        self.stopping.set()
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            self.proc.wait()
+
+
 def hold_tunnel(
     target: SshTarget,
     forwards: list[Forward],
@@ -143,19 +197,21 @@ def hold_tunnel(
 ) -> int:
     """Run the tunnel in the foreground until ssh exits (or ctrl-c).
 
-    `best_effort` forwards ride a second ssh process, so one that can't be
-    set up (a relay port another session holds) doesn't take `forwards` down.
-    `on_detach` runs on ctrl-c/SIGTERM/SIGHUP while the tunnel is still up
-    (e.g. to say goodbye to the server through it).
+    `best_effort` forwards (relays) ride their own supervised ssh: one that
+    can't be set up doesn't take `forwards` down, and it keeps retrying until
+    it can, reporting as it goes. `on_detach` runs on ctrl-c/SIGTERM/SIGHUP
+    while the tunnel is still up (e.g. to say goodbye to the server through it).
     """
     # Own sessions: a terminal's ctrl-c reaches only us, so the tunnel is
     # still there while on_detach runs; then we stop it.
     proc = subprocess.Popen(tunnel_argv(target, forwards), start_new_session=True)
     side = (
-        subprocess.Popen(tunnel_argv(target, best_effort, strict=False), start_new_session=True)
+        _Supervised(target, best_effort, "relay " + ", ".join(f.label or f.dest or "" for f in best_effort))
         if best_effort
         else None
     )
+    if side is not None:
+        side.start()
 
     # Closing the terminal (SIGHUP) or being killed (SIGTERM) is a detach too:
     # route both through the same cleanup as ctrl-c.
@@ -175,7 +231,8 @@ def hold_tunnel(
         print("tunnel closed", file=sys.stderr)
         return 0
     finally:
-        for p in (proc, side):
-            if p is not None and p.poll() is None:
-                p.terminate()
-                p.wait()
+        if side is not None:
+            side.stop()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()

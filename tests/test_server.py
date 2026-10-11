@@ -134,3 +134,11 @@ def test_api_records_who_did_what_and_who_is_here(setup):
         actions = [(e["who"], e["action"]) for e in client.get("/events").json()]
         assert ("carol@laptop", "POST /checkpoints") in actions
         assert not any(a.endswith("/heartbeat") for _, a in actions)  # heartbeats aren't events
+
+
+def test_reach_reports_instead_of_raising(setup):
+    tc, _ = setup
+    with TestClient(create_app(tc)) as client:
+        assert client.get("/reach", params={"url": "ftp://x"}).status_code == 422
+        r = client.get("/reach", params={"url": "https://127.0.0.1:9/"}).json()
+        assert r["reachable"] is False and "Connect" in r["error"]

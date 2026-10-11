@@ -297,3 +297,31 @@ def test_server_request_sends_raw_bodies_and_who(monkeypatch):
     client.server_request("http://f", "/sources/x", content=b"# v2 git bundle\n")
     assert sent["method"] == "POST" and sent["content"] == b"# v2 git bundle\n"
     assert sent["headers"] == {client.WHO_HEADER: "tester"}
+
+
+def test_relay_session_retries_until_it_holds_the_port(tmp_path, capsys):
+    """The VM's relay port goes to whoever binds first; ours must keep trying
+    (and say so) rather than silently idle without it."""
+    from ferment import ssh
+
+    attempts = tmp_path / "attempts"
+    fake_ssh = tmp_path / "ssh"
+    fake_ssh.write_text(
+        "#!/bin/sh\n"
+        f"n=$(cat {attempts} 2>/dev/null || echo 0); echo $((n+1)) > {attempts}\n"
+        'if [ "$n" -lt 2 ]; then echo "Error: remote port forwarding failed for listen port 18440" >&2; exit 255; fi\n'
+        "sleep 30\n"
+    )
+    fake_ssh.chmod(0o755)
+    sup = ssh._Supervised(SshTarget(host="vm"), [Forward(0, 18440, reverse=True, dest="nexus:443")], "relay nexus")
+    sup.argv = [str(fake_ssh)]
+    sup.RETRY = 0.1
+    sup.start()
+    deadline = time.time() + 15
+    while sup.state != "up" and time.time() < deadline:
+        time.sleep(0.1)
+    sup.stop()
+    err = capsys.readouterr().err
+    assert "port held by another session" in err
+    assert err.strip().endswith("relay nexus: up")
+    assert attempts.read_text().strip() == "3"

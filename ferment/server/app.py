@@ -11,6 +11,7 @@ import shlex
 import subprocess
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
@@ -139,6 +140,18 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
     def close_session(session_id: int):
         store.close_session(session_id)
         return {"ok": True}
+
+    @app.get("/reach")
+    def reach(url: str):
+        """Can the VM reach `url` (an http(s) URL)? Any HTTP answer counts: it
+        means DNS, the connection, and TLS all worked (e.g. through a relay)."""
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(422, "http(s) URLs only")
+        try:
+            r = httpx.get(url, timeout=10, follow_redirects=False)
+            return {"url": url, "reachable": True, "status": r.status_code}
+        except httpx.HTTPError as e:
+            return {"url": url, "reachable": False, "error": f"{type(e).__name__}: {e}"}
 
     # -- source and builds ------------------------------------------------------
 
