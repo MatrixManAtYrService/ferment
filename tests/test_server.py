@@ -142,3 +142,30 @@ def test_reach_reports_instead_of_raising(setup):
         assert client.get("/reach", params={"url": "ftp://x"}).status_code == 422
         r = client.get("/reach", params={"url": "https://127.0.0.1:9/"}).json()
         assert r["reachable"] is False and "Connect" in r["error"]
+
+
+def test_broadcasts_let_attached_people_see_each_other(setup, monkeypatch):
+    import httpx
+
+    from ferment.broadcasts import BroadcastWatcher
+
+    tc, _ = setup
+    with TestClient(create_app(tc)) as client:
+        monkeypatch.setattr(
+            httpx, "get", lambda url, **kw: client.get(url.removeprefix("http://f"), params=kw.get("params"))
+        )
+        bob = BroadcastWatcher("http://f", me="bob@laptop")
+        assert bob.poll() == []  # starts at now: no replay of history
+
+        alice = {"X-Ferment-User": "alice@vpn"}
+        client.post("/sessions", json={"client": "vpn", "relays": ["nexus:443"]}, headers=alice)
+        client.post("/time", json={"at": "2026-10-03T12:00:00Z"}, headers=alice)
+        client.post("/checkpoints", json={"message": "loaded", "name": "loaded"}, headers=alice)
+        client.post("/checkpoints", json={"message": "mine"}, headers={"X-Ferment-User": "bob@laptop"})
+
+        heard = [e["message"] for e in bob.poll()]
+        assert heard[0] == "alice@vpn attached from vpn (serving: nexus:443)"
+        assert any("moving the clock to 2026-10-03" in m for m in heard)
+        assert any("checkpointed" in m and "[loaded]" in m for m in heard)
+        assert not any("mine" in m for m in heard)  # your own actions aren't echoed back
+        assert bob.poll() == []  # nothing new

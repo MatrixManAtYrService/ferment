@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from ferment.client import WHO_HEADER
 from ferment.databases import Database, Dolt
+from ferment.server import logs
 from ferment.server.builds import Builder
 from ferment.server.sources import SourceStore, SourceStoreError
 from ferment.server.time_control import CheckpointError, TimeController
@@ -70,8 +71,15 @@ def who(request: Request) -> str:
 
 def create_app(controller: TimeController, title: str = "fermenter", database: Database | None = None) -> FastAPI:
     store = controller.store
+    log_path = controller.state_dir / "logs" / "fermenter.jsonl"
+    logs.configure(log_path)
+
+    def broadcast(event: str, who_: str, message: str, **fields) -> None:
+        fake = controller.state.clock.now().isoformat() if controller.state else None
+        logs.broadcast(event, who_, message, fake_time=fake, **fields)
+
     sources = SourceStore(controller.state_dir)
-    builder = Builder(store, sources, controller.state_dir / "logs" / "builds")
+    builder = Builder(store, sources, controller.state_dir / "logs" / "builds", broadcast=broadcast)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -116,7 +124,11 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
     def set_time(req: SetTime, request: Request):
         if req.at.tzinfo is None:
             raise HTTPException(422, "give a timezone, e.g. 2026-10-03T00:00:00Z")
-        return controller.set_time(req.at, who=who(request))
+        w = who(request)
+        broadcast("clock_change", w, f"{w} is moving the clock to {req.at.isoformat()} (workload restarting)")
+        out = controller.set_time(req.at, who=w)
+        broadcast("clock_changed", w, f"clock is now {out['fake_now'][:19]} (set by {w})")
+        return out
 
     @app.get("/checkpoints")
     def checkpoints(limit: int = 50):
@@ -124,11 +136,26 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
 
     @app.post("/checkpoints")
     def checkpoint(req: NewCheckpoint, request: Request):
-        return controller.checkpoint(req.message, req.name, who=who(request))
+        w = who(request)
+        cp = controller.checkpoint(req.message, req.name, who=w)
+        label = f"{cp['id']}" + (f" [{cp['name']}]" if cp["name"] else "")
+        broadcast("checkpoint", w, f"{w} checkpointed {label}: {req.message}")
+        return cp
 
     @app.post("/checkpoints/{ref}/restore")
     def restore(ref: str, request: Request):
-        return controller.restore(ref, who=who(request))
+        w = who(request)
+        broadcast("restore", w, f"{w} is restoring checkpoint {ref} (workload restarting)")
+        out = controller.restore(ref, who=w)
+        broadcast("restored", w, f"restored checkpoint {ref}; clock is now {out['fake_now'][:19]} (by {w})")
+        return out
+
+    @app.get("/broadcasts")
+    def broadcasts(after: int = -1):
+        """Broadcast log entries after byte offset `after` (-1: just return
+        the current end, to start following from now)."""
+        entries, offset = logs.broadcasts(log_path, after)
+        return {"entries": entries, "offset": offset}
 
     @app.get("/events")
     def events(limit: int = 50):
@@ -140,7 +167,10 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
 
     @app.post("/sessions")
     def open_session(req: NewSession, request: Request):
-        return {"id": store.open_session(who(request), req.client, req.relays, req.fetches)}
+        w = who(request)
+        serves = ", ".join(req.relays + req.fetches) or "nothing"
+        broadcast("attached", w, f"{w} attached from {req.client} (serving: {serves})")
+        return {"id": store.open_session(w, req.client, req.relays, req.fetches)}
 
     @app.post("/sessions/{session_id}/heartbeat")
     def heartbeat(session_id: int):
@@ -149,8 +179,10 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
         return {"ok": True}
 
     @app.delete("/sessions/{session_id}")
-    def close_session(session_id: int):
+    def close_session(session_id: int, request: Request):
+        w = who(request)
         store.close_session(session_id)
+        broadcast("detached", w, f"{w} detached")
         return {"ok": True}
 
     @app.get("/reach")
@@ -182,7 +214,15 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
 
     @app.post("/source-requests")
     def request_source(req: NewSourceRequest, request: Request):
-        return store.request_source(req.name, req.repo, req.ref, who(request))
+        w = who(request)
+        r = store.request_source(req.name, req.repo, req.ref, w)
+        if r["requested_by"] == w and r["status"] == "pending":
+            broadcast(
+                "source_requested",
+                w,
+                f"{w} asked for {req.name} @ {req.ref} (needs an attached client that can fetch it)",
+            )
+        return r
 
     @app.get("/source-requests")
     def source_requests():
@@ -197,9 +237,12 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
 
     @app.post("/source-requests/{request_id}/claim")
     def claim_source_request(request_id: int, request: Request):
-        if not store.claim_source_request(request_id, who(request)):
+        w = who(request)
+        if not store.claim_source_request(request_id, w):
             raise HTTPException(409, "already claimed")
-        return store.source_request(request_id)
+        r = store.source_request(request_id)
+        broadcast("source_claimed", w, f"{w} is fetching {r['name']} @ {r['ref']} for {r['requested_by']}")
+        return r
 
     @app.post("/source-requests/{request_id}/finish")
     def finish_source_request(request_id: int, req: FinishSourceRequest):
@@ -211,7 +254,20 @@ def create_app(controller: TimeController, title: str = "fermenter", database: D
         if req.commit is not None and not sources.has(existing["name"], req.commit):
             raise HTTPException(422, f"commit {req.commit} hasn't been uploaded")
         store.finish_source_request(request_id, commit=req.commit, error=req.error)
-        return store.source_request(request_id)
+        r = store.source_request(request_id)
+        if req.error is None:
+            broadcast(
+                "source_fetched",
+                r["claimed_by"],
+                f"{r['name']} @ {r['ref']} is {req.commit[:12]} (fetched by {r['claimed_by']})",
+            )
+        else:
+            broadcast(
+                "source_failed",
+                r["claimed_by"],
+                f"{r['claimed_by']} couldn't fetch {r['name']} @ {r['ref']}: {req.error}",
+            )
+        return r
 
     @app.post("/builds")
     def request_build(req: NewBuild, request: Request):

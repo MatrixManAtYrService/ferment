@@ -17,8 +17,13 @@ from ferment.server.sources import SourceStore
 from ferment.server.store import Store
 
 
+def _silent(event: str, who: str, message: str, **fields) -> None:
+    pass
+
+
 class Builder:
-    def __init__(self, store: Store, sources: SourceStore, log_dir: Path):
+    def __init__(self, store: Store, sources: SourceStore, log_dir: Path, broadcast=_silent):
+        self.broadcast = broadcast
         self.store = store
         self.sources = sources
         self.log_dir = log_dir
@@ -36,6 +41,7 @@ class Builder:
         )
         log_path = self.log_dir / f"build-{build_id}-{name}.log"
         self.store.update_build(build_id, log_path=str(log_path))
+        self.broadcast("build_started", who, f"{who} started build {build_id}: {name} @ {commit[:12]}")
         threading.Thread(target=self._run, args=(build_id,), daemon=True).start()
         return self.store.build(build_id)  # type: ignore[return-value]
 
@@ -43,6 +49,20 @@ class Builder:
         b = self.store.build(build_id)
         assert b is not None
         self.store.update_build(build_id, status="running")
+        try:
+            self._build(b)
+        finally:
+            done = self.store.build(build_id)
+            assert done is not None
+            outcome = done["artifact"] if done["status"] == "succeeded" else done["error"]
+            self.broadcast(
+                f"build_{done['status']}",
+                done["who"],
+                f"build {build_id} ({done['name']} @ {done['commit_sha'][:12]}) {done['status']}: {outcome}",
+            )
+
+    def _build(self, b: dict) -> None:
+        build_id = b["id"]
         try:
             tree = self.sources.worktree(b["name"], b["commit_sha"])
             with open(b["log_path"], "ab") as log:
