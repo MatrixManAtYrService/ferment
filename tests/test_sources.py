@@ -67,7 +67,8 @@ def test_branch_to_vm_checkout_with_incremental_bundles(upstream, tmp_path):
 
     tree = vm.worktree("svc", c2)
     assert (tree / "pom.txt").read_text() == "v2\n"
-    assert (tree / ".git").exists()  # builds that read git metadata keep working
+    assert (tree / ".git").is_dir()  # a real repo: JGit (git-commit-id plugin) can't follow a .git file
+    assert git(tree, "rev-parse", "HEAD") == c2
     with pytest.raises(SourceStoreError, match="upload a bundle first"):
         vm.worktree("svc", "0" * 40)
 
@@ -224,3 +225,15 @@ def test_old_style_running_builds_are_failed_at_startup(upstream, tmp_path):
     store.update_build(bid, status="running")  # a build from before builds had pid files
     Builder(store, vm, tmp_path / "vm" / "logs", watch=False)
     assert "old build" in store.build(bid)["error"]
+
+
+def test_an_old_linked_worktree_is_replaced_by_a_real_checkout(upstream, tmp_path):
+    url = str(upstream)
+    c1 = sources.resolve(url, "development")
+    vm = SourceStore(tmp_path / "vm")
+    vm.receive("svc", sources.bundle(sources.fetch(url, c1), c1))
+    old = tmp_path / "vm" / "worktrees" / f"svc-{c1[:12]}"
+    git(tmp_path / "vm" / "sources" / "svc.git", "worktree", "add", "--quiet", "--detach", str(old), c1)
+    assert (old / ".git").is_file()
+    tree = vm.worktree("svc", c1)
+    assert tree == old and (tree / ".git").is_dir()

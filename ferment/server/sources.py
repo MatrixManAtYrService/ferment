@@ -1,8 +1,8 @@
 """Server side of shipping source to the VM (client side: ferment.sources).
 
 One bare repo per named source under <state>/sources/<name>.git, filled from
-uploaded bundles; checkouts are git worktrees under <state>/worktrees, one
-per (name, commit), so builds see a real .git.
+uploaded bundles; checkouts are local clones under <state>/worktrees, one per
+(name, commit), so builds see a real .git directory.
 """
 
 from __future__ import annotations
@@ -67,16 +67,25 @@ class SourceStore:
         return [line.split()[0] for line in heads.splitlines() if line.strip()]
 
     def worktree(self, name: str, commit: str) -> Path:
-        """A checkout of `commit` (made once, then reused)."""
+        """A checkout of `commit` (made once, then reused).
+
+        A standalone local clone (objects hardlinked from the bare repo, so
+        it's cheap), not a `git worktree`: a linked worktree's .git is a
+        pointer file, which JGit (Maven's git-commit-id plugin) can't follow
+        ("Missing unknown <sha>"). Here .git is a real repository.
+        """
         if not SHA.match(commit):
             raise SourceStoreError(f"not a full commit sha: {commit!r}")
         repo = self._repo(name)
         path = self.root / "worktrees" / f"{name}-{commit[:12]}"
+        if (path / ".git").is_file():  # a linked worktree from before: replace it
+            _git("worktree", "remove", "--force", str(path), cwd=repo)
         if not path.exists():
             if not self.has(name, commit):
                 raise SourceStoreError(f"{name} has no commit {commit}; upload a bundle first")
             # A ref of its own, so a commit that arrived as history stays put.
             _git("update-ref", f"refs/ferment/{commit}", commit, cwd=repo)
             path.parent.mkdir(parents=True, exist_ok=True)
-            _git("worktree", "add", "--quiet", "--detach", str(path), commit, cwd=repo)
+            _git("clone", "--quiet", "--local", "--no-checkout", str(repo), str(path), cwd=repo)
+            _git("checkout", "--quiet", "--detach", commit, cwd=path)
         return path
