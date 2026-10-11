@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from ferment.procompose import Process, WorkloadSupervisor, render
+from ferment.procompose import Process
 from ferment.server import clock as clock_mod
 from ferment.server.clock import GuestClock
 from ferment.server.store import Store
@@ -53,11 +53,32 @@ class Stack(Protocol):
     def processes(self) -> list[Process]: ...
 
 
+class Supervisor(Protocol):
+    """Runs the workload: ferment.procompose.WorkloadSupervisor in-process, or
+    ferment.agent.client.AgentClient for one run by the workload agent."""
+
+    running: bool
+
+    def launch(self, processes: list[Process]) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def processes(self) -> list[dict]: ...
+
+    def is_ready(self, p: dict) -> bool: ...
+
+    def all_ready(self, procs: list[dict]) -> bool: ...
+
+    def wait_ready(self, timeout: float = 300.0) -> bool: ...
+
+    def log(self, name: str, offset: int = 0) -> tuple[str, int]: ...
+
+
 class TimeController:
     def __init__(
         self,
         stack: Stack,
-        supervisor: WorkloadSupervisor,
+        supervisor: Supervisor,
         state_dir: Path,
         *,
         versioned: list[Versioned] | None = None,
@@ -78,9 +99,8 @@ class TimeController:
         self.launched_at: dt.datetime | None = None
 
     def _launch(self) -> None:
-        config = render(self.stack.processes(), self.state_dir / "logs")
         self.launched_at = self.clock.now()
-        self.supervisor.start(config)
+        self.supervisor.launch(self.stack.processes())
 
     def resume(self) -> None:
         """On server start: bring the workload back on the clock it had (after

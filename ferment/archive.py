@@ -22,6 +22,8 @@ import contextlib
 import json
 import subprocess
 import tempfile
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 
 from ferment.databases import MySQL
@@ -36,10 +38,20 @@ class ArchiveError(RuntimeError):
 class DoltArchive:
     """A ferment.server.time_control.Versioned store for a live MySQL."""
 
-    def __init__(self, root: Path, live: MySQL, dolt: str = "dolt"):
+    def __init__(
+        self,
+        root: Path,
+        live: MySQL,
+        dolt: str = "dolt",
+        offline: Callable[[], AbstractContextManager[int]] | None = None,
+    ):
+        """`offline` runs mysqld on the live data dir while the workload is
+        stopped and yields its port: by default here (`live.offline_server`),
+        or wherever the data dir is (the workload agent's /db/offline)."""
         self.root = root
         self.live = live
         self.dolt_bin = dolt
+        self.offline = offline or live.offline_server
 
     # -- dolt ------------------------------------------------------------------------
 
@@ -63,7 +75,7 @@ class DoltArchive:
     # -- checkpoints -------------------------------------------------------------------
 
     def _server(self, running: bool):
-        return contextlib.nullcontext(self.live.port) if running else self.live.offline_server()
+        return contextlib.nullcontext(self.live.port) if running else self.offline()
 
     def snapshot(self, message: str, tags: list[str], *, running: bool) -> dict[str, str]:
         """Copy every live database into its Dolt repo, commit, tag; returns
@@ -124,7 +136,7 @@ class DoltArchive:
         archived = {k.split(":", 1)[1]: ref for k, ref in parts.items() if k.startswith("archive:")}
         if not archived:
             raise ArchiveError("this checkpoint has no archived databases (made before MySQL + Dolt?)")
-        with tempfile.TemporaryDirectory() as tmp, self.live.offline_server() as port:
+        with tempfile.TemporaryDirectory() as tmp, self.offline() as port:
             for db in self.live.databases(port):
                 if db not in archived:
                     self.live.load(db, port, f"DROP DATABASE `{db}`;", replace=False)

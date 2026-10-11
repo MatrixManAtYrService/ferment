@@ -389,16 +389,9 @@ def create_app(
 
     @app.get("/processes/{name}/log")
     def process_log(name: str, offset: int = 0):
-        """A workload process's output from byte `offset` on (logs/<name>.log)."""
-        path = controller.state_dir / "logs" / f"{name}.log"
-        if "/" in name or not path.exists():
-            return {"text": "", "offset": offset}
-        size = path.stat().st_size
-        offset = min(offset, size)
-        with path.open("rb") as f:
-            f.seek(offset)
-            data = f.read(1_000_000)
-        return {"text": data.decode(errors="replace"), "offset": offset + len(data)}
+        """A workload process's output from byte `offset` on."""
+        text, next_offset = controller.supervisor.log(name, offset)
+        return {"text": text, "offset": next_offset}
 
     @app.delete("/deployments/{name}")
     def undeploy(name: str, request: Request):

@@ -20,7 +20,7 @@ class Supervisor:
     def stop(self):
         self.running = False
 
-    def start(self, config):
+    def launch(self, processes):
         self.running = True
 
     def __init__(self):
@@ -31,6 +31,12 @@ class Supervisor:
 
     def processes(self):
         return self.procs if self.running else []
+
+    logs: dict[str, str] = {}
+
+    def log(self, name, offset=0):
+        text = self.logs.get(name, "")[offset:]
+        return text, offset + len(text)
 
     def is_ready(self, p):
         return p["status"] == "Running" and p["is_ready"] in ("Ready", "-")
@@ -222,9 +228,7 @@ def test_deploy_runs_in_the_background_and_a_failing_hook_stops_it(setup, tmp_pa
         assert failed["state"] == "failed" and "1.41" in failed["error"]
         assert [d["name"] for d in client.get("/deployments").json()] == ["svc"]  # not deployed
 
-        log = tc.state_dir / "logs" / "svc.log"
-        log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text("starting\nstarted\n")
+        tc.supervisor.logs = {"svc": "starting\nstarted\n"}  # where the workload runs (ferment.agent)
         first = client.get("/processes/svc/log").json()
         assert first["text"] == "starting\nstarted\n"
         assert client.get("/processes/svc/log", params={"offset": first["offset"]}).json()["text"] == ""

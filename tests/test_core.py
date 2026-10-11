@@ -337,8 +337,8 @@ def test_unset_clock_starts_on_real_time(tmp_path):
         def stop(self):
             pass
 
-        def start(self, config):
-            self.started = config
+        def launch(self, processes):
+            self.started = processes
 
         def processes(self):
             return []

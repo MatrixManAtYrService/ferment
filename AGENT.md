@@ -16,6 +16,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/server/clock.py` | `GuestClock`: the VM's clock is the workload's; offset to real time |
 | `ferment/archive.py` | `DoltArchive`: checkpoints of the live MySQL in Dolt (MySQL runs, Dolt remembers) |
 | `ferment/procompose.py` | `Process`, `render`, `WorkloadSupervisor` |
+| `ferment/agent/` | the workload agent (`app.py`: clock, process-compose, logs, offline DB, probes) and `AgentClient` (`client.py`), which the server drives it through; see `docs/split-vms.md` |
 | `ferment/server/` | `TimeController` (clock, checkpoints, restore), `create_app` (routes, event log), `store.py` (SQLite: sessions, events, checkpoints) |
 | `ferment/board.py` | `Board`: what attached people see (facts, services, milestones with log-line progress, feed); one model for the terminal, the web page, and status |
 | `ferment/server/board.py` | `board_router`: `GET /board` snapshot, `GET /board/stream` server-sent events |

@@ -134,7 +134,7 @@ def test_attached_client_fetches_for_the_vm(upstream, tmp_path, monkeypatch):
         def stop(self):
             pass
 
-        def start(self, c):
+        def launch(self, processes):
             pass
 
         def wait_ready(self, timeout=1):

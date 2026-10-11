@@ -2,11 +2,14 @@
 
 `Process` is the small slice of process-compose's schema ferment needs;
 `render` turns a set of them into a config; `WorkloadSupervisor` runs one
-process-compose instance and talks to its REST API.
+process-compose instance and talks to its REST API. It runs wherever the
+workload does: under the workload agent (ferment.agent), which the fermenter
+server drives through ferment.agent.client.AgentClient (same interface).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shlex
 import signal
@@ -53,6 +56,9 @@ class Process:
             }
         return entry
 
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
 
 def render(processes: list[Process], log_dir: Path) -> dict:
     """process-compose config. Each process also appends its output, as it
@@ -78,9 +84,12 @@ class WorkloadSupervisor:
     """Owns one process-compose instance: start it with a config, stop it,
     ask it what's running."""
 
-    def __init__(self, state_dir: Path, port: int, process_compose: str = "process-compose"):
+    def __init__(
+        self, state_dir: Path, port: int, log_dir: Path | None = None, process_compose: str = "process-compose"
+    ):
         self.state_dir = state_dir
         self.port = port
+        self.log_dir = log_dir or state_dir / "logs"
         self.binary = process_compose
         self.proc: subprocess.Popen | None = None
         self.probed: set[str] = set()
@@ -88,6 +97,10 @@ class WorkloadSupervisor:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+    def launch(self, processes: list[Process]) -> None:
+        """(Re)start the workload as exactly these processes."""
+        self.start(render(processes, self.log_dir))
 
     def start(self, config: dict) -> None:
         self.stop()
@@ -138,6 +151,18 @@ class WorkloadSupervisor:
             }
             for p in data.get("data", [])
         ]
+
+    def log(self, name: str, offset: int = 0, limit: int = 1_000_000) -> tuple[str, int]:
+        """A process's output from byte `offset` on (<log_dir>/<name>.log), and
+        the offset to ask for next."""
+        path = self.log_dir / f"{name}.log"
+        if "/" in name or not path.exists():
+            return "", offset
+        offset = min(offset, path.stat().st_size)
+        with path.open("rb") as f:
+            f.seek(offset)
+            data = f.read(limit)
+        return data.decode(errors="replace"), offset + len(data)
 
     def is_ready(self, p: dict) -> bool:
         """One process (from `processes`): running, and ready if it has a probe.
