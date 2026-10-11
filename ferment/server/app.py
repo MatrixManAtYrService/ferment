@@ -41,6 +41,11 @@ class NewSession(BaseModel):
     client: str
     relays: list[str] = []
     fetches: list[str] = []  # git hosts this client can fetch from on the VM's behalf
+    client_time: dt.datetime | None = None  # the client's (real) time: corrects the VM's idea of real time
+
+
+class Heartbeat(BaseModel):
+    client_time: dt.datetime | None = None
 
 
 class NewSourceRequest(BaseModel):
@@ -181,14 +186,18 @@ def create_app(
     @app.post("/sessions")
     def open_session(req: NewSession, request: Request):
         w = who(request)
+        if req.client_time is not None:
+            controller.clock.observe(req.client_time, w)
         serves = ", ".join(req.relays + req.fetches) or "nothing"
         broadcast("attached", w, f"{w} attached from {req.client} (serving: {serves})")
         return {"id": store.open_session(w, req.client, req.relays, req.fetches)}
 
     @app.post("/sessions/{session_id}/heartbeat")
-    def heartbeat(session_id: int):
+    def heartbeat(session_id: int, request: Request, req: Heartbeat | None = None):
         if not store.touch_session(session_id):
             raise HTTPException(404, "no open session with that id")
+        if req is not None and req.client_time is not None:
+            controller.clock.observe(req.client_time, who(request))
         return {"ok": True}
 
     @app.delete("/sessions/{session_id}")

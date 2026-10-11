@@ -11,13 +11,21 @@ The provider keeps anything from syncing the guest's clock back to real time
 clock and real time, so the server can still say what time it really is
 (event logs, checkpoints), and so it can put the fake date back after a
 reboot resets the clock to real time.
+
+With nothing syncing it, the guest's clock drifts, and it can stop while the
+host sleeps, so the recorded offset goes stale. Attached clients keep real
+time (NTP), so they report theirs (`observe`, on attach and every heartbeat)
+and the offset follows the median of their recent reports.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import statistics
 import subprocess
+import threading
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -41,6 +49,9 @@ def boot_id() -> str:
 class GuestClock:
     """offset = guest clock - real time. 0: the guest is on real time."""
 
+    SAMPLES = 9  # clients' reports the offset follows (median of)
+    TOLERANCE = dt.timedelta(seconds=0.25)  # smaller differences are latency, not drift
+
     def __init__(
         self,
         state_file: Path,
@@ -56,6 +67,9 @@ class GuestClock:
         self.set_to: str | None = None  # the fake date last requested
         self.set_at: str | None = None  # real time it was requested
         self.boot: str | None = None  # boot the offset was applied in
+        self.lock = threading.Lock()
+        self.samples: deque[dt.timedelta] = deque(maxlen=self.SAMPLES)
+        self.checked: dict | None = None  # the last client report: who, when, how far off we were
         if state_file.exists():
             s = json.loads(state_file.read_text())
             self.offset = dt.timedelta(seconds=s["offset_seconds"])
@@ -75,21 +89,45 @@ class GuestClock:
     def set(self, target: dt.datetime) -> None:
         if target.tzinfo is None:
             target = target.replace(tzinfo=dt.UTC)
-        real = self.real_now()
-        self._set(target)
-        self.offset = target - real
-        self.set_to, self.set_at, self.boot = target.isoformat(), real.isoformat(), self._boot()
-        self._save()
+        with self.lock:
+            real = self.real_now()
+            self._set(target)
+            self.offset = target - real
+            self.samples.clear()  # they measured the old offset
+            self.set_to, self.set_at, self.boot = target.isoformat(), real.isoformat(), self._boot()
+            self._save()
+
+    def observe(self, client_time: dt.datetime, who: str = "unknown") -> None:
+        """A client with real time says it's `client_time` (as of now, give or
+        take the round trip): correct the offset if it has drifted."""
+        if client_time.tzinfo is None:
+            client_time = client_time.replace(tzinfo=dt.UTC)
+        with self.lock:
+            sample = self._now() - client_time
+            self.samples.append(sample)
+            estimate = statistics.median(self.samples)
+            error = estimate - self.offset
+            self.checked = {
+                "who": who,
+                "at": client_time.isoformat(),
+                "error_seconds": round(error.total_seconds(), 3),
+                "samples": len(self.samples),
+            }
+            if abs(error) > self.TOLERANCE:
+                self.offset = estimate
+                self._save()
 
     def ensure(self) -> bool:
         """After a reboot the guest is back on real time: put the fake date
         back (it kept advancing meanwhile, like real time). True if it did."""
-        if self.offset == dt.timedelta(0) or self.boot == self._boot():
-            return False
-        self._set(self._now() + self.offset)  # the clock reads real time right now
-        self.boot = self._boot()
-        self._save()
-        return True
+        with self.lock:
+            if self.offset == dt.timedelta(0) or self.boot == self._boot():
+                return False
+            self._set(self._now() + self.offset)  # the clock reads real time right now
+            self.samples.clear()
+            self.boot = self._boot()
+            self._save()
+            return True
 
     def _save(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)

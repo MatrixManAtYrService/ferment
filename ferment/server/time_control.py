@@ -173,6 +173,7 @@ class TimeController:
             "offset_seconds": round(self.clock.offset.total_seconds()),
             "set_to": self.clock.set_to,
             "set_at": self.clock.set_at,
+            "real_time_checked": self.clock.checked,  # the last attached client's report, if any
             "launched_at": self.launched_at.isoformat() if self.launched_at else None,
             "workload": self.supervisor.processes(),
         }

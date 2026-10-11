@@ -125,7 +125,7 @@ def test_api_records_who_did_what_and_who_is_here(setup):
     with TestClient(create_app(tc)) as client:  # lifespan resumes: clock starts on real time
         hdr = {"X-Ferment-User": "carol@laptop"}
         sid = client.post("/sessions", json={"client": "laptop", "relays": ["nexus:443"]}, headers=hdr).json()["id"]
-        assert client.post(f"/sessions/{sid}/heartbeat").status_code == 200
+        assert client.post(f"/sessions/{sid}/heartbeat").status_code == 200  # older clients send no body
         (s,) = client.get("/sessions").json()
         assert (s["who"], s["relays"], s["active"]) == ("carol@laptop", ["nexus:443"], True)
 
@@ -219,3 +219,16 @@ def test_deploy_runs_in_the_background_and_a_failing_hook_stops_it(setup, tmp_pa
         first = client.get("/processes/svc/log").json()
         assert first["text"] == "starting\nstarted\n"
         assert client.get("/processes/svc/log", params={"offset": first["offset"]}).json()["text"] == ""
+
+
+def test_attached_clients_time_corrects_the_servers_real_time(setup):
+    tc, _ = setup
+    with TestClient(create_app(tc)) as client:
+        assert client.get("/status").json()["real_time_checked"] is None
+        late = tc.clock.real_now() + dt.timedelta(minutes=10)  # the VM's clock fell 10 minutes behind
+        sid = client.post("/sessions", json={"client": "laptop", "client_time": late.isoformat()}).json()["id"]
+        checked = client.get("/status").json()["real_time_checked"]
+        assert round(checked["error_seconds"]) == -600
+        assert abs((tc.clock.real_now() - late).total_seconds()) < 1
+        assert client.post(f"/sessions/{sid}/heartbeat", json={"client_time": late.isoformat()}).status_code == 200
+        assert client.get("/status").json()["real_time_checked"]["samples"] == 2

@@ -52,6 +52,43 @@ def test_guest_clock_keeps_real_time_and_survives_a_reboot(tmp_path):
     assert system["t"] == dt.datetime(2026, 10, 3, 1, tzinfo=dt.UTC)  # date restored, an hour on
 
 
+def test_clients_reports_correct_a_drifted_guest_clock(tmp_path):
+    import datetime as dt
+
+    from ferment.server.clock import GuestClock
+
+    real = {"t": dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.UTC)}
+    system = {"t": real["t"]}
+
+    def tick(seconds, guest_too=True):
+        real["t"] += dt.timedelta(seconds=seconds)
+        if guest_too:
+            system["t"] += dt.timedelta(seconds=seconds)
+
+    clock = GuestClock(
+        tmp_path / "time.json", set_system_time=lambda when: system.update(t=when), system_now=lambda: system["t"]
+    )
+    clock.set(dt.datetime(2026, 10, 3, tzinfo=dt.UTC))
+    tick(3600, guest_too=False)  # the host slept an hour: the guest's clock stood still
+    assert clock.real_now() == real["t"] - dt.timedelta(hours=1)
+
+    clock.observe(real["t"], "alice")
+    assert clock.real_now() == real["t"]  # one report fixes it
+    assert clock.checked["error_seconds"] == -3600 and clock.checked["who"] == "alice"
+    assert GuestClock(tmp_path / "time.json").offset == clock.offset  # and it's kept
+
+    # latency-sized differences don't move it; an outlier among good reports doesn't either
+    offset = clock.offset
+    clock.observe(real["t"] - dt.timedelta(milliseconds=80))
+    clock.observe(real["t"] + dt.timedelta(minutes=5), "bob-with-a-bad-clock")
+    clock.observe(real["t"])
+    assert clock.offset == offset
+
+    # setting the clock forgets reports about the old offset
+    clock.set(dt.datetime(2026, 10, 4, tzinfo=dt.UTC))
+    assert len(clock.samples) == 0 and clock.real_now() == real["t"]
+
+
 def test_process_output_is_teed_to_its_own_log(tmp_path):
     cfg = render([Process("svc", "exec java -jar x.jar")], tmp_path)
     cmd = cfg["processes"]["svc"]["command"]
