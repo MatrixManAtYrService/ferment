@@ -29,13 +29,7 @@
   outputs = {
     self, nixpkgs, flake-utils, uv2nix, pyproject-nix, pyproject-build-systems,
   }:
-    {
-      # fermentGo / fermentFakeable: Go programs that obey FAKETIME
-      # (see nix/fakeable-go.nix). Consumed by the VM-side flake of a
-      # concrete fermenter.
-      overlays.default = import ./nix/fakeable-go.nix;
-    }
-    // flake-utils.lib.eachDefaultSystem (system:
+    flake-utils.lib.eachDefaultSystem (system:
       let
         lib = nixpkgs.lib;
         pkgs = import nixpkgs { inherit system; };

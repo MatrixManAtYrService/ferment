@@ -1,29 +1,25 @@
-"""Server-side time control: the workload runs under one fake clock, and
-changing the date means restarting the whole workload tree with a new one.
-
-The server that owns this runs on real time, outside the faked tree, so it
-survives the restart it performs (as does sshd, so attached clients keep
-their tunnel).
+"""Server-side time control: the workload runs at the VM's clock, and changing
+the date means stopping the workload, setting the guest's clock, and starting
+the workload again.
 
 It also owns checkpoints: one external checkpoint is a snapshot of every
 versioned store (each its own internal commit), recorded in the Store. A
 clock change checkpoints automatically, while the workload is stopped, so
 every store is cut at the same instant. Restoring one puts the data back and
-the clock back to the checkpoint's fake time.
+the clock back to the checkpoint's date.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import json
 import re
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from ferment.faketime import FakeClock
 from ferment.procompose import Process, WorkloadSupervisor, render
+from ferment.server import clock as clock_mod
+from ferment.server.clock import GuestClock
 from ferment.server.store import Store
 
 CHECKPOINT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
@@ -34,11 +30,11 @@ class CheckpointError(ValueError):
 
 
 class Versioned(Protocol):
-    """A store that can be one part of a checkpoint (e.g. ferment.databases.Dolt)."""
+    """A store that can be one part of a checkpoint (e.g. ferment.archive.DoltArchive)."""
 
-    def snapshot(self, message: str, tags: list[str], *, running: bool, env: dict[str, str]) -> dict[str, str]: ...
+    def snapshot(self, message: str, tags: list[str], *, running: bool) -> dict[str, str]: ...
 
-    def restore(self, parts: dict[str, str], *, env: dict[str, str]) -> None: ...
+    def restore(self, parts: dict[str, str]) -> None: ...
 
 
 class Stack(Protocol):
@@ -47,94 +43,61 @@ class Stack(Protocol):
     def processes(self) -> list[Process]: ...
 
 
-@dataclass
-class TimeState:
-    offset_seconds: int
-    set_to: str  # the fake datetime requested
-    set_at: str  # real time when it was requested
-
-    @property
-    def clock(self) -> FakeClock:
-        return FakeClock(self.offset_seconds)
-
-
 class TimeController:
     def __init__(
         self,
         stack: Stack,
         supervisor: WorkloadSupervisor,
-        libfaketime: str,
         state_dir: Path,
         *,
         versioned: list[Versioned] | None = None,
         store: Store | None = None,
+        clock: GuestClock | None = None,
     ):
         self.stack = stack
         self.versioned = versioned or []
+        self.clock = clock or GuestClock(state_dir / "time.json")
+        clock_mod.use(self.clock)
         self.store = store or Store(state_dir / "fermenter.db")
         self.supervisor = supervisor
-        self.libfaketime = libfaketime
         self.state_dir = state_dir
-        self.state_file = state_dir / "time.json"
         self.lock = threading.Lock()
-        self.state: TimeState | None = None
-        # Real time the current workload was launched (by resume or a date
+        # When the current workload was launched (by resume or a date
         # change). Anything the workload wrote before this is from its
         # predecessor.
         self.launched_at: dt.datetime | None = None
-        if self.state_file.exists():
-            self.state = TimeState(**json.loads(self.state_file.read_text()))
 
-    def _launch(self, clock: FakeClock) -> None:
-        config = render(self.stack.processes(), clock.env(self.libfaketime), self.state_dir / "logs")
-        self.launched_at = dt.datetime.now(dt.UTC)
+    def _launch(self) -> None:
+        config = render(self.stack.processes(), self.state_dir / "logs")
+        self.launched_at = self.clock.now()
         self.supervisor.start(config)
 
     def resume(self) -> None:
-        """On server start: bring the workload back with the clock it had.
-
-        The offset persists, so fake time keeps advancing in step with real
-        time, including across a server or VM restart. A fermenter that never
-        had its clock set starts on real time (offset 0), so it's usable
-        right away; setting a date later just moves the clock.
-        """
-        if self.state is None:
-            self.set_time(dt.datetime.now(dt.UTC), wait_ready=False)
-            return
+        """On server start: bring the workload back on the clock it had (after
+        a VM reboot, the guest is on real time again: put the date back)."""
         with self.lock:
-            self._launch(self.state.clock)
-
-    def _set_clock(self, target: dt.datetime) -> FakeClock:
-        now = dt.datetime.now(dt.UTC)
-        clock = FakeClock.starting_at(target, now=now)
-        self.state = TimeState(clock.offset_seconds, target.isoformat(), now.isoformat())
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(self.state.__dict__, indent=2))
-        return clock
+            self.clock.ensure()
+            self._launch()
 
     def _checkpoint(self, *, message: str, kind: str, who: str, name: str | None, running: bool) -> dict:
         """Snapshot every versioned store and record it. Caller holds the lock."""
-        if self.state is None:
-            raise CheckpointError("the clock was never set; nothing to checkpoint")
         if name is not None:
             if not CHECKPOINT_NAME.match(name):
                 raise CheckpointError(f"bad checkpoint name {name!r}: start with a letter; letters, digits, . _ -")
             if self.store.name_taken(name):
                 raise CheckpointError(f"a checkpoint named {name!r} already exists")
-        clock = self.state.clock
         cid = self.store.next_checkpoint_id()
         tags = [f"ckpt-{cid}"] + ([name] if name else [])
-        env = clock.env(self.libfaketime)
         parts: dict[str, str] = {}
         for store in self.versioned:
-            parts.update(store.snapshot(message, tags, running=running, env=env))
+            parts.update(store.snapshot(message, tags, running=running))
         return self.store.add_checkpoint(
             name=name,
             message=message,
             kind=kind,
             who=who,
-            fake_time=clock.now().isoformat(),
-            offset_seconds=clock.offset_seconds,
+            fake_time=self.clock.now().isoformat(),
+            offset_seconds=round(self.clock.offset.total_seconds()),
             parts=parts,
         )
 
@@ -146,7 +109,7 @@ class TimeController:
         checkpoint = None
         with self.lock:
             self.supervisor.stop()
-            if self.state is not None and self.versioned:
+            if self.versioned:
                 try:
                     checkpoint = self._checkpoint(
                         message=f"before clock change to {target.isoformat()}",
@@ -156,9 +119,10 @@ class TimeController:
                         running=False,
                     )
                 except Exception:
-                    self._launch(self.state.clock)  # don't leave the workload down
+                    self._launch()  # don't leave the workload down
                     raise
-            self._launch(self._set_clock(target))
+            self.clock.set(target)
+            self._launch()
             ready = self.supervisor.wait_ready() if wait_ready else None
         return {**self.status(), "ready": ready, "checkpoint": checkpoint}
 
@@ -169,8 +133,8 @@ class TimeController:
 
     def restore(self, ref: str, wait_ready: bool = True, who: str = "unknown") -> dict:
         """Put every versioned store back to checkpoint `ref` (id or name) and
-        the clock back to the fake time it was taken at. The state being left
-        is checkpointed first, so a restore can itself be undone."""
+        the clock back to the date it was taken at. The state being left is
+        checkpointed first, so a restore can itself be undone."""
         cp = self.store.checkpoint(ref)
         if cp is None:
             raise CheckpointError(f"no checkpoint {ref!r}")
@@ -179,16 +143,13 @@ class TimeController:
         with self.lock:
             self.supervisor.stop()
             left = self._checkpoint(
-                message=f"before restoring checkpoint {cp['id']}",
-                kind="before-restore",
-                who=who,
-                name=None,
+                message=f"before restoring checkpoint {cp['id']}", kind="before-restore", who=who, name=None,
                 running=False,
-            )
-            env = self.state.clock.env(self.libfaketime) if self.state else {}
+            )  # fmt: skip
             for store in self.versioned:
-                store.restore(cp["parts"], env=env)
-            self._launch(self._set_clock(dt.datetime.fromisoformat(cp["fake_time"])))
+                store.restore(cp["parts"])
+            self.clock.set(dt.datetime.fromisoformat(cp["fake_time"]))
+            self._launch()
             ready = self.supervisor.wait_ready() if wait_ready else None
         return {**self.status(), "ready": ready, "restored": cp, "previous": left}
 
@@ -197,10 +158,7 @@ class TimeController:
         deployed services changed)."""
         with self.lock:
             self.supervisor.stop()
-            if self.state is None:
-                self._set_clock(dt.datetime.now(dt.UTC))
-            assert self.state is not None
-            self._launch(self.state.clock)
+            self._launch()
             ready = self.supervisor.wait_ready(timeout) if wait_ready else None
         return {**self.status(), "ready": ready}
 
@@ -209,13 +167,12 @@ class TimeController:
             self.supervisor.stop()
 
     def status(self) -> dict:
-        real = dt.datetime.now(dt.UTC)
         return {
-            "real_now": real.isoformat(),
-            "fake_now": self.state.clock.now().isoformat() if self.state else None,
-            "offset_seconds": self.state.offset_seconds if self.state else None,
-            "set_to": self.state.set_to if self.state else None,
-            "set_at": self.state.set_at if self.state else None,
+            "real_now": self.clock.real_now().isoformat(),
+            "fake_now": self.clock.now().isoformat(),
+            "offset_seconds": round(self.clock.offset.total_seconds()),
+            "set_to": self.clock.set_to,
+            "set_at": self.clock.set_at,
             "launched_at": self.launched_at.isoformat() if self.launched_at else None,
             "workload": self.supervisor.processes(),
         }

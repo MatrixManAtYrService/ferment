@@ -21,14 +21,15 @@ ferment provides the pieces that make that practical:
   forwards), so a local VM and a cloud VM are driven by the same code.
 - **lifetime** (`ferment.lifetime`): deadlines recorded by the provider and
   armed as a timer inside the guest, so a forgotten VM goes away on its own.
-- **faked time** (`ferment.faketime`): libfaketime in *offset* mode, so every
-  process in the tree agrees on the time no matter when it started.
-- **fakeable Go** (`nix/fakeable-go.nix`, the flake's `overlays.default`):
-  libfaketime can't reach Go programs, so this patches Go's `time.Now()` to
-  honor the same `FAKETIME` offset. `fermentFakeable pkgs.dolt` gives a Dolt
-  whose `NOW()` and commit dates follow the fake clock.
-- **databases** (`ferment.databases`): MariaDB, or Dolt for checkpoints,
-  history, diffs between checkpoints, and hard restores.
+- **the guest clock** (`ferment.server.clock`): the workload runs at the
+  VM's own system clock, set to whatever date you choose, so every process,
+  the kernel, and file timestamps agree by construction. The server
+  remembers the offset to real time and puts the date back after a reboot;
+  providers keep the guest from syncing its clock (e.g. Lima's guest agent).
+- **databases and history** (`ferment.databases`, `ferment.archive`): MySQL
+  8.4 runs the workload; each checkpoint is copied into Dolt (one repo per
+  database), which gives commits, tags, table/row diffs, and restores. MySQL
+  runs, Dolt remembers.
 - **process-compose supervision** (`ferment.procompose`): one parent for the
   whole workload, so the whole workload shares one clock.
 - **time control and checkpoints** (`ferment.server`): a FastAPI app factory
@@ -56,20 +57,22 @@ processes, which data) and its own CLIs. See
 [skills-ebb-ferment](https://github.corp.clover.com/clover/skills-ebb-ferment)
 for one.
 
-## Why offset mode
+## Why the VM's own clock
 
-libfaketime can start a process at a fixed date (`FAKETIME="@2026-10-03
-00:00:00"`), but that clock starts when *each process* starts: a service that
-boots 40 seconds after its database runs 40 seconds behind it. ferment always
-uses an offset from real time (`FAKETIME="-604800"`), computed once per date
-change and given to every process, including ones spawned much later.
+The first version faked time per process with libfaketime (LD_PRELOAD). It
+can't reach Go programs, needs care to keep processes consistent, and made
+every idle JVM spin two CPU cores. A fermenter is a whole VM anyway, so its
+system clock is simply set to the workload's date. Everything on the VM
+agrees, at no cost. The trade: things on the VM that check certificate dates
+(downloading packages) see the fake date too, so build near real time.
 
-libfaketime only affects programs that read the clock through libc. The JVM,
-Python, MariaDB, and coreutils do; Go binaries (process-compose, Grafana,
-Loki, Prometheus, Dolt) don't. ferment uses that split on purpose: the
-supervisor and observability stay on real time, the workload is faked. A Go
-program that belongs in the workload (Dolt) is rebuilt with ferment's patched
-Go toolchain, which reads the same `FAKETIME` offset.
+## Why MySQL runs and Dolt remembers
+
+Dolt can run a lot of MySQL, but real services find the gaps (WITH ROLLUP,
+variables inside stored procedures, some ALTER syntax). So services run on
+MySQL, production's engine, and Dolt holds only history: mysqldump in at each
+checkpoint, `dolt dump` out on restore. Views and routines Dolt can't hold
+are kept as SQL text beside the tables.
 
 ## Development
 

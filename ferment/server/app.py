@@ -19,8 +19,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ferment.archive import DoltArchive
 from ferment.client import WHO_HEADER
-from ferment.databases import Database, Dolt
+from ferment.databases import Database
 from ferment.server import logs
 from ferment.server.builds import Builder
 from ferment.server.sources import SourceStore, SourceStoreError
@@ -88,8 +89,7 @@ def create_app(
     logs.configure(log_path)
 
     def broadcast(event: str, who_: str, message: str, **fields) -> None:
-        fake = controller.state.clock.now().isoformat() if controller.state else None
-        logs.broadcast(event, who_, message, fake_time=fake, **fields)
+        logs.broadcast(event, who_, message, **fields)
 
     sources = SourceStore(controller.state_dir)
     builder = Builder(store, sources, controller.state_dir / "logs" / "builds", broadcast=broadcast)
@@ -108,7 +108,7 @@ def create_app(
     async def log_events(request: Request, call_next):
         response = await call_next(request)
         if request.method not in ("GET", "HEAD", "OPTIONS") and not request.url.path.endswith("/heartbeat"):
-            fake = controller.state.clock.now().isoformat() if controller.state else None
+            fake = controller.clock.now().isoformat()
             store.add_event(
                 who(request),
                 f"{request.method} {request.url.path}",
@@ -375,15 +375,17 @@ def create_app(
         return {"text": text, "offset": next_offset}
 
     if database is not None:
-        _mount_database(app, database)
+        _mount_database(app, controller, database)
 
     return app
 
 
-def _mount_database(app: FastAPI, database: Database) -> None:
+def _mount_database(app: FastAPI, controller: TimeController, database: Database) -> None:
+    archive = next((v for v in controller.versioned if isinstance(v, DoltArchive)), None)
+
     @app.get("/db")
     def db_info():
-        return {"kind": database.kind, "versioned": database.versioned, "client": database.client}
+        return {"kind": database.kind, "versioned": archive is not None, "client": database.client}
 
     # Runs the stock CLI client server-side, so callers need no driver, no
     # route to the database port, and no opinion about the fake clock.
@@ -397,9 +399,14 @@ def _mount_database(app: FastAPI, database: Database) -> None:
             raise HTTPException(400, result.stderr.strip())
         return {"output": result.stdout}
 
-    if isinstance(database, Dolt):
+    if archive is not None:
 
         @app.get("/db/diff")
-        def db_diff(from_ref: str, to_ref: str = "WORKING"):
-            """Refs: dolt hashes, checkpoint names, or ckpt-<id>."""
-            return database.diff(from_ref, to_ref)
+        def db_diff(from_ref: str, to_ref: str = "HEAD"):
+            """Refs: checkpoint names, ckpt-<id>, or dolt commits (in the archive)."""
+            return archive.diff(from_ref, to_ref)
+
+        @app.get("/db/diff/{database_name}/{table}")
+        def db_row_diff(database_name: str, table: str, from_ref: str, to_ref: str = "HEAD"):
+            """Row by row: what changed in one table between two checkpoints."""
+            return archive.row_diff(database_name, table, from_ref, to_ref)

@@ -13,7 +13,8 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/ssh.py` | run (optionally holding forwards), push_dir (tar over ssh), tunnels (`Forward`, -L and -R) |
 | `ferment/relay.py` | make a client-reachable `host:port` appear on a NixOS VM under its own name (`-R` + /etc/hosts + socat) |
 | `ferment/lifetime.py` | durations, in-guest poweroff timer |
-| `ferment/faketime.py` | `FakeClock`: libfaketime offset-mode env |
+| `ferment/server/clock.py` | `GuestClock`: the VM's clock is the workload's; offset to real time |
+| `ferment/archive.py` | `DoltArchive`: checkpoints of the live MySQL in Dolt (MySQL runs, Dolt remembers) |
 | `ferment/procompose.py` | `Process`, `render`, `WorkloadSupervisor` |
 | `ferment/server/` | `TimeController` (clock, checkpoints, restore), `create_app` (routes, event log), `store.py` (SQLite: sessions, events, checkpoints) |
 | `ferment/clockcheck.py` | clock probes + agreement check |
@@ -22,7 +23,6 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/server/sources.py`, `builds.py` | VM side: bare repos from bundles, worktrees, builds (real time, SOURCE_DATE_EPOCH = commit time, cached per input; each a script in its own systemd unit that outlives the server, finished via an exit-status file) |
 | `ferment/databases.py` | MariaDB / Dolt processes; Dolt checkpoints, log, diff, restore |
 | `ferment/config.py` | `~/.config/ferment/config.toml` |
-| `nix/fakeable-go.nix` | overlay: `fermentGo`, `fermentFakeable` (Go that obeys FAKETIME) |
 
 ## Dev environment (nix)
 
@@ -34,10 +34,9 @@ README.md: users only need uv.
 
 - Providers stop at "here's an ssh target". Anything above that goes through
   `ferment.ssh` so it works on every provider.
-- Faked processes get one shared offset (`FakeClock.env`), never libfaketime's
-  start-at mode.
-- A Go program inside the faked tree must be built with `fermentFakeable`;
-  otherwise it silently runs on real time (stock Dolt's `NOW()` does).
+- Time is the VM's system clock. Don't add per-process time shims; providers
+  must keep the guest's clock from being synced back (see vm/lima.py).
+- Services run on MySQL; Dolt only stores checkpoint history.
 - No TLS between real-time and faked processes: certs minted under the fake
   clock look not-yet-valid or expired to everyone else.
 - Store schema changes are new entries appended to `store.MIGRATIONS`; never

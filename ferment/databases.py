@@ -1,24 +1,28 @@
-"""SQL databases a fermenter's workload can run on.
+"""SQL databases a fermenter's workload runs on.
 
-Both speak the MySQL protocol on 127.0.0.1:<port>, so services don't care
-which one they got. Both run inside the faked tree:
+Both speak the MySQL protocol on 127.0.0.1:<port>.
 
-- MariaDB reads the clock through libc: libfaketime covers it.
-- Dolt is Go, which libfaketime can't reach; it must be built with ferment's
-  patched Go toolchain (nix/fakeable-go.nix: `fermentFakeable pkgs.dolt`),
-  which honors the same FAKETIME offset.
+- MySQL 8.4 (the default): the line production runs, so services, their
+  migrations, and their queries behave as they do in production. Root over
+  TCP with no password (a loopback-only sandbox). Its history is kept by
+  ferment.archive.DoltArchive: "MySQL runs, Dolt remembers".
+- MariaDB: the older fallback; no archive.
 
-Dolt adds version control: it can be one part of a fermenter checkpoint (a
-commit and tag in every database; see ferment.server.store), diffs between
-checkpoints, and hard restores to one. Commits made under a fake clock carry
-fake dates, so history reads in the workload's time.
+No TLS where a client might check validity dates: a server's self-signed cert
+is minted at the fermenter's (fake) date, which a client elsewhere would see
+as not yet valid.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import os
 import shlex
 import subprocess
+import tempfile
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +34,10 @@ from ferment.procompose import Process
 SYSTEM_SCHEMAS = {"information_schema", "mysql", "performance_schema", "sys"}
 
 
+class DatabaseError(RuntimeError):
+    pass
+
+
 @dataclass
 class Database:
     kind: str
@@ -38,12 +46,8 @@ class Database:
 
     @property
     def client(self) -> str:
-        """Shell prefix for the mariadb CLI against this server (no TLS).
-
-        No TLS anywhere: a server's self-signed cert is minted by the FAKE
-        clock, so real-time clients would reject it as not yet valid.
-        """
-        return f"mariadb --skip-ssl -h 127.0.0.1 -P {self.port} -u root"
+        """Shell prefix for a CLI client against this server."""
+        raise NotImplementedError
 
     def processes(self) -> list[Process]:
         raise NotImplementedError
@@ -81,107 +85,124 @@ class MariaDB(Database):
         ]
 
 
-class Dolt(Database):
-    def __init__(self, state_dir: Path, port: int = 3306):
-        super().__init__("dolt", state_dir, port)
+class MySQL(Database):
+    """MySQL 8.4 from FERMENT_MYSQL_BIN (by path: MariaDB's packages also
+    install `mysql`/`mysqldump` names)."""
+
+    def __init__(self, state_dir: Path, port: int = 3306, bin_dir: str | None = None):
+        super().__init__("mysql", state_dir, port)
+        self.bin = bin_dir if bin_dir is not None else os.environ.get("FERMENT_MYSQL_BIN", "")
 
     @property
     def data_dir(self) -> Path:
-        return self.state_dir / "dolt"
+        return self.state_dir / "mysql84"
+
+    def tool(self, name: str) -> str:
+        return str(Path(self.bin) / name) if self.bin else name
+
+    def client_args(self, port: int | None = None) -> list[str]:
+        return [self.tool("mysql"), "--no-defaults", "-h", "127.0.0.1", "-P", str(port or self.port), "-uroot"]
 
     @property
-    def versioned(self) -> bool:
-        return True
+    def client(self) -> str:
+        return " ".join(shlex.quote(a) for a in self.client_args())
 
-    def connect(self, database: str | None = None) -> pymysql.Connection:
-        return pymysql.connect(host="127.0.0.1", port=self.port, user="root", database=database, autocommit=True)
+    @property
+    def _init_file(self) -> Path:
+        return self.state_dir / "mysql84-init.sql"
 
-    def databases(self) -> list[str]:
-        with self.connect() as conn, conn.cursor() as cur:
-            cur.execute("SHOW DATABASES")
-            return [row[0] for row in cur.fetchall() if row[0].lower() not in SYSTEM_SCHEMAS]
+    def _init_script(self) -> str:
+        """Initialize the data dir once; root reachable over TCP (init file)."""
+        d = shlex.quote(str(self.data_dir))
+        init = shlex.quote(str(self._init_file))
+        mysqld = shlex.quote(self.tool("mysqld"))
+        sql = "CREATE USER IF NOT EXISTS 'root'@'127.0.0.1'; GRANT ALL ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;"
+        return (
+            f"mkdir -p {shlex.quote(str(self.state_dir))}; echo {shlex.quote(sql)} > {init}; "
+            f"[ -d {d}/mysql ] || {mysqld} --no-defaults --initialize-insecure --datadir={d} >/dev/null 2>&1"
+        )
+
+    def _socket(self, name: str) -> Path:
+        """Unix socket paths max out around 104 bytes; fall back to /tmp."""
+        path = self.state_dir / f"{name}.sock"
+        if len(str(path)) < 100:
+            return path
+        digest = hashlib.sha256(str(path).encode()).hexdigest()[:12]
+        return Path(tempfile.gettempdir()) / f"ferment-{digest}.sock"
+
+    def _server_args(self, port: int, socket: Path) -> list[str]:
+        return [
+            self.tool("mysqld"), "--no-defaults", f"--datadir={self.data_dir}", f"--port={port}",
+            f"--socket={socket}", "--bind-address=127.0.0.1", "--mysqlx=OFF",
+            f"--pid-file={self.state_dir / f'mysql84.{port}.pid'}", f"--init-file={self._init_file}",
+        ]  # fmt: skip
 
     def processes(self) -> list[Process]:
-        data = shlex.quote(str(self.data_dir))
+        server = " ".join(shlex.quote(a) for a in self._server_args(self.port, self._socket("mysql84")))
         return [
             Process(
-                "dolt",
-                f"mkdir -p {data} && cd {data} && "
-                "dolt config --global --add user.name fermenter >/dev/null 2>&1; "
-                "dolt config --global --add user.email fermenter@localhost >/dev/null 2>&1; "
-                "dolt config --global --add versioncheck.disabled true >/dev/null 2>&1; "
-                f"exec dolt sql-server --host 127.0.0.1 --port {self.port} --data-dir {data}",
+                "mysql",
+                f"{self._init_script()} && exec {server}",
                 readiness_exec=f"{self.client} -e 'SELECT 1'",
+                readiness_initial_delay=2,
             )
         ]
 
-    # -- snapshots (one part of a fermenter checkpoint) --------------------------
-    #
-    # Each database is its own dolt repo under data_dir, committed and tagged
-    # together. Running: through SQL. Stopped (clock changes, restores: the
-    # whole workload is down, so every store is cut at the same moment):
-    # through the dolt CLI, run under the workload's fake clock so commit
-    # dates read in workload time.
+    # -- for the archive -----------------------------------------------------------
 
-    def _offline_databases(self) -> list[str]:
-        return sorted(p.parent.name for p in self.data_dir.glob("*/.dolt"))
-
-    def _cli(self, db: str, *args: str, env: dict[str, str]) -> str:
-        result = subprocess.run(
-            ["dolt", *args], cwd=self.data_dir / db, env={**os.environ, **env}, text=True, capture_output=True
+    def connect(self, port: int | None = None, database: str | None = None) -> pymysql.Connection:
+        return pymysql.connect(
+            host="127.0.0.1", port=port or self.port, user="root", database=database, autocommit=True
         )
+
+    def databases(self, port: int | None = None) -> list[str]:
+        with self.connect(port) as conn, conn.cursor() as cur:
+            cur.execute("SHOW DATABASES")
+            return [row[0] for row in cur.fetchall() if row[0].lower() not in SYSTEM_SCHEMAS]
+
+    @contextlib.contextmanager
+    def offline_server(self, port: int = 3399) -> Iterator[int]:
+        """Run mysqld on the live data dir while the workload is stopped (to
+        dump or restore it); yields its port."""
+        subprocess.run(["bash", "-c", self._init_script()], check=True)
+        log_path = self.state_dir / "mysql84-offline.log"
+        with log_path.open("a") as log:
+            proc = subprocess.Popen(self._server_args(port, self._socket(f"mysql84-{port}")), stdout=log, stderr=log)
+        try:
+            deadline = time.monotonic() + 120
+            while subprocess.run([*self.client_args(port), "-e", "SELECT 1"], capture_output=True).returncode:
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    raise DatabaseError(f"mysqld wouldn't start; see {log_path}")
+                time.sleep(0.5)
+            yield port
+        finally:
+            proc.terminate()
+            proc.wait(timeout=120)
+
+    def dump(self, database: str, port: int, out: Path, *, routines: bool, extra: list[str] = ()) -> None:  # type: ignore[assignment]
+        """Tables (with data and triggers), or only the stored routines."""
+        args = [self.tool("mysqldump"), "--no-defaults", "-h", "127.0.0.1", "-P", str(port), "-uroot",
+                "--single-transaction", "--set-gtid-purged=OFF", "--no-tablespaces", *extra]  # fmt: skip
+        if routines:
+            args += ["--routines", "--no-create-info", "--no-data", "--skip-triggers"]
+        else:
+            args += ["--skip-routines"]
+        with out.open("w") as f:
+            result = subprocess.run([*args, database], stdout=f, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
-            raise RuntimeError(f"dolt {' '.join(args)} in {db}: {result.stderr.strip() or result.stdout.strip()}")
-        return result.stdout
+            raise DatabaseError(f"mysqldump {database}: {result.stderr.strip()}")
 
-    def snapshot(self, message: str, tags: list[str], *, running: bool, env: dict[str, str]) -> dict[str, str]:
-        """Commit (even if nothing changed) and tag every database; returns
-        {"dolt:<db>": commit hash}."""
-        parts = {}
-        if running:
-            for db in self.databases():
-                with self.connect(db) as conn, conn.cursor() as cur:
-                    cur.execute("CALL DOLT_COMMIT('-A', '--allow-empty', '-m', %s)", (message,))
-                    for tag in tags:
-                        cur.execute("CALL DOLT_TAG(%s, 'HEAD')", (tag,))
-                    cur.execute("SELECT HASHOF('HEAD')")
-                    parts[f"dolt:{db}"] = cur.fetchone()[0]
-            return parts
-        for db in self._offline_databases():
-            self._cli(db, "add", "-A", env=env)
-            self._cli(db, "commit", "--allow-empty", "-m", message, env=env)
-            for tag in tags:
-                self._cli(db, "tag", tag, env=env)
-            out = self._cli(db, "sql", "-r", "csv", "-q", "SELECT HASHOF('HEAD') AS h", env=env)
-            parts[f"dolt:{db}"] = out.strip().splitlines()[-1]
-        return parts
-
-    def restore(self, parts: dict[str, str], *, env: dict[str, str]) -> None:
-        """Hard-reset each database to its part's commit. Workload must be stopped.
-        Databases created after the checkpoint are left alone (not dropped)."""
-        for store, ref in parts.items():
-            kind, _, db = store.partition(":")
-            if kind == "dolt" and (self.data_dir / db / ".dolt").exists():
-                self._cli(db, "reset", "--hard", ref, env=env)
-
-    def diff(self, from_ref: str, to_ref: str = "WORKING") -> dict[str, list[dict]]:
-        """Per database: which tables changed between two refs, and how much.
-        Checkpoint names and `ckpt-<id>` are dolt tags, so they work as refs."""
-        out = {}
-        for db in self.databases():
-            with self.connect(db) as conn, conn.cursor(pymysql.cursors.DictCursor) as cur:
-                try:
-                    cur.execute("SELECT * FROM DOLT_DIFF_STAT(%s, %s)", (from_ref, to_ref))
-                except pymysql.err.MySQLError as e:  # ref unknown in this database
-                    out[db] = [{"error": str(e)}]
-                    continue
-                out[db] = [{k: (str(v) if v is not None else None) for k, v in row.items()} for row in cur.fetchall()]
-        return out
+    def load(self, database: str, port: int, sql: str, *, replace: bool) -> None:
+        head = f"DROP DATABASE IF EXISTS `{database}`;\nCREATE DATABASE `{database}`;\n" if replace else ""
+        sql = f"{head}USE `{database}`;\n{sql}"
+        result = subprocess.run(self.client_args(port), input=sql, text=True, capture_output=True)
+        if result.returncode != 0:
+            raise DatabaseError(f"loading {database}: {result.stderr.strip()[-2000:]}")
 
 
 def make_database(kind: str, state_dir: Path, port: int = 3306) -> Database:
+    if kind == "mysql":
+        return MySQL(state_dir, port)
     if kind == "mariadb":
         return MariaDB(state_dir, port)
-    if kind == "dolt":
-        return Dolt(state_dir, port)
-    raise ValueError(f"unknown database {kind!r} (mariadb, dolt)")
+    raise ValueError(f"unknown database {kind!r} (mysql, mariadb)")

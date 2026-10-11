@@ -32,14 +32,12 @@ class Process:
     readiness_initial_delay: int = 1
     readiness_period: int = 2
     readiness_failures: int = 60
-    faked: bool = True  # run under the workload's fake clock
     restart: str = "on_failure"
 
-    def to_pc(self, extra_env: dict[str, str]) -> dict:
-        env = {**(extra_env if self.faked else {}), **self.env}
+    def to_pc(self) -> dict:
         entry: dict = {
             "command": self.command,
-            "environment": [f"{k}={v}" for k, v in env.items()],
+            "environment": [f"{k}={v}" for k, v in self.env.items()],
             "availability": {"restart": self.restart, "backoff_seconds": 2},
         }
         if self.working_dir:
@@ -56,14 +54,14 @@ class Process:
         return entry
 
 
-def render(processes: list[Process], fake_env: dict[str, str], log_dir: Path) -> dict:
+def render(processes: list[Process], log_dir: Path) -> dict:
     """process-compose config. Each process also appends its output, as it
     happens, to <log_dir>/<name>.log (process-compose's own per-process log
     files are written in 8 KB chunks: useless for watching a service start)."""
     log_dir.mkdir(parents=True, exist_ok=True)
     processes_cfg = {}
     for p in processes:
-        entry = p.to_pc(fake_env)
+        entry = p.to_pc()
         log = shlex.quote(str(log_dir / f"{p.name}.log"))
         entry["command"] = f"exec > >(tee -a {log}) 2>&1\n{entry['command']}"
         processes_cfg[p.name] = entry

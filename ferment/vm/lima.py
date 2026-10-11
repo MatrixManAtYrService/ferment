@@ -64,6 +64,24 @@ fi
 """
 
 
+# The workload runs at the guest's own clock (ferment.server.clock), so
+# nothing may sync it back to real time: NixOS's timesyncd, and Lima's guest
+# agent, which sets the time on the host's behalf every few seconds. The agent
+# keeps running (it does other jobs) without the capability to set the clock;
+# its sync attempts then fail harmlessly. Both are runtime settings, re-applied
+# after a reboot by _sync_guest.
+GUEST_CLOCK_FREE = """\
+sudo systemctl stop systemd-timesyncd 2>/dev/null || true
+d=/run/systemd/system/lima-guestagent.service.d
+if [ ! -f $d/ferment-clock.conf ]; then
+  sudo mkdir -p $d
+  printf '[Service]\\nCapabilityBoundingSet=~CAP_SYS_TIME\\n' | sudo tee $d/ferment-clock.conf >/dev/null
+  sudo systemctl daemon-reload
+  sudo systemctl restart lima-guestagent
+fi
+"""
+
+
 def lima_config(spec: VMSpec) -> dict:
     return {
         "vmType": "vz",
@@ -173,7 +191,7 @@ class LimaProvider(Provider):
     def _apply_guest_state(self, inst: dict) -> str:
         """Put recorded guest state in place (idempotent); returns the boot id."""
         record = inst["record"]
-        script = SSHD_KEEPALIVE + _keys_script(record.get("authorized_keys", []))
+        script = SSHD_KEEPALIVE + GUEST_CLOCK_FREE + _keys_script(record.get("authorized_keys", []))
         if record.get("delete_after"):
             script += deadline_script(dt.datetime.fromisoformat(record["delete_after"])) + "\n"
         return self._guest(inst, script + "cat /proc/sys/kernel/random/boot_id").strip().splitlines()[-1]
@@ -195,7 +213,7 @@ class LimaProvider(Provider):
         if rebooted:
             print(
                 f"ferment: {inst['name']} rebooted since last seen; restored ssh keys, "
-                "sshd keepalive and the delete-me timer",
+                "sshd keepalive, the delete-me timer, and its free clock",
                 file=sys.stderr,
             )
             self.rebooted.add(inst["name"])

@@ -23,6 +23,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from ferment.server.clock import real_now
+
 # Append-only: schema version N is MIGRATIONS[:N] applied in order.
 MIGRATIONS = [
     """
@@ -115,7 +117,8 @@ SESSION_TIMEOUT = dt.timedelta(seconds=60)
 
 
 def _now() -> str:
-    return dt.datetime.now(dt.UTC).isoformat()
+    """Real time (the fermenter's own clock reads the workload's date)."""
+    return real_now().isoformat()
 
 
 class Store:
@@ -184,7 +187,7 @@ class Store:
             )
 
     def sessions(self, include_gone: bool = False) -> list[dict]:
-        cutoff = (dt.datetime.now(dt.UTC) - SESSION_TIMEOUT).isoformat()
+        cutoff = (real_now() - SESSION_TIMEOUT).isoformat()
         out = []
         for r in self._rows("SELECT * FROM sessions ORDER BY id"):
             r["relays"] = json.loads(r["relays"])
@@ -328,7 +331,7 @@ class Store:
         return rows[0] if rows else None
 
     def claimable_source_requests(self) -> list[dict]:
-        cutoff = (dt.datetime.now(dt.UTC) - CLAIM_TIMEOUT).isoformat()
+        cutoff = (real_now() - CLAIM_TIMEOUT).isoformat()
         return self._rows(
             "SELECT * FROM source_requests WHERE status = 'pending' OR (status = 'claimed' AND claimed_at < ?) "
             "ORDER BY id",
@@ -337,7 +340,7 @@ class Store:
 
     def claim_source_request(self, request_id: int, who: str) -> bool:
         """Atomic: exactly one client wins a request."""
-        cutoff = (dt.datetime.now(dt.UTC) - CLAIM_TIMEOUT).isoformat()
+        cutoff = (real_now() - CLAIM_TIMEOUT).isoformat()
         with self.lock:
             cur = self.db.execute(
                 "UPDATE source_requests SET status = 'claimed', claimed_by = ?, claimed_at = ? "

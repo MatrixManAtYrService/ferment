@@ -144,7 +144,10 @@ def test_attached_client_fetches_for_the_vm(upstream, tmp_path, monkeypatch):
             return []
 
     vm_state = tmp_path / "vm"
-    with TestClient(create_app(TimeController(Stack(), Sup(), "/x", vm_state))) as client:
+    from ferment.server.clock import GuestClock
+
+    clock = GuestClock(vm_state / "time.json", set_system_time=lambda when: None)
+    with TestClient(create_app(TimeController(Stack(), Sup(), vm_state, clock=clock))) as client:
         base = "http://fermenter"
         for verb in ("get", "post"):
             monkeypatch.setattr(

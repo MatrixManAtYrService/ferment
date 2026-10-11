@@ -13,11 +13,14 @@ query: {job="fermenter"} | json | broadcast="true".
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import threading
 from pathlib import Path
 
 import structlog
+
+from ferment.server.clock import real_now
 
 log = structlog.get_logger("fermenter")
 
@@ -39,11 +42,18 @@ class _JsonLinesFile:
     info = warning = error = debug = msg
 
 
+def _times(_logger, _name, event: dict) -> dict:
+    """Both clocks: the fermenter's own reads the workload's (fake) date."""
+    event.setdefault("real_time", real_now().isoformat())
+    event.setdefault("fake_time", dt.datetime.now(dt.UTC).isoformat())
+    return event
+
+
 def configure(path: Path) -> None:
     structlog.configure(
         processors=[
             structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True, key="real_time"),
+            _times,
             structlog.processors.JSONRenderer(),
         ],
         logger_factory=lambda *_: _JsonLinesFile(path),

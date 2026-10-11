@@ -7,7 +7,6 @@ import pytest
 
 from ferment import config
 from ferment.clockcheck import agreement, read_probes
-from ferment.faketime import FakeClock
 from ferment.lifetime import parse_duration
 from ferment.procompose import Process, render
 from ferment.ssh import Forward, tunnel_argv
@@ -27,17 +26,34 @@ def test_config_initializes_then_merges_new_defaults(tmp_path, monkeypatch):
     assert cfg["backend"]["lima"] == {"cpus": 4}
 
 
-def test_fake_clock_is_an_offset_not_a_start_time():
-    now = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.UTC)
-    past = FakeClock.starting_at(dt.datetime(2026, 10, 3, tzinfo=dt.UTC), now=now)
-    assert past.offset_seconds == -(7 * 86400 + 12 * 3600)
-    assert past.env("/lib/libfaketime.so.1")["FAKETIME"] == f"-{7 * 86400 + 12 * 3600}"
-    future = FakeClock.starting_at(dt.datetime(2026, 10, 11, 12, 0, tzinfo=dt.UTC), now=now)
-    assert future.env("x")["FAKETIME"] == "+86400"
+def test_guest_clock_keeps_real_time_and_survives_a_reboot(tmp_path):
+    import datetime as dt
+
+    from ferment.server.clock import GuestClock
+
+    real = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.UTC)
+    system = {"t": real, "boot": "b1"}
+    make = lambda: GuestClock(  # noqa: E731
+        tmp_path / "time.json",
+        set_system_time=lambda when: system.update(t=when),
+        system_now=lambda: system["t"],
+        current_boot=lambda: system["boot"],
+    )
+    clock = make()
+    assert clock.offset == dt.timedelta(0) and not clock.is_set
+    clock.set(dt.datetime(2026, 10, 3, tzinfo=dt.UTC))
+    assert system["t"] == dt.datetime(2026, 10, 3, tzinfo=dt.UTC)  # the guest's clock moved
+    assert clock.real_now() == real  # and we still know what time it really is
+    assert not make().ensure()  # same boot: nothing to do
+
+    system.update(t=real + dt.timedelta(hours=1), boot="b2")  # reboot: back on real time
+    clock = make()
+    assert clock.ensure()
+    assert system["t"] == dt.datetime(2026, 10, 3, 1, tzinfo=dt.UTC)  # date restored, an hour on
 
 
 def test_process_output_is_teed_to_its_own_log(tmp_path):
-    cfg = render([Process("svc", "exec java -jar x.jar")], {}, tmp_path)
+    cfg = render([Process("svc", "exec java -jar x.jar")], tmp_path)
     cmd = cfg["processes"]["svc"]["command"]
     assert cmd.startswith(f"exec > >(tee -a {tmp_path}/svc.log) 2>&1")
     assert cmd.endswith("exec java -jar x.jar")
@@ -65,13 +81,6 @@ def test_wait_ready_doesnt_count_a_probe_still_in_its_grace_period(tmp_path):
     sup.processes = lambda: (seen.append(1), next(states))[1]
     assert sup.wait_ready(timeout=5)
     assert len(seen) == 2  # the "-" during svc's initial delay didn't count as ready
-
-
-def test_only_faked_processes_get_the_clock(tmp_path):
-    procs = [Process("db", "mariadbd"), Process("grafana", "grafana", faked=False)]
-    cfg = render(procs, {"LD_PRELOAD": "lib"}, tmp_path)
-    assert "LD_PRELOAD=lib" in cfg["processes"]["db"]["environment"]
-    assert cfg["processes"]["grafana"]["environment"] == []
 
 
 def test_clock_agreement_uses_real_mtime(tmp_path):
@@ -154,27 +163,18 @@ def test_probe_written_before_relaunch_is_stale(tmp_path):
     assert not agreement([result], None)["agree"]
 
 
-def test_databases_speak_without_tls_and_only_dolt_is_versioned(tmp_path):
+def test_mysql_is_the_live_database_reached_over_tcp_by_explicit_path(tmp_path):
     from ferment.databases import make_database
 
-    maria, dolt = make_database("mariadb", tmp_path), make_database("dolt", tmp_path)
-    # a cert minted under the fake clock would be rejected by real-time clients
-    assert "--skip-ssl" in maria.processes()[0].command
-    assert "--skip-ssl" in maria.client and "--skip-ssl" in dolt.client
-    assert not maria.versioned and dolt.versioned
-    assert f"--data-dir {tmp_path / 'dolt'}" in dolt.processes()[0].command
+    mysql = make_database("mysql", tmp_path)
+    mysql.bin = "/opt/mysql84/bin"
+    assert mysql.kind == "mysql"
+    assert mysql.client.startswith("/opt/mysql84/bin/mysql --no-defaults -h 127.0.0.1 -P 3306 -uroot")
+    (proc,) = mysql.processes()
+    assert "--initialize-insecure" in proc.command and "/opt/mysql84/bin/mysqld" in proc.command
+    assert "--skip-ssl" in make_database("mariadb", tmp_path).processes()[0].command
     with pytest.raises(ValueError):
-        make_database("sqlite", tmp_path)
-
-
-def test_go_patch_hooks_the_one_time_now_call_site():
-    # nix/fakeable-go.nix substitutes this exact line; --replace-fail breaks
-    # the build (loudly) if a Go upgrade changes it.
-    from pathlib import Path
-
-    nix = (Path(__file__).parent.parent / "nix" / "fakeable-go.nix").read_text()
-    assert "'sec, nsec, mono := runtimeNow()'" in nix
-    assert "--replace-fail" in nix
+        make_database("dolt", tmp_path)  # Dolt keeps history now; it doesn't run the workload
 
 
 class FakeLimaHost:
@@ -279,12 +279,14 @@ def test_lima_restores_keys_and_deadline_after_a_reboot(monkeypatch, tmp_path, c
     applied = "\n".join(s for s, _ in p.lima.scripts)
     assert "ssh-ed25519 OLD someone" in applied
     assert "ClientAliveInterval" in applied and "ferment-deadline" in applied
+    assert "CAP_SYS_TIME" in applied and "systemd-timesyncd" in applied  # the guest's clock stays ours
     assert p.lima.record["boot_id"] == "boot-2"
     assert "mine" in p.rebooted
     assert "rebooted since last seen" in capsys.readouterr().err
 
 
 def test_unset_clock_starts_on_real_time(tmp_path):
+    from ferment.server.clock import GuestClock
     from ferment.server.time_control import TimeController
 
     class Stack:
@@ -305,11 +307,12 @@ def test_unset_clock_starts_on_real_time(tmp_path):
             return []
 
     sup = Supervisor()
-    tc = TimeController(Stack(), sup, "/lib/libfaketime.so.1", tmp_path)
+    tc = TimeController(
+        Stack(), sup, tmp_path, clock=GuestClock(tmp_path / "time.json", set_system_time=lambda w: None)
+    )
     tc.resume()
-    assert sup.started is not None
-    assert tc.state.offset_seconds == 0
-    assert (tmp_path / "time.json").exists()
+    assert sup.started is not None  # a fresh fermenter runs right away, on real time
+    assert tc.status()["offset_seconds"] == 0
 
 
 def test_server_request_sends_raw_bodies_and_who(monkeypatch):

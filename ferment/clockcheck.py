@@ -1,13 +1,13 @@
-"""Do the processes in the faked tree agree about what time it is?
+"""Do the workload's runtimes agree about what time it is?
 
 Each probe process repeatedly overwrites <probe dir>/<name>.txt with the time
 *it* observes (one ISO-8601 line). The reader compares that against the
-file's mtime: the kernel stamps mtime with real time no matter what
-libfaketime tells the writer, so `observed - mtime` is that process's offset
-from real time, measured independently of the probe's own clock.
+file's mtime, stamped by the kernel: `observed - mtime` is how far that
+runtime's idea of now is from the system clock's.
 
-All probes agreeing on one offset (and it matching the requested one) is the
-proof that a restart under a new date put the whole tree on the same clock.
+The workload runs at the VM's own clock, so every probe should agree with it
+(offset ~0): a canary that no runtime has its own idea of the time (a
+container with its own clock, a cached timezone, a stale JVM).
 
 Probes:
   python  python -m ferment.clockcheck probe <dir> <name>

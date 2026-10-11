@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ferment.server.app import create_app
+from ferment.server.clock import GuestClock
 from ferment.server.store import Store
 from ferment.server.time_control import CheckpointError, TimeController
 
@@ -35,13 +36,13 @@ class FakeDolt:
     def __init__(self):
         self.data, self.commits, self.calls = 0, {}, []
 
-    def snapshot(self, message, tags, *, running, env):
+    def snapshot(self, message, tags, *, running):
         ref = f"c{len(self.commits) + 1}"
         self.commits[ref] = self.data
-        self.calls.append(("snapshot", running, tags, env.get("FAKETIME")))
+        self.calls.append(("snapshot", running, tags))
         return {"dolt:billing": ref}
 
-    def restore(self, parts, *, env):
+    def restore(self, parts):
         self.data = self.commits[parts["dolt:billing"]]
         self.calls.append(("restore", parts))
 
@@ -49,7 +50,11 @@ class FakeDolt:
 @pytest.fixture
 def setup(tmp_path):
     dolt = FakeDolt()
-    tc = TimeController(Stack(), Supervisor(), "/lib/libfaketime.so.1", tmp_path, versioned=[dolt])
+    system = {"t": dt.datetime.now(dt.UTC)}
+    clock = GuestClock(
+        tmp_path / "time.json", set_system_time=lambda when: system.update(t=when), system_now=lambda: system["t"]
+    )
+    tc = TimeController(Stack(), Supervisor(), tmp_path, versioned=[dolt], clock=clock)
     return tc, dolt
 
 
@@ -63,17 +68,16 @@ def test_store_migrates_once_and_survives_reopen(tmp_path):
 def test_clock_change_checkpoints_the_stopped_workload_at_the_old_time(setup):
     tc, dolt = setup
     tc.set_time(dt.datetime(2026, 10, 3, 12, tzinfo=dt.UTC), wait_ready=False)
-    assert tc.store.checkpoints() == []  # first clock: nothing to checkpoint yet
     dolt.data = 1
     out = tc.set_time(dt.datetime(2026, 10, 4, 12, tzinfo=dt.UTC), who="alice")
     cp = out["checkpoint"]
     assert cp["kind"] == "clock-change" and cp["who"] == "alice"
     assert cp["fake_time"].startswith("2026-10-03")  # where the clock was, not where it's going
-    assert cp["parts"] == {"dolt:billing": "c1"}
-    _, running, tags, faketime = dolt.calls[-1]
+    assert cp["parts"] == {"dolt:billing": "c2"}
+    _, running, tags = dolt.calls[-1]
     assert running is False  # cut while stopped: consistent across stores
     assert tags == [f"ckpt-{cp['id']}"]
-    assert faketime.startswith("-")  # committed under the (old, past) fake clock
+    assert out["fake_now"].startswith("2026-10-04")
 
 
 def test_restore_returns_data_and_clock_and_can_be_undone(setup):
