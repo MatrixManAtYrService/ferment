@@ -22,6 +22,9 @@ def utcnow() -> dt.datetime:
 # scripts, the server) needn't know how the provider names or addresses it.
 WORKLOAD_SSH_HOST = "fermenter-workload"
 
+# Where a VM finds the caches it asked for (VMSpec.caches): CACHE_MOUNT/<name>.
+CACHE_MOUNT = "/mnt/ferment-cache"
+
 
 @dataclass
 class WorkloadSpec:
@@ -46,6 +49,12 @@ class VMSpec:
     # Given: this VM is the control VM, and the provider also makes the
     # workload VM, on a private network with it. None: one VM does both.
     workload: WorkloadSpec | None = None
+    # Named caches that outlive the VM and are shared with later ones (e.g. a
+    # package manager's downloads), writable at CACHE_MOUNT/<name>: the one
+    # thing a fermenter keeps from the machine that hosts it. Each provider
+    # supplies them its own way (Lima: a directory on the Lima host). Only
+    # this VM gets them, not a split fermenter's workload VM.
+    caches: list[str] = field(default_factory=list)
 
 
 @dataclass

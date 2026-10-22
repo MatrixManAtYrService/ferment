@@ -3,7 +3,9 @@
 Free and fast to iterate on, and close enough to a cloud VM for everything
 above the provider: the VM is reached only over ssh (Lima's own port
 forwarding and home-directory mounts are switched off so nothing works here
-that would not work in the cloud).
+that would not work in the cloud). The exception is caches (VMSpec.caches):
+directories under `cache_root` on the Lima host, mounted writable at
+CACHE_MOUNT/<name>, kept when the VM goes.
 
 The Lima host can be this machine or another one (`host`: an ssh
 destination). Remotely, every limactl call runs over ssh, and clients reach
@@ -38,7 +40,7 @@ import sys
 
 from ferment.identity import client_key
 from ferment.lifetime import deadline_script
-from ferment.vm.base import WORKLOAD_SSH_HOST, Provider, ProviderError, SshTarget, VMInfo, VMSpec, utcnow
+from ferment.vm.base import CACHE_MOUNT, WORKLOAD_SSH_HOST, Provider, ProviderError, SshTarget, VMInfo, VMSpec, utcnow
 
 # Same image pixiebox runs on (nixos-lima v0.0.5): NixOS, nix preinstalled.
 IMAGES = [
@@ -55,6 +57,8 @@ IMAGES = [
 ]
 
 RECORD = "ferment.json"
+# On the Lima host (Lima expands ~): rebuildable data, so share/, not state/.
+CACHE_ROOT = "~/.local/share/ferment/cache"
 
 # vz carries ssh over vsock and the guest never learns that a client went away:
 # sessions linger, keeping their -R ports bound. Have sshd probe and drop them.
@@ -121,17 +125,22 @@ fi
 """
 
 
-def lima_config(spec: VMSpec, *, private_network: bool = False) -> dict:
+def lima_config(spec: VMSpec, *, private_network: bool = False, cache_root: str = CACHE_ROOT) -> dict:
     """`private_network`: on Lima's user-v2 network, where instances reach
-    each other (lima-<name>.internal) and still reach the internet."""
+    each other (lima-<name>.internal) and still reach the internet.
+    `cache_root`: where spec.caches live on the Lima host."""
     cfg = {
         "vmType": "vz",
         "images": IMAGES,
         "cpus": spec.cpus,
         "memory": f"{spec.memory_gib}GiB",
         "disk": f"{spec.disk_gib}GiB",
-        # A cloud VM can't see the laptop's disk; neither can this one.
-        "mounts": [],
+        # A cloud VM can't see the laptop's disk; neither can this one, except
+        # for the caches it asked for.
+        "mounts": [
+            {"location": f"{cache_root}/{name}", "mountPoint": f"{CACHE_MOUNT}/{name}", "writable": True}
+            for name in spec.caches
+        ],
         "portForwards": [
             # NixOS + Lima DHCP interception workaround
             # (https://github.com/nixos-lima/nixos-lima/issues/50)
@@ -188,11 +197,13 @@ class LimaProvider(Provider):
         control_cpus: int | None = None,
         control_memory_gib: int | None = None,
         control_disk_gib: int | None = None,
+        cache_root: str = CACHE_ROOT,
     ):
         """cpus, memory_gib, disk_gib: the VM that runs the workload (the only
         VM, or a split fermenter's workload VM). control_*: a split
         fermenter's control VM (the server, builds, the archive)."""
         self.lima = LimaHost(host, limactl)
+        self.cache_root = cache_root
         # Names whose guest rebooted since last seen (noticed by ssh_target):
         # callers may need to restart whatever they ran there.
         self.rebooted: set[str] = set()
@@ -311,7 +322,12 @@ class LimaProvider(Provider):
     def _start(self, spec: VMSpec, *, private_network: bool) -> dict:
         import yaml
 
-        cfg = yaml.safe_dump(lima_config(spec, private_network=private_network), sort_keys=False)
+        if spec.caches:  # Lima won't mount a directory that doesn't exist
+            root = self.cache_root.replace("~", '"$HOME"', 1) if self.cache_root.startswith("~") else self.cache_root
+            self.lima.run("mkdir -p " + " ".join(f"{root}/{shlex.quote(c)}" for c in spec.caches))
+        cfg = yaml.safe_dump(
+            lima_config(spec, private_network=private_network, cache_root=self.cache_root), sort_keys=False
+        )
         # limactl reads the template from stdin with "-"; its progress streams
         # to the terminal (first boot downloads the image, which takes a while).
         self.lima.run(

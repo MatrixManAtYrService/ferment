@@ -12,9 +12,10 @@ import subprocess
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -71,6 +72,10 @@ class NewBuild(BaseModel):
 
 class Deploy(BaseModel):
     build_id: int
+
+
+class DeployMany(BaseModel):
+    builds: dict[str, int]  # service name -> build id; all start in one workload restart
 
 
 class Sql(BaseModel):
@@ -341,45 +346,70 @@ def create_app(
     # clients follow /deployments/{name}/progress and the process's log.
     progress: dict[str, dict] = {}
 
-    def run_deploy(name: str, b: dict, w: str) -> None:
+    def run_deploy(chosen: list[tuple[str, dict]], w: str) -> None:
+        """Prepare each service (in order), record them all, then restart the
+        workload once: every service of a template comes up together."""
+        names = [name for name, _ in chosen]
+        what = ", ".join(f"{name} @ {b['commit_sha'][:12]}" for name, b in chosen)
         said: list[str] = []
         keys = [*(["prepare"] if before_deploy is not None else []), "stop", "start", "ready"]
-        s = steps(f"deploy {name} @ {b['commit_sha'][:12]} ({w})", keys, ready=f"{name} ready")
+        s = steps(f"deploy {what} ({w})", keys, ready=f"{', '.join(names)} ready")
+
+        def update(**fields) -> None:
+            for name in names:
+                progress[name] = {**progress[name], **fields}
 
         def say(msg: str) -> None:
             said.append(msg)
-            progress[name] = {**progress[name], "steps": list(said)}
+            update(steps=list(said))
             s.note("prepare", msg)
 
         try:
             if before_deploy is not None:
-                progress[name]["state"] = "preparing"
-                before_deploy(name, b, say)
+                update(state="preparing")
+                for name, b in chosen:
+                    before_deploy(name, b, say)
                 s("prepare")
-            store.deploy(name, b["id"], w)
-            progress[name]["state"] = "starting"
+            for name, b in chosen:
+                store.deploy(name, b["id"], w)
+            update(state="starting")
             controller.relaunch(wait_ready=False, step=s)
-            publisher.await_ready(s.ids["ready"], name)
-            progress[name]["state"] = "started"
-            broadcast("deployed", w, f"{name} @ {b['commit_sha'][:12]} deployed by {w}; starting")
+            publisher.await_ready(s.ids["ready"], names[0] if len(names) == 1 else None)
+            update(state="started")
+            broadcast("deployed", w, f"{what} deployed by {w}; starting")
         except Exception as e:  # report it rather than lose it in a thread
             s.fail(str(e))
-            progress[name] = {**progress[name], "state": "failed", "error": str(e)}
-            broadcast("deploy_failed", w, f"deploying {name} failed: {e}")
+            update(state="failed", error=str(e))
+            broadcast("deploy_failed", w, f"deploying {', '.join(names)} failed: {e}")
+
+    def start_deploy(builds: dict[str, int], request: Request) -> dict[str, dict]:
+        chosen = []
+        for name, build_id in builds.items():
+            b = store.build(build_id)
+            if b is None or b["name"] != name or b["status"] != "succeeded":
+                raise HTTPException(422, f"build {build_id} isn't a successful build of {name}")
+            if progress.get(name, {}).get("state") in ("preparing", "starting"):
+                raise HTTPException(409, f"{name} is already being deployed")
+            chosen.append((name, b))
+        if not chosen:
+            raise HTTPException(422, "nothing to deploy")
+        w = who(request)
+        for name, b in chosen:
+            progress[name] = {"name": name, "build_id": b["id"], "state": "queued", "steps": [], "who": w}
+        what = ", ".join(f"{name} @ {b['commit_sha'][:12]}" for name, b in chosen)
+        broadcast("deploying", w, f"{w} is deploying {what}")
+        accepted = {name: dict(progress[name]) for name, _ in chosen}  # the thread updates progress from here on
+        threading.Thread(target=run_deploy, args=(chosen, w), daemon=True).start()
+        return accepted
 
     @app.put("/deployments/{name}", status_code=202)
     def deploy(name: str, req: Deploy, request: Request):
-        b = store.build(req.build_id)
-        if b is None or b["name"] != name or b["status"] != "succeeded":
-            raise HTTPException(422, f"build {req.build_id} isn't a successful build of {name}")
-        if progress.get(name, {}).get("state") in ("preparing", "starting"):
-            raise HTTPException(409, f"{name} is already being deployed")
-        w = who(request)
-        progress[name] = {"name": name, "build_id": b["id"], "state": "queued", "steps": [], "who": w}
-        broadcast("deploying", w, f"{w} is deploying {name} @ {b['commit_sha'][:12]}")
-        accepted = dict(progress[name])  # the thread updates progress[name] from here on
-        threading.Thread(target=run_deploy, args=(name, b, w), daemon=True).start()
-        return accepted
+        return start_deploy({name: req.build_id}, request)[name]
+
+    @app.put("/deployments", status_code=202)
+    def deploy_many(req: DeployMany, request: Request):
+        """Deploy several services with one workload restart."""
+        return start_deploy(req.builds, request)
 
     @app.get("/deployments/{name}/progress")
     def deploy_progress(name: str):
@@ -393,14 +423,27 @@ def create_app(
         text, next_offset = controller.supervisor.log(name, offset)
         return {"text": text, "offset": next_offset}
 
+    def undeploy_names(names: list[str], request: Request) -> dict:
+        deployed = {d["name"] for d in store.deployments()}
+        missing = [n for n in names if n not in deployed]
+        if missing or not names:
+            raise HTTPException(404, f"{', '.join(missing) or 'nothing'} isn't deployed")
+        for name in names:
+            store.undeploy(name)
+        w = who(request)
+        what = ", ".join(names)
+        broadcast("undeployed", w, f"{w} undeployed {what} (workload restarting)")
+        s = steps(f"undeploy {what} ({w})", ["stop", "start", "ready"])
+        return _stepped(s, lambda: controller.relaunch(step=s))
+
     @app.delete("/deployments/{name}")
     def undeploy(name: str, request: Request):
-        if not store.undeploy(name):
-            raise HTTPException(404, f"{name} isn't deployed")
-        w = who(request)
-        broadcast("undeployed", w, f"{w} undeployed {name} (workload restarting)")
-        s = steps(f"undeploy {name} ({w})", ["stop", "start", "ready"])
-        return _stepped(s, lambda: controller.relaunch(step=s))
+        return undeploy_names([name], request)
+
+    @app.delete("/deployments")
+    def undeploy_many(request: Request, names: Annotated[list[str] | None, Query()] = None):
+        """Undeploy several services (default: all) with one workload restart."""
+        return undeploy_names(names or [d["name"] for d in store.deployments()], request)
 
     @app.get("/builds/{build_id}/log")
     def build_log(build_id: int, offset: int = 0):

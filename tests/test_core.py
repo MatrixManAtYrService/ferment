@@ -496,3 +496,15 @@ def test_mysql_on_a_private_network_is_reached_from_the_control_vm(tmp_path):
     control = workload.reached_at("lima-fx-workload.internal")
     assert "-h lima-fx-workload.internal" in control.client and workload.host == "127.0.0.1"
     assert "%" not in grants(MySQL(tmp_path, bin_dir="/m"))  # loopback only
+
+
+def test_lima_mounts_only_the_caches_a_vm_asks_for():
+    import datetime as dt
+
+    from ferment.vm import lima
+    from ferment.vm.base import CACHE_MOUNT, VMSpec
+
+    plain = lima.lima_config(VMSpec(name="a", ttl=dt.timedelta(hours=1)))
+    assert plain["mounts"] == []
+    cached = lima.lima_config(VMSpec(name="a", ttl=dt.timedelta(hours=1), caches=["maven"]), cache_root="/c")
+    assert cached["mounts"] == [{"location": "/c/maven", "mountPoint": f"{CACHE_MOUNT}/maven", "writable": True}]

@@ -314,3 +314,38 @@ def test_the_board_follows_what_happens(setup):
         b, ms, svcs = settle(client, lambda b, ms, svcs: any(m["state"] == "failed" for m in b["milestones"]))
         (failed,) = [m for m in b["milestones"] if m["state"] == "failed"]
         assert failed["group"].startswith("deploy broken") and "1.41" in failed["detail"]
+
+
+def test_deploying_and_undeploying_several_services_restarts_the_workload_once(setup):
+    import time as _time
+
+    tc, _ = setup
+    store = tc.store
+    for name in ("a", "b"):
+        bid = store.add_build(name=name, commit="c" * 40, command="x", artifact_glob=None, who="me", log_path="")
+        store.update_build(bid, status="succeeded", artifact="/a.jar")
+    relaunches = []
+    original = tc.relaunch
+
+    def counting(*args, **kwargs):
+        relaunches.append(1)
+        return original(*args, **kwargs)
+
+    tc.relaunch = counting
+    with TestClient(create_app(tc)) as client:
+        relaunches.clear()  # the server's own start
+        r = client.put("/deployments", json={"builds": {"a": 1, "b": 2}})
+        assert r.status_code == 202 and set(r.json()) == {"a", "b"}
+        deadline = _time.time() + 5
+        while client.get("/deployments/b/progress").json()["state"] not in ("started", "failed"):
+            assert _time.time() < deadline
+            _time.sleep(0.05)
+        assert client.get("/deployments/a/progress").json()["state"] == "started"
+        assert [d["name"] for d in client.get("/deployments").json()] == ["a", "b"]
+        assert len(relaunches) == 1
+
+        assert client.put("/deployments", json={"builds": {"a": 2}}).status_code == 422  # b's build, not a's
+        assert client.delete("/deployments", params={"names": ["nope"]}).status_code == 404
+        client.delete("/deployments")
+        assert client.get("/deployments").json() == []
+        assert len(relaunches) == 2
