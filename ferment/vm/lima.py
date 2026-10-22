@@ -408,8 +408,13 @@ class LimaProvider(Provider):
         return self.lima.run(f"awk '$1 == \"User\" {{print $2; exit}}' {cfg}").strip()
 
     def ssh_target(self, name: str) -> SshTarget:
-        inst = self._instance(name)
+        inst, winst = self._pair(name)
         user = self._running(inst)
+        if winst is not None:
+            # Whatever reaches control may next go through it to the workload
+            # (deploy's copy, the agent): after a reboot, that needs control's
+            # key and firewall rule back on the workload VM too.
+            self._running(winst)
         options = self._client_options()
         if self.lima.host:
             options["ProxyJump"] = self.lima.host
