@@ -155,6 +155,9 @@ class Builder:
         lines += [
             f"cd {q(str(tree))}",
             f"exec >>{q(log)} 2>&1",
+            # Tracked files as committed: a previous build's `prepare` steps
+            # (editing a lock file, say) don't carry over to this one.
+            "git reset -q --hard",
             f"printf '%s\\n' {q('$ ' + b['command'])} {q('# in ' + str(tree))}",
             f"bash -c {q(b['command'])}",
             "rc=$?",
