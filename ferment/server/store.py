@@ -105,6 +105,11 @@ MIGRATIONS = [
         deployed_at TEXT NOT NULL
     );
     """,
+    """
+    -- Other sources a build checks out beside its own (canonical JSON
+    -- {name: commit}, '' for none); part of what makes two builds the same.
+    ALTER TABLE builds ADD COLUMN inputs TEXT NOT NULL DEFAULT '';
+    """,
 ]
 
 # A claimed source request not finished in this long is up for grabs again
@@ -119,6 +124,10 @@ SESSION_TIMEOUT = dt.timedelta(seconds=60)
 def _now() -> str:
     """Real time (the fermenter's own clock reads the workload's date)."""
     return real_now().isoformat()
+
+
+def _inputs_key(inputs: dict[str, str] | None) -> str:
+    return json.dumps(inputs, sort_keys=True, separators=(",", ":")) if inputs else ""
 
 
 class Store:
@@ -256,13 +265,21 @@ class Store:
     # -- builds -----------------------------------------------------------------
 
     def add_build(
-        self, *, name: str, commit: str, command: str, artifact_glob: str | None, who: str, log_path: str
+        self,
+        *,
+        name: str,
+        commit: str,
+        command: str,
+        artifact_glob: str | None,
+        who: str,
+        log_path: str,
+        inputs: dict[str, str] | None = None,
     ) -> int:
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO builds (name, commit_sha, command, artifact_glob, status, log_path, who, requested_at) "
-                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
-                (name, commit, command, artifact_glob, log_path, who, _now()),
+                "INSERT INTO builds (name, commit_sha, command, artifact_glob, status, log_path, who, requested_at, "
+                "inputs) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+                (name, commit, command, artifact_glob, log_path, who, _now(), _inputs_key(inputs)),
             )
             return int(cur.lastrowid)
 
@@ -277,14 +294,15 @@ class Store:
         rows = self._rows("SELECT * FROM builds WHERE id = ?", build_id)
         return rows[0] if rows else None
 
-    def find_build(self, name: str, commit: str, command: str) -> dict | None:
+    def find_build(self, name: str, commit: str, command: str, inputs: dict[str, str] | None = None) -> dict | None:
         """The latest build of exactly these inputs that succeeded or is still going."""
         rows = self._rows(
-            "SELECT * FROM builds WHERE name = ? AND commit_sha = ? AND command = ? "
+            "SELECT * FROM builds WHERE name = ? AND commit_sha = ? AND command = ? AND inputs = ? "
             "AND status IN ('queued', 'running', 'succeeded') ORDER BY id DESC LIMIT 1",
             name,
             commit,
             command,
+            _inputs_key(inputs),
         )
         return rows[0] if rows else None
 

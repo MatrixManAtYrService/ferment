@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import hashlib
+import subprocess
 import threading
 import time
 from collections.abc import Iterator
@@ -25,6 +26,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from ferment.procompose import Process
+from ferment.vm.base import WORKLOAD_SSH_HOST
 
 
 class AgentError(RuntimeError):
@@ -43,6 +45,7 @@ class AgentClient:
         # On this machine: it reads our files where they are (see `place`).
         self.local = urlsplit(url).hostname in ("127.0.0.1", "localhost")
         self._digests: dict[tuple[str, int, int], str] = {}
+        self._copied: set[str] = set()  # store paths already on the workload's machine
         self._lock = threading.Lock()
         self._sample: tuple[dt.datetime, float, str] | None = None  # (agent now, our monotonic, boot id)
 
@@ -143,8 +146,19 @@ class AgentClient:
 
     def place(self, local_path: str) -> str:
         """Where the workload's machine has this file (a built artifact),
-        uploading it first if it lacks it."""
+        uploading it first if it lacks it. A nix store path is copied with its
+        closure (`nix copy`, over the control VM's ssh to the workload VM) and
+        has the same path there."""
         if self.local:
+            return local_path
+        if local_path.startswith("/nix/store/"):
+            if local_path not in self._copied:
+                subprocess.run(
+                    ["nix", "--extra-experimental-features", "nix-command", "copy", "--no-check-sigs",
+                     "--to", f"ssh-ng://{WORKLOAD_SSH_HOST}", local_path],
+                    check=True, capture_output=True, text=True,
+                )  # fmt: skip
+                self._copied.add(local_path)
             return local_path
         path = Path(local_path)
         st = path.stat()

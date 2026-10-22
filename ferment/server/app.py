@@ -68,6 +68,7 @@ class NewBuild(BaseModel):
     commit: str
     command: str
     artifact: str | None = None  # glob, relative to the checkout
+    inputs: dict[str, str] = {}  # other sources checked out for it: name -> commit (FERMENT_INPUT_<NAME>)
 
 
 class Deploy(BaseModel):
@@ -322,7 +323,10 @@ def create_app(
 
     @app.post("/builds")
     def request_build(req: NewBuild, request: Request):
-        return builder.request(req.name, req.commit, req.command, req.artifact, who(request))
+        missing = [f"{n} @ {c}" for n, c in req.inputs.items() if not sources.has(n, c)]
+        if missing:
+            raise HTTPException(422, f"not uploaded: {', '.join(missing)}")
+        return builder.request(req.name, req.commit, req.command, req.artifact, who(request), inputs=req.inputs)
 
     @app.get("/builds")
     def builds(limit: int = 50):
