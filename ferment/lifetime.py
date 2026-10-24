@@ -7,6 +7,9 @@ if nobody runs another ferment command:
   lima's ferment.json) so `ls` can show it and a reaper can act on it.
 - The guest arms its own timer: at the deadline it powers itself off. That
   needs no client, no credentials, and no cron job anywhere else.
+
+A lifetime of `never` means no date at all: for VMs on hardware you own,
+where a forgotten one costs nothing but its share of the host.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from ferment.vm.base import SshTarget, utcnow
 GUARD_UNIT = "ferment-deadline"
 
 _DURATION = re.compile(r"^(\d+)([mhd])$")
+NEVER = "never"
 
 
 def parse_duration(text: str) -> dt.timedelta:
@@ -29,6 +33,19 @@ def parse_duration(text: str) -> dt.timedelta:
         raise ValueError(f"bad duration {text!r}: use e.g. 90m, 72h, 3d")
     n, unit = int(m.group(1)), m.group(2)
     return {"m": dt.timedelta(minutes=n), "h": dt.timedelta(hours=n), "d": dt.timedelta(days=n)}[unit]
+
+
+def parse_lifetime(text: str) -> dt.timedelta | None:
+    """A duration (parse_duration), or 'never' -> None: no delete-me date."""
+    return None if text.strip() == NEVER else parse_duration(text)
+
+
+def disarm_script() -> str:
+    """Shell that stops the in-guest poweroff timer, if one is armed."""
+    return (
+        f"sudo systemctl stop {GUARD_UNIT}.timer {GUARD_UNIT}.service 2>/dev/null; "
+        f"sudo systemctl reset-failed {GUARD_UNIT}.timer {GUARD_UNIT}.service 2>/dev/null; true"
+    )
 
 
 def deadline_script(delete_after: dt.datetime) -> str:
@@ -42,8 +59,7 @@ def deadline_script(delete_after: dt.datetime) -> str:
     """
     seconds = max(60, int((delete_after - utcnow()).total_seconds()))
     return (
-        f"sudo systemctl stop {GUARD_UNIT}.timer {GUARD_UNIT}.service 2>/dev/null; "
-        f"sudo systemctl reset-failed {GUARD_UNIT}.timer {GUARD_UNIT}.service 2>/dev/null; "
+        f"{disarm_script()}; "
         f"sudo systemd-run --quiet --unit={GUARD_UNIT} --on-active={seconds}s "
         f"--description='ferment delete-me deadline {delete_after.isoformat()}' systemctl poweroff"
     )

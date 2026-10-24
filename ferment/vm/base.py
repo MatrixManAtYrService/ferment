@@ -39,7 +39,7 @@ class WorkloadSpec:
 @dataclass
 class VMSpec:
     name: str
-    ttl: dt.timedelta
+    ttl: dt.timedelta | None  # None: no delete-me date (ferment.lifetime.NEVER)
     cpus: int = 4
     memory_gib: int = 8
     disk_gib: int = 50
@@ -132,8 +132,8 @@ class Provider(ABC):
     def delete(self, name: str) -> None: ...
 
     @abstractmethod
-    def set_deadline(self, name: str, delete_after: dt.datetime) -> None:
-        """Move the delete-me date (extend, or shorten)."""
+    def set_deadline(self, name: str, delete_after: dt.datetime | None) -> None:
+        """Move the delete-me date (extend, or shorten); None removes it."""
 
     @abstractmethod
     def ssh_target(self, name: str) -> SshTarget:

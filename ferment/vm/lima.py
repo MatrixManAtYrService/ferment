@@ -39,7 +39,7 @@ import subprocess
 import sys
 
 from ferment.identity import client_key
-from ferment.lifetime import deadline_script
+from ferment.lifetime import deadline_script, disarm_script
 from ferment.vm.base import CACHE_MOUNT, WORKLOAD_SSH_HOST, Provider, ProviderError, SshTarget, VMInfo, VMSpec, utcnow
 
 # Same image pixiebox runs on (nixos-lima v0.0.5): NixOS, nix preinstalled.
@@ -354,7 +354,7 @@ class LimaProvider(Provider):
             if name in existing:
                 raise ProviderError(f"a lima instance named {name!r} already exists")
         record = {
-            "delete_after": (utcnow() + spec.ttl).isoformat(),
+            "delete_after": (utcnow() + spec.ttl).isoformat() if spec.ttl is not None else None,
             "labels": spec.labels,
             "authorized_keys": [_check_key(k) for k in spec.authorized_keys],
         }
@@ -398,11 +398,11 @@ class LimaProvider(Provider):
             names.append(workload)
         self.lima.run(self.lima.limactl_cmd("delete", "--force", *names))
 
-    def set_deadline(self, name: str, delete_after: dt.datetime) -> None:
+    def set_deadline(self, name: str, delete_after: dt.datetime | None) -> None:
         for inst in filter(None, self._pair(name)):
-            inst["record"]["delete_after"] = delete_after.isoformat()
+            inst["record"]["delete_after"] = delete_after.isoformat() if delete_after else None
             self._write_record(inst, inst["record"])
-            self._guest(inst, deadline_script(delete_after))
+            self._guest(inst, deadline_script(delete_after) if delete_after else disarm_script())
 
     def authorize_key(self, name: str, public_key: str) -> None:
         """Let `public_key` log in to the fermenter's VMs (recorded, so it survives reboots)."""

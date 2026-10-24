@@ -300,6 +300,28 @@ def test_lima_create_makes_sshd_drop_vanished_clients(monkeypatch, tmp_path):
     assert any("ClientAliveInterval" in s for s in guest)
 
 
+def test_lima_fermenters_can_live_forever(monkeypatch, tmp_path):
+    from ferment.lifetime import parse_lifetime
+    from ferment.vm.base import VMSpec
+
+    p = _lima("mac", monkeypatch, tmp_path)
+    new = {"name": "new", "status": "Running", "dir": "/h/.lima/new", "sshConfigFile": "/h/.lima/new/ssh.config"}
+    started = lambda: any(s.startswith("limactl start") for s, _ in p.lima.scripts)  # noqa: E731
+    monkeypatch.setattr(p, "_instances", lambda: {"new": dict(new)} if started() else {})
+    p.create(VMSpec(name="new", ttl=parse_lifetime("never")))
+    written = [json.loads(i) for s, i in p.lima.scripts if s.startswith("cat >")]
+    assert written and all(r["delete_after"] is None for r in written)
+    assert not any("systemd-run" in s for s, _ in p.lima.scripts)  # no poweroff timer
+
+    p = _lima("mac", monkeypatch, tmp_path)
+    p.set_deadline("mine", None)  # an existing one, made to live forever
+    assert p.lima.record["delete_after"] is None
+    last = p.lima.scripts[-1][0]
+    assert "systemctl stop ferment-deadline.timer" in last and "systemd-run" not in last
+    (vm,) = p.list()
+    assert vm.delete_after is None and not vm.expired
+
+
 def test_lima_restores_keys_and_deadline_after_a_reboot(monkeypatch, tmp_path, capsys):
     p = _lima(None, monkeypatch, tmp_path)
     p.ssh_target("mine")  # first look: adopts existing non-lima keys, records the boot
