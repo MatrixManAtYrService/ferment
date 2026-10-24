@@ -28,6 +28,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/server/sources.py`, `builds.py` | VM side: bare repos from bundles, worktrees, builds (real time, SOURCE_DATE_EPOCH = commit time, cached per input; each a script in its own systemd unit that outlives the server, finished via an exit-status file) |
 | `ferment/databases.py` | MariaDB / Dolt processes; Dolt checkpoints, log, diff, restore |
 | `ferment/config.py` | `~/.config/ferment/config.toml` |
+| `ferment/bootstrap.py` | prepare a machine to host fermenters, once, over ssh: idempotent steps (ok/changed/manual/failed); `macos` = a Mac running Lima from a pinned nixpkgs |
 
 ## Dev environment (nix)
 
