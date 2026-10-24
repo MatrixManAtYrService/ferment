@@ -20,6 +20,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ferment import needs as needs_mod
 from ferment.archive import DoltArchive
 from ferment.board import Board, Service
 from ferment.client import WHO_HEADER
@@ -50,6 +51,11 @@ class NewSession(BaseModel):
 
 class Heartbeat(BaseModel):
     client_time: dt.datetime | None = None
+
+
+class NewNeed(BaseModel):
+    capability: str  # ferment.needs: relay:<host:port> | fetch:<git host>
+    purpose: str  # what's waiting, e.g. "fmnt apply"
 
 
 class NewSourceRequest(BaseModel):
@@ -248,6 +254,40 @@ def create_app(
             return {"url": url, "reachable": True, "status": r.status_code}
         except httpx.HTTPError as e:
             return {"url": url, "reachable": False, "error": f"{type(e).__name__}: {e}"}
+
+    # Work waiting for something only an attached client provides
+    # (ferment.needs). The waiting client keeps its need fresh; the board says
+    # what's waiting, and whether anyone attached serves it.
+
+    @app.get("/needs")
+    def needs():
+        offered: dict[str, list[str]] = {}
+        for s in store.sessions():
+            for cap in needs_mod.offered(s):
+                offered.setdefault(cap, []).append(s["who"])
+        return [{**n, "served_by": offered.get(n["capability"], [])} for n in store.needs()]
+
+    @app.post("/needs")
+    def add_need(req: NewNeed, request: Request):
+        w = who(request)
+        n = store.add_need(req.capability, req.purpose, w)
+        broadcast("waiting", w, f"{req.purpose} ({w}) is waiting for {needs_mod.describe(req.capability)}")
+        return n
+
+    @app.post("/needs/{need_id}/heartbeat")
+    def need_heartbeat(need_id: int):
+        if not store.touch_need(need_id):
+            raise HTTPException(404, "no open need with that id")
+        return {"ok": True}
+
+    @app.delete("/needs/{need_id}")
+    def close_need(need_id: int, request: Request, met: bool = True):
+        n = store.close_need(need_id, met)
+        if n is None:
+            raise HTTPException(404, f"no need {need_id}")
+        outcome = "got it" if met else "gave up"
+        broadcast("waited", who(request), f"{n['purpose']} ({n['who']}) {outcome}: {n['capability']}")
+        return n
 
     # -- source and builds ------------------------------------------------------
 

@@ -349,3 +349,72 @@ def test_deploying_and_undeploying_several_services_restarts_the_workload_once(s
         client.delete("/deployments")
         assert client.get("/deployments").json() == []
         assert len(relaunches) == 2
+
+
+def test_waiting_needs_show_on_the_board_until_someone_serves_them(setup):
+    tc, _ = setup
+
+    def waiting(client):
+        client.app.state.publisher.refresh()
+        return {f["key"]: f["value"] for f in client.get("/board").json()["facts"]}.get("waiting")
+
+    me = {"X-Ferment-User": "me@twin"}
+    with TestClient(create_app(tc)) as client:
+        assert waiting(client) is None
+        need = client.post("/needs", json={"capability": "relay:nexus:443", "purpose": "fmnt apply"}, headers=me).json()
+        assert waiting(client) == "fmnt apply needs someone attached who relays nexus:443 (0m)"
+        client.post("/source-requests", json={"name": "svc", "repo": "git@git.corp:org/svc.git", "ref": "main"})
+        assert "svc @ main needs someone attached who fetches from git.corp (0m)" in waiting(client)
+
+        vpn = {"X-Ferment-User": "me@vpn"}
+        client.post("/sessions", json={"client": "vpn", "relays": ["nexus:443"], "fetches": ["git.corp"]}, headers=vpn)
+        assert waiting(client) == (
+            "fmnt apply needs someone attached who relays nexus:443 (0m); me@vpn serves it, not working yet"
+        )
+        (n,) = client.get("/needs").json()
+        assert n["served_by"] == ["me@vpn"]
+        assert client.post(f"/needs/{need['id']}/heartbeat").status_code == 200
+        client.delete(f"/needs/{need['id']}", headers=me)
+        assert waiting(client) is None
+        assert client.post(f"/needs/{need['id']}/heartbeat").status_code == 404
+
+
+def test_a_claim_lapses_when_its_claimers_session_goes(setup):
+    tc, _ = setup
+    vpn, other = {"X-Ferment-User": "me@vpn"}, {"X-Ferment-User": "you@vpn"}
+    with TestClient(create_app(tc)) as client:
+        sid = client.post("/sessions", json={"client": "vpn", "fetches": ["git.corp"]}, headers=vpn).json()["id"]
+        rid = client.post("/source-requests", json={"name": "svc", "repo": "git@git.corp:o/svc.git", "ref": "main"})
+        rid = rid.json()["id"]
+        assert client.post(f"/source-requests/{rid}/claim", headers=vpn).status_code == 200
+        assert client.get("/source-requests").json() == []  # claimed, and its claimer is here
+        assert client.post(f"/source-requests/{rid}/claim", headers=other).status_code == 409
+
+        client.delete(f"/sessions/{sid}", headers=vpn)  # the laptop closed its lid
+        assert [r["id"] for r in client.get("/source-requests").json()] == [rid]
+        assert client.post(f"/source-requests/{rid}/claim", headers=other).status_code == 200
+
+
+def test_waiting_registers_beats_and_closes_its_need(setup, monkeypatch):
+    import httpx
+
+    from ferment import needs
+
+    tc, _ = setup
+    with TestClient(create_app(tc)) as client:
+
+        def route(method, url, **kw):
+            return client.request(method, url.removeprefix("http://f"), **kw)
+
+        monkeypatch.setattr(httpx, "request", route)
+        with needs.Waiting("http://f", needs.relay("nexus:443"), "fmnt apply") as w:
+            assert [n["capability"] for n in client.get("/needs").json()] == ["relay:nexus:443"]
+            tc.store.close_need(w.id, met=False)  # lapsed meanwhile (say this machine slept)
+            w.beat()  # registers anew
+            assert len(client.get("/needs").json()) == 1
+        assert client.get("/needs").json() == []
+
+        monkeypatch.setattr(httpx, "request", lambda method, url, **kw: httpx.Response(404))
+        with needs.Waiting("http://f", needs.fetch("git.corp"), "fmnt apply") as w:  # a server without /needs
+            w.beat()
+        assert w.id is None

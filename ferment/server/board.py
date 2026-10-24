@@ -13,6 +13,7 @@ left off, a client passes the last `feed_seq` it saw as `after`.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import itertools
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -21,8 +22,11 @@ from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
+from ferment import needs
 from ferment.board import Board, Milestone, Service, Snapshot
 from ferment.server import logs
+from ferment.server.clock import real_now
+from ferment.sources import repo_host
 
 # How long the stream sits idle before sending a comment, so proxies and ssh
 # tunnels see traffic and a gone client is noticed.
@@ -116,6 +120,31 @@ class Steps:
                 self.board.finish(mid, ok=False, detail=detail)
 
 
+def _age(since: str) -> str:
+    minutes = int((real_now() - dt.datetime.fromisoformat(since)).total_seconds() // 60)
+    return f"{minutes}m" if minutes < 120 else f"{minutes // 60}h"
+
+
+def waiting_for(store, sessions: list[dict]) -> list[str]:
+    """What's waiting on an attached client, for the board: registered needs,
+    and source requests nobody attached can fetch (or whose fetcher left)."""
+    served: dict[str, list[str]] = {}
+    for s in sessions:
+        for cap in needs.offered(s):
+            served.setdefault(cap, []).append(s["who"])
+    out = []
+    for n in store.needs():
+        line = f"{n['purpose']} needs {needs.describe(n['capability'])} ({_age(n['since'])})"
+        if by := served.get(n["capability"]):
+            line += f"; {', '.join(by)} serves it, not working yet"
+        out.append(line)
+    for r in store.claimable_source_requests():
+        cap = needs.fetch(repo_host(r["repo"]) or "?")
+        if cap not in served:
+            out.append(f"{r['name']} @ {r['ref']} needs {needs.describe(cap)} ({_age(r['requested_at'])})")
+    return out
+
+
 class Publisher(threading.Thread):
     """Keeps a fermenter server's board current: the clock, who's attached,
     the workload's readiness, the state of its services (from `services`,
@@ -174,8 +203,14 @@ class Publisher(threading.Thread):
     def _refresh(self) -> None:
         b, c = self.board, self.controller
         b.set_clock(c.clock.offset.total_seconds())
-        who = sorted({s["who"] for s in c.store.sessions()})
+        sessions = c.store.sessions()
+        who = sorted({s["who"] for s in sessions})
         b.set_fact("attached", ", ".join(who) or "nobody", "attached")
+        waiting = waiting_for(c.store, sessions)
+        if waiting:
+            b.set_fact("waiting", "; ".join(waiting), "waiting")
+        else:
+            b.drop_fact("waiting")
 
         sup = c.supervisor
         procs = {p["name"]: p for p in sup.processes()}

@@ -10,6 +10,7 @@ What lives here is what the server knows that no workload database does:
 - builds       what was built from which commit, how, and how it went
 - source_requests   code the VM needs that only an attached client can fetch
 - deployments  which build of each service the workload runs
+- needs        clients waiting for a capability only an attached client provides (ferment.needs)
 
 The server runs on real time, so rows carry real time; anything that happened
 "in the workload" also carries the fake time it happened at.
@@ -110,15 +111,38 @@ MIGRATIONS = [
     -- {name: commit}, '' for none); part of what makes two builds the same.
     ALTER TABLE builds ADD COLUMN inputs TEXT NOT NULL DEFAULT '';
     """,
+    """
+    CREATE TABLE needs (
+        id          INTEGER PRIMARY KEY,
+        capability  TEXT NOT NULL,          -- relay:<host:port> | fetch:<git host> (ferment.needs)
+        purpose     TEXT NOT NULL,          -- what waits on it, for the board
+        who         TEXT NOT NULL,
+        since       TEXT NOT NULL,
+        last_seen   TEXT NOT NULL,          -- the waiting client refreshes it, like a session
+        closed_at   TEXT,
+        met         INTEGER                 -- 1: got it, 0: gave up (when closed)
+    );
+    """,
 ]
 
 # A claimed source request not finished in this long is up for grabs again
-# (the client that claimed it went away mid-fetch).
+# (the client that claimed it is stuck). One whose claimer's session has gone
+# (detached, or a laptop that slept) is up for grabs at once.
 CLAIM_TIMEOUT = dt.timedelta(minutes=10)
 
 # A session not heard from in this long is treated as gone (attach heartbeats
 # every 15s; a laptop that sleeps or loses the network just stops).
 SESSION_TIMEOUT = dt.timedelta(seconds=60)
+# Same for a need nobody refreshes (its client was killed, or slept).
+NEED_TIMEOUT = SESSION_TIMEOUT
+
+# A claim the claimer has abandoned: too old, or its claimer was attached and
+# no longer is. Params: the claim cutoff, the session cutoff.
+_LAPSED = (
+    "(status = 'claimed' AND (claimed_at < ? OR ("
+    "EXISTS (SELECT 1 FROM sessions s WHERE s.who = claimed_by) AND NOT EXISTS ("
+    "SELECT 1 FROM sessions s WHERE s.who = claimed_by AND s.closed_at IS NULL AND s.last_seen >= ?))))"
+)
 
 
 def _now() -> str:
@@ -348,22 +372,23 @@ class Store:
         rows = self._rows("SELECT * FROM source_requests WHERE id = ?", request_id)
         return rows[0] if rows else None
 
+    @staticmethod
+    def _cutoffs() -> tuple[str, str]:
+        now = real_now()
+        return (now - CLAIM_TIMEOUT).isoformat(), (now - SESSION_TIMEOUT).isoformat()
+
     def claimable_source_requests(self) -> list[dict]:
-        cutoff = (real_now() - CLAIM_TIMEOUT).isoformat()
         return self._rows(
-            "SELECT * FROM source_requests WHERE status = 'pending' OR (status = 'claimed' AND claimed_at < ?) "
-            "ORDER BY id",
-            cutoff,
+            f"SELECT * FROM source_requests WHERE status = 'pending' OR {_LAPSED} ORDER BY id", *self._cutoffs()
         )
 
     def claim_source_request(self, request_id: int, who: str) -> bool:
         """Atomic: exactly one client wins a request."""
-        cutoff = (real_now() - CLAIM_TIMEOUT).isoformat()
         with self.lock:
             cur = self.db.execute(
                 "UPDATE source_requests SET status = 'claimed', claimed_by = ?, claimed_at = ? "
-                "WHERE id = ? AND (status = 'pending' OR (status = 'claimed' AND claimed_at < ?))",
-                (who, _now(), request_id, cutoff),
+                f"WHERE id = ? AND (status = 'pending' OR {_LAPSED})",
+                (who, _now(), request_id, *self._cutoffs()),
             )
             return cur.rowcount == 1
 
@@ -374,6 +399,41 @@ class Store:
                 "UPDATE source_requests SET status = ?, commit_sha = ?, error = ?, finished_at = ? WHERE id = ?",
                 (status, commit, error, _now(), request_id),
             )
+
+    # -- needs ----------------------------------------------------------------------
+
+    def add_need(self, capability: str, purpose: str, who: str) -> dict:
+        now = _now()
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO needs (capability, purpose, who, since, last_seen) VALUES (?, ?, ?, ?, ?)",
+                (capability, purpose, who, now, now),
+            )
+            nid = int(cur.lastrowid)
+        return self._rows("SELECT * FROM needs WHERE id = ?", nid)[0]
+
+    def touch_need(self, need_id: int) -> bool:
+        cutoff = (real_now() - NEED_TIMEOUT).isoformat()
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE needs SET last_seen = ? WHERE id = ? AND closed_at IS NULL AND last_seen >= ?",
+                (_now(), need_id, cutoff),
+            )
+            return cur.rowcount == 1
+
+    def close_need(self, need_id: int, met: bool) -> dict | None:
+        with self.lock:
+            self.db.execute(
+                "UPDATE needs SET closed_at = ?, met = ? WHERE id = ? AND closed_at IS NULL",
+                (_now(), int(met), need_id),
+            )
+        rows = self._rows("SELECT * FROM needs WHERE id = ?", need_id)
+        return rows[0] if rows else None
+
+    def needs(self) -> list[dict]:
+        """Open needs whose client is still waiting."""
+        cutoff = (real_now() - NEED_TIMEOUT).isoformat()
+        return self._rows("SELECT * FROM needs WHERE closed_at IS NULL AND last_seen >= ? ORDER BY id", cutoff)
 
     # -- deployments --------------------------------------------------------------
 
