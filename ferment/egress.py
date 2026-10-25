@@ -86,6 +86,18 @@ class EgressCache:
             )
             self.db.execute("DELETE FROM misses WHERE cache = ? AND key = ?", (cache, key))
 
+    def drop(self, cache: str, keys: list[str]) -> int:
+        """Forget entries (e.g. one recorded from a wrong route): the next run misses them again."""
+        with self.lock:
+            cur = self.db.executemany("DELETE FROM entries WHERE cache = ? AND key = ?", [(cache, k) for k in keys])
+            return cur.rowcount
+
+    def entries(self, cache: str) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT key, status_code, LENGTH(body), stored_at FROM entries WHERE cache = ? ORDER BY key", (cache,)
+        ).fetchall()
+        return [dict(zip(("key", "status_code", "bytes", "stored_at"), r, strict=True)) for r in rows]
+
     def miss(self, cache: str, key: str, env: str) -> None:
         now = _now()
         with self.lock:
@@ -122,6 +134,11 @@ class EgressCache:
 class CacheGet(BaseModel):
     cache_name: str | None = None
     key: str
+
+
+class CacheDrop(BaseModel):
+    cache_name: str | None = None
+    keys: list[str]
 
 
 class CachePut(BaseModel):
@@ -169,6 +186,14 @@ def create_egress_app(cache: EgressCache, default_cache: str) -> FastAPI:
     def get(req: CacheGet):
         hit = cache.get(req.cache_name or default_cache, req.key)
         return {"hit": False, "detail": f"cache miss for {req.key}"} if hit is None else {"hit": True, **hit}
+
+    @app.post("/cache/drop")
+    def drop(req: CacheDrop):
+        return {"dropped": cache.drop(req.cache_name or default_cache, req.keys)}
+
+    @app.get("/entries")
+    def entries(cache_name: str | None = None):
+        return cache.entries(cache_name or default_cache)
 
     @app.get("/misses")
     def misses(cache_name: str | None = None):

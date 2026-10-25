@@ -34,3 +34,11 @@ def test_a_run_reads_only_the_cache_misses_fail_closed_and_writes_are_faked(tmp_
 def test_the_cache_survives_a_restart(tmp_path):
     EgressCache(tmp_path / "e.sqlite").put("c", "GET a", 200, "x", None, {})
     assert EgressCache(tmp_path / "e.sqlite").get("c", "GET a")["body"] == "x"
+
+
+def test_an_entry_from_a_wrong_route_can_be_dropped_and_is_missed_again(tmp_path):
+    client = TestClient(create_egress_app(EgressCache(tmp_path / "e.sqlite"), "fermenter"))
+    client.post("/cache/put", json={"key": "GET cos/v3/developer-apps", "status_code": 405, "body": ""})
+    assert [(e["key"], e["status_code"]) for e in client.get("/entries").json()] == [("GET cos/v3/developer-apps", 405)]
+    assert client.post("/cache/drop", json={"keys": ["GET cos/v3/developer-apps"]}).json() == {"dropped": 1}
+    assert client.get("/proxy/na/cos/v3/developer-apps").status_code == 511
