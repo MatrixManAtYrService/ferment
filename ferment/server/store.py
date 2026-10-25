@@ -11,6 +11,7 @@ What lives here is what the server knows that no workload database does:
 - source_requests   code the VM needs that only an attached client can fetch
 - deployments  which build of each service the workload runs
 - needs        clients waiting for a capability only an attached client provides (ferment.needs)
+- data_requests  data the VM needs that only an attached client can get (ferment.data)
 
 The server runs on real time, so rows carry real time; anything that happened
 "in the workload" also carries the fake time it happened at.
@@ -123,6 +124,22 @@ MIGRATIONS = [
         met         INTEGER                 -- 1: got it, 0: gave up (when closed)
     );
     """,
+    """
+    ALTER TABLE sessions ADD COLUMN provides TEXT NOT NULL DEFAULT '[]';  -- JSON list of capabilities (data:<source>)
+    CREATE TABLE data_requests (
+        id          INTEGER PRIMARY KEY,
+        capability  TEXT NOT NULL,          -- who can serve it: data:<source>
+        spec        TEXT NOT NULL,          -- canonical JSON, meaningful to the source's handler
+        status      TEXT NOT NULL,          -- pending | claimed | done | failed
+        result      TEXT,                   -- JSON, when done
+        requested_by TEXT NOT NULL,
+        claimed_by  TEXT,
+        requested_at TEXT NOT NULL,
+        claimed_at  TEXT,
+        finished_at TEXT,
+        error       TEXT
+    );
+    """,
 ]
 
 # A claimed source request not finished in this long is up for grabs again
@@ -197,12 +214,20 @@ class Store:
 
     # -- sessions ---------------------------------------------------------------
 
-    def open_session(self, who: str, client: str, relays: list[str], fetches: list[str] = ()) -> int:  # type: ignore[assignment]
+    def open_session(
+        self,
+        who: str,
+        client: str,
+        relays: list[str],
+        fetches: list[str] = (),  # type: ignore[assignment]
+        provides: list[str] = (),  # type: ignore[assignment]
+    ) -> int:
         now = _now()
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO sessions (who, client, relays, fetches, opened_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-                (who, client, json.dumps(relays), json.dumps(list(fetches)), now, now),
+                "INSERT INTO sessions (who, client, relays, fetches, provides, opened_at, last_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (who, client, json.dumps(relays), json.dumps(list(fetches)), json.dumps(list(provides)), now, now),
             )
             return int(cur.lastrowid)
 
@@ -225,6 +250,7 @@ class Store:
         for r in self._rows("SELECT * FROM sessions ORDER BY id"):
             r["relays"] = json.loads(r["relays"])
             r["fetches"] = json.loads(r["fetches"])
+            r["provides"] = json.loads(r["provides"])
             r["active"] = r["closed_at"] is None and r["last_seen"] >= cutoff
             if include_gone or r["active"]:
                 out.append(r)
@@ -398,6 +424,63 @@ class Store:
             self.db.execute(
                 "UPDATE source_requests SET status = ?, commit_sha = ?, error = ?, finished_at = ? WHERE id = ?",
                 (status, commit, error, _now(), request_id),
+            )
+
+    # -- data requests --------------------------------------------------------------
+
+    @staticmethod
+    def _data_row(r: dict) -> dict:
+        r["spec"] = json.loads(r["spec"])
+        r["result"] = json.loads(r["result"]) if r["result"] else None
+        return r
+
+    def request_data(self, capability: str, spec: dict, who: str) -> dict:
+        """Queue a request for an attached client; an identical open one is reused."""
+        key = json.dumps(spec, sort_keys=True, separators=(",", ":"))
+        open_ = self._rows(
+            "SELECT id FROM data_requests WHERE capability = ? AND spec = ? AND status IN ('pending', 'claimed') "
+            "ORDER BY id DESC LIMIT 1",
+            capability,
+            key,
+        )
+        if open_:
+            return self.data_request(open_[0]["id"])  # type: ignore[return-value]
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO data_requests (capability, spec, status, requested_by, requested_at) "
+                "VALUES (?, ?, 'pending', ?, ?)",
+                (capability, key, who, _now()),
+            )
+            rid = int(cur.lastrowid)
+        return self.data_request(rid)  # type: ignore[return-value]
+
+    def data_request(self, request_id: int) -> dict | None:
+        rows = self._rows("SELECT * FROM data_requests WHERE id = ?", request_id)
+        return self._data_row(rows[0]) if rows else None
+
+    def claimable_data_requests(self, capability: str | None = None) -> list[dict]:
+        sql = f"SELECT * FROM data_requests WHERE (status = 'pending' OR {_LAPSED})"
+        args: list = [*self._cutoffs()]
+        if capability is not None:
+            sql += " AND capability = ?"
+            args.append(capability)
+        return [self._data_row(r) for r in self._rows(sql + " ORDER BY id", *args)]
+
+    def claim_data_request(self, request_id: int, who: str) -> bool:
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE data_requests SET status = 'claimed', claimed_by = ?, claimed_at = ? "
+                f"WHERE id = ? AND (status = 'pending' OR {_LAPSED})",
+                (who, _now(), request_id, *self._cutoffs()),
+            )
+            return cur.rowcount == 1
+
+    def finish_data_request(self, request_id: int, *, result: dict | None = None, error: str | None = None) -> None:
+        status = "done" if error is None else "failed"
+        with self.lock:
+            self.db.execute(
+                "UPDATE data_requests SET status = ?, result = ?, error = ?, finished_at = ? WHERE id = ?",
+                (status, json.dumps(result) if result is not None else None, error, _now(), request_id),
             )
 
     # -- needs ----------------------------------------------------------------------

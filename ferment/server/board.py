@@ -142,6 +142,12 @@ def waiting_for(store, sessions: list[dict]) -> list[str]:
         cap = needs.fetch(repo_host(r["repo"]) or "?")
         if cap not in served:
             out.append(f"{r['name']} @ {r['ref']} needs {needs.describe(cap)} ({_age(r['requested_at'])})")
+    unserved: dict[str, list[dict]] = {}
+    for r in store.claimable_data_requests():
+        if r["capability"] not in served:
+            unserved.setdefault(r["capability"], []).append(r)
+    for cap, rows in unserved.items():  # a pull asks for every table at once: one line, counted
+        out.append(f"{len(rows)} data requests need {needs.describe(cap)} ({_age(rows[0]['requested_at'])})")
     return out
 
 

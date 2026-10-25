@@ -10,6 +10,7 @@ advertise what they serve:
 
     relay:<host>:<port>   the VM reaches host:port through a client (ferment.relay)
     fetch:<git host>      a client fetches code from that host for the VM (ferment.fulfill)
+    data:<source>         a client gets data from that source for the VM (ferment.data)
 
 A client that's waiting registers a need with the server (`Waiting`) and
 keeps it fresh while it waits, so the board can say "fmnt apply needs
@@ -39,7 +40,11 @@ def fetch(host: str) -> str:
 
 def offered(session: dict) -> set[str]:
     """What an attached session (store.sessions()) serves."""
-    return {relay(r) for r in session.get("relays", [])} | {fetch(h) for h in session.get("fetches", [])}
+    return (
+        {relay(r) for r in session.get("relays", [])}
+        | {fetch(h) for h in session.get("fetches", [])}
+        | set(session.get("provides", []))
+    )
 
 
 def describe(capability: str) -> str:
@@ -48,6 +53,8 @@ def describe(capability: str) -> str:
         return f"someone attached who relays {what}"
     if kind == "fetch":
         return f"someone attached who fetches from {what}"
+    if kind == "data":
+        return f"someone attached who gets data from {what}"
     return f"someone attached who provides {capability}"
 
 

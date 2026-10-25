@@ -29,6 +29,7 @@ from ferment.server import clock as clock_mod
 from ferment.server import logs
 from ferment.server.board import Publisher, Steps, board_router
 from ferment.server.builds import Builder
+from ferment.server.data import DataStore, Loader, data_root, data_router
 from ferment.server.sources import SourceStore, SourceStoreError
 from ferment.server.time_control import CheckpointError, TimeController
 
@@ -46,6 +47,7 @@ class NewSession(BaseModel):
     client: str
     relays: list[str] = []
     fetches: list[str] = []  # git hosts this client can fetch from on the VM's behalf
+    provides: list[str] = []  # other capabilities it serves (ferment.needs), e.g. data:<source>
     client_time: dt.datetime | None = None  # the client's (real) time: corrects the VM's idea of real time
 
 
@@ -140,6 +142,12 @@ def create_app(
     app.state.board = board
     app.state.publisher = publisher
     app.include_router(board_router(board))
+    datastore = DataStore(data_root(controller.state_dir))
+    loader = None
+    if database is not None and hasattr(database, "client_args"):  # MySQL; MariaDB is the no-archive fallback
+        loader = Loader(datastore, database.client_args, lambda group, keys: steps(group, keys), broadcast)
+    app.include_router(data_router(store, datastore, loader, who, broadcast))
+    app.state.datastore, app.state.loader = datastore, loader
 
     # Every state-changing request lands in the event log, with who sent it.
     @app.middleware("http")
@@ -224,9 +232,9 @@ def create_app(
         w = who(request)
         if req.client_time is not None:
             controller.clock.observe(req.client_time, w)
-        serves = ", ".join(req.relays + req.fetches) or "nothing"
+        serves = ", ".join(req.relays + req.fetches + req.provides) or "nothing"
         broadcast("attached", w, f"{w} attached from {req.client} (serving: {serves})")
-        return {"id": store.open_session(w, req.client, req.relays, req.fetches)}
+        return {"id": store.open_session(w, req.client, req.relays, req.fetches, req.provides)}
 
     @app.post("/sessions/{session_id}/heartbeat")
     def heartbeat(session_id: int, request: Request, req: Heartbeat | None = None):
