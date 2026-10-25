@@ -202,7 +202,8 @@ def create_app(
 
     @app.get("/checkpoints")
     def checkpoints(limit: int = 50):
-        return store.checkpoints(limit)
+        head = store.head()
+        return [{**c, "head": c["id"] == head} for c in store.checkpoints(limit)]
 
     @app.post("/checkpoints")
     def checkpoint(req: NewCheckpoint, request: Request):

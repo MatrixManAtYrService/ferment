@@ -153,6 +153,16 @@ MIGRATIONS = [
         resolved_at TEXT
     );
     """,
+    """
+    -- Checkpoints form a tree: a restore and more work is a branch. parent is
+    -- the checkpoint the data descended from when this one was taken (the
+    -- head, kept in kv); NULL for the first, and for ones taken before this.
+    ALTER TABLE checkpoints ADD COLUMN parent INTEGER REFERENCES checkpoints(id);
+    CREATE TABLE kv (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL
+    );
+    """,
 ]
 
 # A claimed source request not finished in this long is up for grabs again
@@ -281,16 +291,19 @@ class Store:
         fake_time: str,
         offset_seconds: int,
         parts: dict[str, str],
+        parent: int | None = None,
     ) -> dict:
+        """Records it as the head too: what later ones descend from."""
         with self.lock:
             self.db.execute("BEGIN")
             try:
                 cur = self.db.execute(
-                    "INSERT INTO checkpoints (name, message, kind, who, real_time, fake_time, offset_seconds) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (name, message, kind, who, _now(), fake_time, offset_seconds),
+                    "INSERT INTO checkpoints (name, message, kind, who, real_time, fake_time, offset_seconds, parent) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (name, message, kind, who, _now(), fake_time, offset_seconds, parent),
                 )
                 cid = int(cur.lastrowid)
+                self.db.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('head', ?)", (str(cid),))
                 self.db.executemany(
                     "INSERT INTO checkpoint_parts (checkpoint_id, store, ref) VALUES (?, ?, ?)",
                     [(cid, store, ref) for store, ref in parts.items()],
@@ -300,6 +313,15 @@ class Store:
                 self.db.execute("ROLLBACK")
                 raise
         return self.checkpoint(str(cid))  # type: ignore[return-value]
+
+    def head(self) -> int | None:
+        """The checkpoint the live data descends from: the last one taken or restored."""
+        rows = self._rows("SELECT value FROM kv WHERE key = 'head'")
+        return int(rows[0]["value"]) if rows else None
+
+    def set_head(self, checkpoint_id: int) -> None:
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('head', ?)", (str(checkpoint_id),))
 
     def next_checkpoint_id(self) -> int:
         """The id the next checkpoint will get (single writer: the controller's lock)."""

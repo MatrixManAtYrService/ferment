@@ -418,3 +418,17 @@ def test_waiting_registers_beats_and_closes_its_need(setup, monkeypatch):
         with needs.Waiting("http://f", needs.fetch("git.corp"), "fmnt apply") as w:  # a server without /needs
             w.beat()
         assert w.id is None
+
+
+def test_checkpoints_form_a_tree_and_a_restore_starts_a_branch(setup):
+    tc, _ = setup
+    a = tc.checkpoint("loaded", name="loaded")
+    b = tc.checkpoint("day 1")
+    assert (a["parent"], b["parent"]) == (None, a["id"])
+    out = tc.restore("loaded", wait_ready=False)
+    assert out["previous"]["parent"] == b["id"]  # where we were, kept
+    c = tc.checkpoint("day 1, variant B")
+    assert c["parent"] == a["id"]  # a branch off loaded, not after b
+    with TestClient(create_app(tc)) as client:
+        rows = {r["id"]: r for r in client.get("/checkpoints").json()}
+        assert rows[c["id"]]["head"] and not rows[b["id"]]["head"]

@@ -129,6 +129,7 @@ class TimeController:
             fake_time=self.clock.now().isoformat(),
             offset_seconds=round(self.clock.offset.total_seconds()),
             parts=parts,
+            parent=self.store.head(),
         )
 
     def set_time(
@@ -186,6 +187,7 @@ class TimeController:
             step("checkpoint")
             for store in self.versioned:
                 store.restore(cp["parts"])
+            self.store.set_head(cp["id"])  # what's next descends from it: a branch
             step("restore")
             self.clock.set(dt.datetime.fromisoformat(cp["fake_time"]))
             step("clock")
