@@ -36,6 +36,7 @@ from pathlib import Path
 
 SNAPSHOT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PART = "volume:data"
+BINLOG_PART = "volume:binlog"  # where the binlog was at the snapshot: file:position
 
 
 class VolumeError(RuntimeError):
@@ -162,7 +163,13 @@ class VolumeSnapshots:
         self.agent = agent
 
     def snapshot(self, message: str, tags: list[str], *, running: bool) -> dict[str, str]:
-        return {PART: self.agent.snapshot_volume(tags[0])}
+        """The snapshot, and where the binlog was: the rows that changed between
+        two checkpoints on one lineage are the binlog between their positions."""
+        snap = self.agent.snapshot_volume(tags[0])
+        parts = {PART: snap["id"]}
+        if snap.get("binlog"):
+            parts[BINLOG_PART] = snap["binlog"]
+        return parts
 
     def restore(self, parts: dict[str, str]) -> None:
         if PART not in parts:

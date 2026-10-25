@@ -144,9 +144,9 @@ class AgentClient:
         finally:
             self._request("DELETE", "/db/offline")
 
-    def snapshot_volume(self, sid: str) -> str:
-        """For ferment.volume.VolumeSnapshots."""
-        return self._request("POST", f"/volume/snapshots/{sid}")["id"]
+    def snapshot_volume(self, sid: str) -> dict:
+        """For ferment.volume.VolumeSnapshots: {id, binlog (file:position, or None)}."""
+        return self._request("POST", f"/volume/snapshots/{sid}")
 
     def restore_volume(self, sid: str) -> None:
         self._request("POST", f"/volume/snapshots/{sid}/restore")

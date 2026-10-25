@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from ferment.volume import PART, Volume, VolumeError, VolumeSnapshots
+from ferment.volume import BINLOG_PART, PART, Volume, VolumeError, VolumeSnapshots
 
 
 class FakeBtrfs:
@@ -90,7 +90,7 @@ def test_checkpoints_through_the_agent_are_volume_snapshots():
 
         def snapshot_volume(self, sid):
             self.calls.append(("snapshot", sid))
-            return sid
+            return {"id": sid, "binlog": "binlog.000007:1234"}
 
         def restore_volume(self, sid):
             self.calls.append(("restore", sid))
@@ -98,7 +98,7 @@ def test_checkpoints_through_the_agent_are_volume_snapshots():
     agent = Agent()
     store = VolumeSnapshots(agent)
     parts = store.snapshot("before clock change", ["ckpt-7", "loaded"], running=False)
-    assert parts == {PART: "ckpt-7"}
+    assert parts == {PART: "ckpt-7", BINLOG_PART: "binlog.000007:1234"}
     store.restore(parts)
     assert agent.calls == [("snapshot", "ckpt-7"), ("restore", "ckpt-7")]
     with pytest.raises(VolumeError, match="before snapshots"):
@@ -127,8 +127,26 @@ def test_the_agent_prepares_the_volume_before_the_workload_and_guards_restores(t
     with TestClient(create_agent_app(sup, volume=v)) as client:
         assert client.put("/workload", json={"processes": []}).status_code == 200  # waits for the volume
         assert client.get("/health").json()["volume"] == "ready"
-        assert client.post("/volume/snapshots/ckpt-1").json() == {"id": "ckpt-1"}  # fine while running
+        assert client.post("/volume/snapshots/ckpt-1").json() == {"id": "ckpt-1", "binlog": None}  # fine while running
         assert client.post("/volume/snapshots/ckpt-1/restore").status_code == 409  # not while running
         client.delete("/workload")
         assert client.post("/volume/snapshots/ckpt-1/restore").status_code == 200
         assert client.get("/volume").json()["snapshots"] == ["ckpt-1"]
+
+
+def test_a_stopped_servers_binlog_position_is_its_newest_binlog_and_length(tmp_path):
+    from ferment.databases import MySQL
+
+    db = MySQL(tmp_path)
+    assert db.binlog_position() is None
+    db.data_dir.mkdir()
+    (db.data_dir / "binlog.000006").write_bytes(b"x" * 10)
+    (db.data_dir / "binlog.000007").write_bytes(b"x" * 1234)
+    (db.data_dir / "binlog.index").write_text("./binlog.000006\n./binlog.000007\n")
+    assert db.binlog_position() == "binlog.000007:1234"
+
+
+def test_binlogs_never_expire_by_the_fake_clock(tmp_path):
+    from ferment.databases import MySQL
+
+    assert "--binlog-expire-logs-auto-purge=OFF" in MySQL(tmp_path)._server_args(3306, tmp_path / "s.sock")

@@ -161,6 +161,9 @@ class MySQL(Database):
             self.tool("mysqld"), "--no-defaults", f"--datadir={self.data_dir}", f"--port={port}",
             f"--socket={socket}", f"--bind-address={self.bind}", "--mysqlx=OFF",
             f"--pid-file={self.state_dir / f'mysql84.{port}.pid'}", f"--init-file={self._init_file}",
+            # The fake clock jumps (a month, or back to a checkpoint): don't let
+            # it expire binlogs, which are how checkpoints get diffed.
+            "--binlog-expire-logs-auto-purge=OFF",
         ]  # fmt: skip
 
     def processes(self) -> list[Process]:
@@ -203,18 +206,36 @@ class MySQL(Database):
             proc.terminate()
             proc.wait(timeout=120)
 
-    def dump(self, database: str, port: int, out: Path, *, routines: bool, extra: list[str] = ()) -> None:  # type: ignore[assignment]
-        """Tables (with data and triggers), or only the stored routines."""
-        args = [self.tool("mysqldump"), "--no-defaults", "-h", self.host, "-P", str(port), "-uroot",
-                "--single-transaction", "--set-gtid-purged=OFF", "--no-tablespaces", *extra]  # fmt: skip
-        if routines:
-            args += ["--routines", "--no-create-info", "--no-data", "--skip-triggers"]
-        else:
-            args += ["--skip-routines"]
-        with out.open("w") as f:
-            result = subprocess.run([*args, database], stdout=f, stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            raise DatabaseError(f"mysqldump {database}: {result.stderr.strip()}")
+    def _query(self, sql: str) -> str:
+        p = subprocess.run([*self.client_args(), "-N", "-B", "-e", sql], capture_output=True, text=True)
+        if p.returncode != 0:
+            raise DatabaseError(f"{sql}: {p.stderr.strip()}")
+        return p.stdout
+
+    def before_snapshot(self, timeout: float = 60.0) -> str | None:
+        """Get a running server ready for a snapshot of its data dir: dump the
+        buffer pool's page list (so a restore starts warm), and say where the
+        binlog is (`file:position`), which is where this checkpoint's changes
+        end in it."""
+        self._query("SET GLOBAL innodb_buffer_pool_dump_now = ON")
+        deadline = time.monotonic() + timeout
+        while "completed" not in self._query("SHOW STATUS LIKE 'Innodb_buffer_pool_dump_status'"):
+            if time.monotonic() > deadline:
+                break  # a cold restore, not a wrong one
+            time.sleep(0.2)
+        row = self._query("SHOW BINARY LOG STATUS").split("\t")
+        return f"{row[0]}:{row[1]}" if len(row) > 1 else None
+
+    def binlog_position(self) -> str | None:
+        """The same, for a stopped server: the newest binlog and its length."""
+        index = self.data_dir / "binlog.index"
+        if not index.exists():
+            return None
+        names = [line.strip() for line in index.read_text().splitlines() if line.strip()]
+        if not names:
+            return None
+        newest = self.data_dir / Path(names[-1]).name
+        return f"{newest.name}:{newest.stat().st_size}" if newest.exists() else None
 
     def load(self, database: str, port: int, sql: str, *, replace: bool) -> None:
         head = f"DROP DATABASE IF EXISTS `{database}`;\nCREATE DATABASE `{database}`;\n" if replace else ""

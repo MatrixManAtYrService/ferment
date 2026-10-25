@@ -176,8 +176,15 @@ def create_agent_app(
 
     @app.post("/volume/snapshots/{sid}")
     def snapshot(sid: str):
+        v = _volume()
+        binlog = None
         try:
-            return {"id": _volume().snapshot(sid)}
+            if database is not None:
+                binlog = database.before_snapshot() if supervisor.running else database.binlog_position()
+        except Exception as e:  # warmth and the binlog coordinate are nice to have, the snapshot isn't
+            print(f"volume: before snapshot {sid}: {e}", flush=True)
+        try:
+            return {"id": v.snapshot(sid), "binlog": binlog}
         except VolumeError as e:
             raise HTTPException(409, str(e))
 
