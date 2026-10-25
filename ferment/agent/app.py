@@ -13,6 +13,7 @@ GET    /volume             the data volume (ferment.volume): its snapshots, what
 POST   /volume/snapshots/{id}           snapshot the database's data dir (a checkpoint)
 POST   /volume/snapshots/{id}/restore   put it back (workload stopped)
 DELETE /volume/snapshots/{id}           drop one
+GET    /db/changes         what the binlog has between start and stop (file:position; ferment.binlog)
 GET    /probes             clock probe readings (ferment.clockcheck), `since` a fake time
 GET    /artifacts/{sha256}/{filename}   {path, exists}: where a built artifact is (or would be) kept
 PUT    /artifacts/{sha256}/{filename}   upload it (body: the file); checked against its hash
@@ -206,6 +207,21 @@ def create_agent_app(
         except VolumeError as e:
             raise HTTPException(409, str(e))
         return {"ok": True}
+
+    @app.get("/db/changes")
+    def db_changes(start: str, stop: str | None = None):
+        if database is None:
+            raise HTTPException(404, "this workload has no database the agent manages")
+        from ferment.binlog import summarize
+
+        valid = re.compile(r"^[A-Za-z0-9_.-]+:\d+$")
+        if not valid.match(start) or (stop is not None and not valid.match(stop)):
+            raise HTTPException(422, "positions are file:offset")
+        try:
+            tables = summarize(database.binlog_lines(start, stop), database.columns)
+        except LookupError as e:
+            raise HTTPException(404, str(e))
+        return {"start": start, "stop": stop, "tables": tables}
 
     @app.delete("/db/offline")
     def stop_offline():

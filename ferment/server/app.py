@@ -555,6 +555,25 @@ def _stepped(s: Steps, run: Callable[[], dict]) -> dict:
 
 
 def _mount_database(app: FastAPI, controller: TimeController, database: Database) -> None:
+    @app.get("/db/changes")
+    def db_changes(from_ref: str, to_ref: str | None = None):
+        """What the binlog says was written between two checkpoints (names or
+        ids; to: now if omitted), table by table (ferment.binlog)."""
+
+        def position(ref: str) -> str:
+            cp = controller.store.checkpoint(ref)
+            if cp is None:
+                raise HTTPException(404, f"no checkpoint {ref!r}")
+            pos = cp["parts"].get("volume:binlog")
+            if pos is None:
+                raise HTTPException(422, f"checkpoint {ref!r} has no binlog position (taken before they were kept)")
+            return pos
+
+        changes = getattr(controller.supervisor, "db_changes", None)
+        if changes is None:
+            raise HTTPException(501, "this fermenter's workload agent can't read its binlog")
+        return changes(position(from_ref), position(to_ref) if to_ref else None)
+
     @app.get("/db")
     def db_info():
         return {"kind": database.kind, "versioned": bool(controller.versioned), "client": database.client}

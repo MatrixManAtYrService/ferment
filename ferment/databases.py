@@ -231,6 +231,35 @@ class MySQL(Database):
         row = self._query("SHOW BINARY LOG STATUS").split("\t")
         return f"{row[0]}:{row[1]}" if len(row) > 1 else None
 
+    def binlog_names(self) -> list[str]:
+        index = self.data_dir / "binlog.index"
+        if not index.exists():
+            return []
+        return [Path(line.strip()).name for line in index.read_text().splitlines() if line.strip()]
+
+    def binlog_lines(self, start: str, stop: str | None = None) -> Iterator[str]:
+        """The binlog's rows from `start` to `stop` (file:position; None: now),
+        as mysqlbinlog -v prints them (ferment.binlog parses them)."""
+        from ferment.binlog import span
+
+        for name, s, e in span(self.binlog_names(), start, stop):
+            argv = [self.tool("mysqlbinlog"), "--no-defaults", "-v", "--base64-output=DECODE-ROWS"]
+            argv += [f"--start-position={s}"] if s is not None else []
+            argv += [f"--stop-position={e}"] if e is not None else []
+            with subprocess.Popen([*argv, str(self.data_dir / name)], stdout=subprocess.PIPE, text=True) as p:
+                assert p.stdout
+                yield from p.stdout
+            if p.returncode:
+                raise DatabaseError(f"mysqlbinlog {name} exited {p.returncode}")
+
+    def columns(self, database: str, table: str) -> list[str]:
+        """The table's columns in order (what the binlog's @1, @2, ... are)."""
+        out = self._query(
+            "SELECT column_name FROM information_schema.columns "
+            f"WHERE table_schema = '{database}' AND table_name = '{table}' ORDER BY ordinal_position"
+        )
+        return [line for line in out.splitlines() if line]
+
     def binlog_position(self) -> str | None:
         """The same, for a stopped server: the newest binlog and its length."""
         index = self.data_dir / "binlog.index"
