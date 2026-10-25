@@ -14,8 +14,10 @@ stands where those services expect the outbound proxy and:
   the proxy that fetches them (eda's egress, in record mode) writes to.
 
 Keys are the outbound proxy's own: `METHOD upstream_path?sorted-query`, for
-requests to `/proxy/<env>/<upstream_path>`, computed from the incoming
-request so a recording and a replay agree.
+requests to `/proxy/<env>/<upstream_path>`, plus ` #<sha256(body)[:16]>`
+when a read carries a body (some are GETs whose arguments are JSON),
+computed from the incoming request so a recording and a replay agree. A
+miss keeps its body, so precaching can send the same request.
 
 The cache lives in SQLite outside the workload's snapshot volume: restoring
 a checkpoint keeps what was precached.
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import sqlite3
 import threading
@@ -45,18 +48,19 @@ CREATE TABLE IF NOT EXISTS entries (
     content_type TEXT, meta TEXT, stored_at TEXT NOT NULL, PRIMARY KEY (cache, key));
 CREATE TABLE IF NOT EXISTS misses (
     cache TEXT NOT NULL, key TEXT NOT NULL, env TEXT NOT NULL, count INTEGER NOT NULL,
-    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, PRIMARY KEY (cache, key));
+    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', PRIMARY KEY (cache, key));
 CREATE TABLE IF NOT EXISTS writes (
     cache TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, count INTEGER NOT NULL,
     last_seen TEXT NOT NULL, PRIMARY KEY (cache, method, path));
 """
 
 
-def cache_key(method: str, upstream_path: str, query: list[tuple[str, str]]) -> str:
+def cache_key(method: str, upstream_path: str, query: list[tuple[str, str]], body: bytes = b"") -> str:
     """As eda's egress proxy computes it (its _cache_key): the one form a recording
     and a replay both produce."""
     q = urlencode(sorted(query))
-    return f"{method.upper()} {upstream_path}" + (f"?{q}" if q else "")
+    key = f"{method.upper()} {upstream_path}" + (f"?{q}" if q else "")
+    return key + (f" #{hashlib.sha256(body).hexdigest()[:16]}" if body else "")
 
 
 def _now() -> str:
@@ -70,6 +74,8 @@ class EgressCache:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.executescript(SCHEMA)
+        if "body" not in {r[1] for r in self.db.execute("PRAGMA table_info(misses)")}:  # made before bodies counted
+            self.db.execute("ALTER TABLE misses ADD COLUMN body TEXT NOT NULL DEFAULT ''")
         self.lock = threading.Lock()
 
     def get(self, cache: str, key: str) -> dict | None:
@@ -98,13 +104,13 @@ class EgressCache:
         ).fetchall()
         return [dict(zip(("key", "status_code", "bytes", "stored_at"), r, strict=True)) for r in rows]
 
-    def miss(self, cache: str, key: str, env: str) -> None:
+    def miss(self, cache: str, key: str, env: str, body: str = "") -> None:
         now = _now()
         with self.lock:
             self.db.execute(
-                "INSERT INTO misses VALUES (?, ?, ?, 1, ?, ?) ON CONFLICT (cache, key) "
-                "DO UPDATE SET count = count + 1, last_seen = excluded.last_seen",
-                (cache, key, env, now, now),
+                "INSERT INTO misses (cache, key, env, count, first_seen, last_seen, body) VALUES (?, ?, ?, 1, ?, ?, ?) "
+                "ON CONFLICT (cache, key) DO UPDATE SET count = count + 1, last_seen = excluded.last_seen",
+                (cache, key, env, now, now, body),
             )
 
     def wrote(self, cache: str, method: str, path: str) -> None:
@@ -117,9 +123,10 @@ class EgressCache:
 
     def misses(self, cache: str) -> list[dict]:
         rows = self.db.execute(
-            "SELECT key, env, count, first_seen, last_seen FROM misses WHERE cache = ? ORDER BY first_seen", (cache,)
+            "SELECT key, env, count, first_seen, last_seen, body FROM misses WHERE cache = ? ORDER BY first_seen",
+            (cache,),
         ).fetchall()
-        return [dict(zip(("key", "env", "count", "first_seen", "last_seen"), r, strict=True)) for r in rows]
+        return [dict(zip(("key", "env", "count", "first_seen", "last_seen", "body"), r, strict=True)) for r in rows]
 
     def stats(self, cache: str) -> dict:
         one = lambda q: self.db.execute(q, (cache,)).fetchone()[0]  # noqa: E731
@@ -163,10 +170,11 @@ def create_egress_app(cache: EgressCache, default_cache: str) -> FastAPI:
         if method not in READS:
             cache.wrote(default_cache, method, upstream_path)
             return Response(status_code=200)  # faked, as the recording proxy fakes them
-        key = cache_key(method, upstream_path, list(request.query_params.multi_items()))
+        body = await request.body()
+        key = cache_key(method, upstream_path, list(request.query_params.multi_items()), body)
         hit = cache.get(default_cache, key)
         if hit is None:
-            cache.miss(default_cache, key, env)
+            cache.miss(default_cache, key, env, body.decode(errors="replace"))
             return Response(
                 content=f"egress cache: miss for {key} (precache it; a run never reaches the real thing)".encode(),
                 status_code=511,

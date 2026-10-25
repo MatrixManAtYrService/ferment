@@ -42,3 +42,15 @@ def test_an_entry_from_a_wrong_route_can_be_dropped_and_is_missed_again(tmp_path
     assert [(e["key"], e["status_code"]) for e in client.get("/entries").json()] == [("GET cos/v3/developer-apps", 405)]
     assert client.post("/cache/drop", json={"keys": ["GET cos/v3/developer-apps"]}).json() == {"dropped": 1}
     assert client.get("/proxy/na/cos/v3/developer-apps").status_code == 511
+
+
+def test_a_get_with_a_body_is_keyed_by_it_and_its_miss_keeps_the_body(tmp_path):
+    client = TestClient(create_egress_app(EgressCache(tmp_path / "e.sqlite"), "fermenter"))
+    body = '["APP1","APP2"]'
+    r = client.request(
+        "GET", "/proxy/na/cos/v3/developer-apps", content=body, headers={"content-type": "application/json"}
+    )
+    assert r.status_code == 511
+    (m,) = client.get("/misses").json()
+    assert m["key"] == cache_key("GET", "cos/v3/developer-apps", [], body.encode()) and m["body"] == body
+    assert m["key"] != cache_key("GET", "cos/v3/developer-apps", [], b'["APP3"]')
