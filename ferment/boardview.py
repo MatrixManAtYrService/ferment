@@ -66,10 +66,11 @@ class BoardView:
         me: str,
         forwards: dict[str, tuple[int, int]] | None = None,
         resolve: Callable[[str], list[str] | None] | None = None,
-        on_acted: Callable[[str, int], None] | None = None,
+        on_acted: Callable[[WaitItem, int], None] | None = None,
     ):
         """`resolve(key)`: the command this client runs for an action key, or
-        None; `on_acted(key, exit code)`: called after it ran."""
+        None; `on_acted(item, exit code)`: called after it ran (e.g. to resolve
+        the action once its command succeeded)."""
         self.console = console
         self.title = title
         self.me = me
@@ -161,7 +162,7 @@ class BoardView:
         if keys is not None:
             keys.resume()
         if self.on_acted is not None:
-            self.on_acted(w.key or "", code)
+            self.on_acted(w, code)
 
     # -- input --------------------------------------------------------------------------
 

@@ -210,7 +210,7 @@ def _waiting_snapshot(*items):
 def test_the_queue_shows_whats_waiting_and_what_enter_would_run(monkeypatch):
     ran = []
     resolve = {"eda.gcloud-login": ["eda", "auth", "gcloud-login", "--server-auth"]}.get
-    view, _ = terminal_view(resolve=resolve, on_acted=lambda key, code: ran.append(("acted", key, code)))
+    view, _ = terminal_view(resolve=resolve, on_acted=lambda w, code: ran.append(("acted", w.key, code)))
     view.update(
         _waiting_snapshot(
             {"id": "data-x", "kind": "requests", "title": "3 data requests need someone", "detail": "asked by you"},
