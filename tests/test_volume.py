@@ -150,7 +150,9 @@ def test_a_stopped_servers_binlog_position_is_its_newest_binlog_and_length(tmp_p
 def test_binlogs_never_expire_by_the_fake_clock(tmp_path):
     from ferment.databases import MySQL
 
-    assert "--binlog-expire-logs-auto-purge=OFF" in MySQL(tmp_path)._server_args(3306, tmp_path / "s.sock")
+    args = MySQL(tmp_path)._server_args(3306, tmp_path / "s.sock")
+    assert "--binlog-expire-logs-auto-purge=OFF" in args
+    assert "--tls-version=" in args  # no TLS: its certificate's dates would meet the fake clock
 
 
 def test_every_dir_lives_in_the_one_subvolume_so_a_snapshot_cuts_them_together(tmp_path, monkeypatch):

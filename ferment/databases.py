@@ -164,6 +164,11 @@ class MySQL(Database):
             # The fake clock jumps (a month, or back to a checkpoint): don't let
             # it expire binlogs, which are how checkpoints get diffed.
             "--binlog-expire-logs-auto-purge=OFF",
+            # No TLS: MySQL makes itself a certificate at the date it first
+            # starts, and a clock set earlier than that makes every client that
+            # checks it (Java's, by default when the server offers TLS) refuse
+            # to connect. Nothing here leaves the VMs' private network.
+            "--tls-version=",
         ]  # fmt: skip
 
     def processes(self) -> list[Process]:
