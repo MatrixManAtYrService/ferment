@@ -11,7 +11,13 @@ Sections:
 - milestones: the known steps of a run. A run always starts from scratch, so
   its steps are known ahead of time, and so is roughly how much log each one
   writes before it's done: progress is lines seen over lines expected, and a
-  finished run's line counts (`actuals`) are the next run's estimates.
+  finished run's line counts (`actuals`) are the next run's estimates. A
+  long task that can count its own work (tables pulled, fragments loaded)
+  says `done` of `total` instead.
+- waiting: what's held up on someone: work that needs an attached client
+  nobody attached provides, and actions only a particular attached person
+  can take (sign in to a data source). Renderers list them; the person whose
+  turn it is can act from theirs.
 - feed: what happened, oldest first (broadcasts, milestone transitions)
 
 Every change bumps `version`; `wait` blocks until it moves, which is what the
@@ -63,6 +69,8 @@ class Milestone(BaseModel):
     started: str | None = None
     finished: str | None = None
     detail: str | None = None
+    done: int | None = None  # counted progress, when the work counts itself
+    total: int | None = None
 
     @computed_field
     @property
@@ -70,9 +78,26 @@ class Milestone(BaseModel):
         """0..1. Never 1 until it's actually done: estimates are only estimates."""
         if self.state == "done":
             return 1.0
+        if self.total:
+            return min((self.done or 0) / self.total, 0.99)
         if not self.expected:
             return None
         return min(self.lines / self.expected, 0.99)
+
+
+WaitKind = Literal["action", "need", "requests"]
+
+
+class WaitItem(BaseModel):
+    """Something held up on someone (see the module docstring)."""
+
+    id: str
+    kind: WaitKind
+    title: str
+    detail: str = ""
+    since: str | None = None
+    who: str | None = None  # an action: whose turn it is
+    key: str | None = None  # an action: what to do, in its raiser's terms
 
 
 class FeedEntry(BaseModel):
@@ -90,6 +115,7 @@ class Snapshot(BaseModel):
     facts: list[Fact]
     services: list[Service]
     milestones: list[Milestone]
+    waiting: list[WaitItem] = []
     feed: list[FeedEntry]  # only entries after the `after` asked for
     feed_seq: int  # the last entry's seq; ask for entries after it next time
 
@@ -106,6 +132,7 @@ class Board:
         self.facts: dict[str, Fact] = {}
         self.services: dict[str, Service] = {}
         self.milestones: dict[str, Milestone] = {}
+        self.waiting: list[WaitItem] = []
         self.feed: deque[FeedEntry] = deque(maxlen=feed_limit)
         self.feed_seq = 0
 
@@ -132,6 +159,7 @@ class Board:
                 facts=[f.model_copy() for f in self.facts.values()],
                 services=[s.model_copy() for s in self.services.values()],
                 milestones=[m.model_copy() for m in self.milestones.values()],
+                waiting=[w.model_copy() for w in self.waiting],
                 feed=[e for e in self.feed if after is None or e.seq > after],
                 feed_seq=self.feed_seq,
             )
@@ -144,6 +172,7 @@ class Board:
             self.facts.clear()
             self.services.clear()
             self.milestones.clear()
+            self.waiting = []
             self._bump()
 
     # -- facts, clock, services -------------------------------------------------
@@ -177,6 +206,12 @@ class Board:
                 self.services[name] = svc
                 self._bump()
             return svc
+
+    def set_waiting(self, items: list[WaitItem]) -> None:
+        with self._changed:
+            if items != self.waiting:
+                self.waiting = items
+                self._bump()
 
     def set_services(self, services: list[Service]) -> None:
         """Exactly these services, in this order."""
@@ -223,6 +258,15 @@ class Board:
             if detail is not None:
                 m.detail = detail
             self._bump()
+
+    def set_progress(self, mid: str, done: int, total: int | None = None, detail: str | None = None) -> None:
+        """Counted progress for a running milestone: `done` of `total`."""
+        with self._changed:
+            m = self.milestones[mid]
+            new = (done, total if total is not None else m.total, detail if detail is not None else m.detail)
+            if new != (m.done, m.total, m.detail):
+                m.done, m.total, m.detail = new
+                self._bump()
 
     def note(self, mid: str, detail: str) -> None:
         """What a running milestone is doing now (e.g. which migration)."""

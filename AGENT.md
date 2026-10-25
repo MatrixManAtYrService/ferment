@@ -20,7 +20,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/server/` | `TimeController` (clock, checkpoints, restore), `create_app` (routes, event log), `store.py` (SQLite: sessions, events, checkpoints) |
 | `ferment/board.py` | `Board`: what attached people see (facts, services, milestones with log-line progress, feed); one model for the terminal, the web page, and status |
 | `ferment/server/board.py` | `board_router`: `GET /board` snapshot, `GET /board/stream` server-sent events |
-| `ferment/boardview.py` | `BoardView` (Rich: board pinned at the bottom, feed scrolling above; plain lines when not a terminal), `Follower` (keeps it current; falls back to /broadcasts on servers without a board) |
+| `ferment/boardview.py` | `BoardView` (Rich: board pinned at the bottom, feed scrolling above; plain lines when not a terminal; the `waiting` queue, ↑↓/enter in a terminal: enter runs what the client's own `resolve(key)` says, never a server-sent command), `Follower` (keeps it current; falls back to /broadcasts on servers without a board) |
 | `ferment/fakeboard.py` | a board replaying a scripted run, for building renderers without a VM (`python -m ferment.fakeboard`) |
 | `ferment/clockcheck.py` | clock probes + agreement check |
 | `ferment/sources.py` | client side of shipping code: resolve refs, mirror, incremental git bundles |
@@ -28,6 +28,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/server/sources.py`, `builds.py` | VM side: bare repos from bundles, worktrees, builds (real time, SOURCE_DATE_EPOCH = commit time, cached per input; each a script in its own systemd unit that outlives the server, finished via an exit-status file) |
 | `ferment/databases.py` | MariaDB / Dolt processes; Dolt checkpoints, log, diff, restore |
 | `ferment/config.py` | `~/.config/ferment/config.toml` |
+| `ferment/progress.py` | `Task`: a client's long work on the board with done/total (server: `Tasks` in `server/board.py`, lapses when its client stops reporting) |
 | `ferment/needs.py` | capabilities (`relay:`, `fetch:`, `data:`) and `Waiting`: a client waiting for one says so on the board |
 | `ferment/data.py`, `ferment/server/data.py` | data for the workload: fragments (gzip'd SQL by sha256, keyed by source/database/table/selector/version) in the `data` cache, datasets, data requests an attached client fulfills (`DataFulfiller` + a per-source handler), loading a dataset into MySQL |
 | `ferment/bootstrap.py` | prepare a machine to host fermenters, once, over ssh: idempotent steps (ok/changed/manual/failed); `macos` = a Mac running Lima from a pinned nixpkgs |

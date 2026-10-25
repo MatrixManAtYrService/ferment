@@ -193,3 +193,63 @@ def test_the_client_runner_reports_the_clients_last_error_line(tmp_path):
     assert out.read_bytes() == b"a\nb\n"
     failing = ["sh", "-c", "cat >/dev/null; echo warming up >&2; echo 'ERROR 1146: no table' >&2; exit 1"]
     assert _run_client(failing, iter([b"x\n"] * 10000)) == "ERROR 1146: no table"
+
+
+def test_a_sign_in_pauses_requests_until_the_person_acts(app):
+    client, _ = app
+    vpn = {"X-Ferment-User": "me@vpn"}
+    client.post("/sessions", json={"client": "vpn", "provides": ["data:test"]}, headers=vpn)
+    monkey_who = data.whoami
+    try:
+        data.whoami = lambda: "me@vpn"  # the fulfiller is the attached client
+        signed_in = {"yes": False}
+
+        def handler(spec, fragments):
+            if not signed_in["yes"]:
+                raise data.ActionNeeded("test.login", "test: sign in", "the source's session expired")
+            return {"ok": True}
+
+        f = data.DataFulfiller("http://f", {"data:test": handler})
+    finally:
+        data.whoami = monkey_who
+    req = client.post("/data-requests", json={"capability": "data:test", "spec": {"t": 1}}, headers=vpn).json()
+    assert f._claim(req["id"])
+    assert f.fulfill(req) is False
+    assert client.get(f"/data-requests/{req['id']}").json()["status"] == "pending"  # given back, not failed
+    (action,) = client.get("/actions").json()
+    assert (action["key"], action["who"]) == ("test.login", "me@vpn")
+    client.app.state.publisher.refresh()
+    (w,) = client.get("/board").json()["waiting"]
+    assert w["kind"] == "action" and w["title"] == "test: sign in" and w["who"] == "me@vpn"
+
+    assert f._claim(req["id"])
+    assert f.fulfill(req) is False  # still not: one action, not two
+    assert len(client.get("/actions").json()) == 1
+
+    signed_in["yes"] = True
+    assert f._claim(req["id"])
+    assert f.fulfill(req) is True
+    assert client.get(f"/data-requests/{req['id']}").json()["status"] == "done"
+    assert client.get("/actions").json() == [] and "data:test" not in f.paused
+
+
+def test_tasks_report_progress_and_lapse_when_their_client_goes(app):
+    from ferment.progress import Task
+
+    client, _ = app
+    with Task("http://f", "pull base", total=3) as t:
+        t.update(done=1, detail="fee", force=True)
+        (m,) = [m for m in client.get("/board").json()["milestones"] if m["label"] == "pull base"]
+        assert (m["state"], m["done"], m["total"], m["detail"]) == ("running", 1, 3, "fee")
+    (m,) = [m for m in client.get("/board").json()["milestones"] if m["label"] == "pull base"]
+    assert m["state"] == "done"
+
+    tasks = client.app.state.publisher.tasks
+    clock = {"t": 0.0}
+    tasks.now = lambda: clock["t"]
+    tid = client.post("/tasks", json={"label": "orphan"}).json()["id"]
+    clock["t"] = 1000.0
+    tasks.lapse()
+    (m,) = [m for m in client.get("/board").json()["milestones"] if m["label"] == "orphan"]
+    assert m["state"] == "failed" and m["detail"] == "its client stopped reporting"
+    assert client.patch(f"/tasks/{tid}", json={"done": 1}).status_code == 404

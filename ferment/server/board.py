@@ -16,14 +16,16 @@ import asyncio
 import datetime as dt
 import itertools
 import threading
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from ferment import needs
-from ferment.board import Board, Milestone, Service, Snapshot
+from ferment.board import Board, Milestone, Service, Snapshot, WaitItem
 from ferment.server import logs
 from ferment.server.clock import real_now
 from ferment.sources import repo_host
@@ -125,30 +127,148 @@ def _age(since: str) -> str:
     return f"{minutes}m" if minutes < 120 else f"{minutes // 60}h"
 
 
-def waiting_for(store, sessions: list[dict]) -> list[str]:
-    """What's waiting on an attached client, for the board: registered needs,
-    and source requests nobody attached can fetch (or whose fetcher left)."""
+def waiting_for(store, sessions: list[dict]) -> list[WaitItem]:
+    """What's held up on someone, for the board: actions an attached person
+    has to take, registered needs, and source and data requests nobody
+    attached can serve (or whose server left)."""
     served: dict[str, list[str]] = {}
     for s in sessions:
         for cap in needs.offered(s):
             served.setdefault(cap, []).append(s["who"])
+    here = {s["who"] for s in sessions}
     out = []
+    for a in store.actions():
+        detail = a["detail"] + ("" if a["who"] in here else f"\n({a['who']} isn't attached right now)")
+        out.append(
+            WaitItem(
+                id=f"action-{a['id']}", kind="action", title=a["title"], detail=detail.strip(),
+                since=a["raised_at"], who=a["who"], key=a["key"],
+            )
+        )  # fmt: skip
     for n in store.needs():
-        line = f"{n['purpose']} needs {needs.describe(n['capability'])} ({_age(n['since'])})"
+        title = f"{n['purpose']} needs {needs.describe(n['capability'])} ({_age(n['since'])})"
+        detail = f"asked by {n['who']}"
         if by := served.get(n["capability"]):
-            line += f"; {', '.join(by)} serves it, not working yet"
-        out.append(line)
+            title += f"; {', '.join(by)} serves it, not working yet"
+            detail += f"; {', '.join(by)} says it serves {n['capability']}, but it isn't working yet"
+        out.append(WaitItem(id=f"need-{n['id']}", kind="need", title=title, detail=detail, since=n["since"]))
     for r in store.claimable_source_requests():
         cap = needs.fetch(repo_host(r["repo"]) or "?")
         if cap not in served:
-            out.append(f"{r['name']} @ {r['ref']} needs {needs.describe(cap)} ({_age(r['requested_at'])})")
+            title = f"{r['name']} @ {r['ref']} needs {needs.describe(cap)} ({_age(r['requested_at'])})"
+            out.append(
+                WaitItem(
+                    id=f"source-{r['id']}", kind="requests", title=title,
+                    detail=f"{r['repo']}, asked by {r['requested_by']}", since=r["requested_at"],
+                )
+            )  # fmt: skip
     unserved: dict[str, list[dict]] = {}
     for r in store.claimable_data_requests():
         if r["capability"] not in served:
             unserved.setdefault(r["capability"], []).append(r)
     for cap, rows in unserved.items():  # a pull asks for every table at once: one line, counted
-        out.append(f"{len(rows)} data requests need {needs.describe(cap)} ({_age(rows[0]['requested_at'])})")
+        title = f"{len(rows)} data requests need {needs.describe(cap)} ({_age(rows[0]['requested_at'])})"
+        who = ", ".join(sorted({r["requested_by"] for r in rows}))
+        out.append(
+            WaitItem(
+                id=f"data-{cap}", kind="requests", title=title, detail=f"asked by {who}",
+                since=rows[0]["requested_at"],
+            )
+        )  # fmt: skip
     return out
+
+
+# -- tasks: long work that reports its own progress ------------------------------------
+
+# A client's task not heard from in this long has lost its client.
+TASK_TIMEOUT = 120.0
+
+
+class Tasks:
+    """Long-running work shown as a milestone with counted progress (`done`
+    of `total`, plus what it's on now). Clients open one over HTTP and keep
+    it current; one whose client stops reporting fails. The server's own
+    (a load) don't lapse."""
+
+    def __init__(self, board: Board, now: Callable[[], float] = time.monotonic):
+        self.board = board
+        self.now = now
+        self._lock = threading.Lock()
+        self._seen: dict[str, float | None] = {}  # milestone -> last report (None: never lapses)
+
+    def open(self, label: str, total: int | None = None, group: str | None = None, lease: bool = True) -> str:
+        mid = f"task-{next(_ids)}"
+        self.board.plan([Milestone(id=mid, label=label, group=group or label, total=total, done=0 if total else None)])
+        self.board.start(mid)
+        with self._lock:
+            self._seen[mid] = self.now() if lease else None
+        return mid
+
+    def update(self, mid: str, done: int | None = None, total: int | None = None, detail: str | None = None) -> bool:
+        with self._lock:
+            if mid not in self._seen:
+                return False
+            if self._seen[mid] is not None:
+                self._seen[mid] = self.now()
+        if done is not None:
+            self.board.set_progress(mid, done, total, detail)
+        elif detail is not None:
+            self.board.note(mid, detail)
+        return True
+
+    def finish(self, mid: str, ok: bool = True, detail: str | None = None) -> bool:
+        with self._lock:
+            if mid not in self._seen:
+                return False
+            del self._seen[mid]
+        self.board.finish(mid, ok=ok, detail=detail)
+        return True
+
+    def lapse(self) -> None:
+        cutoff = self.now() - TASK_TIMEOUT
+        with self._lock:
+            gone = [m for m, t in self._seen.items() if t is not None and t < cutoff]
+        for mid in gone:
+            self.finish(mid, ok=False, detail="its client stopped reporting")
+
+
+class NewTask(BaseModel):
+    label: str
+    total: int | None = None
+    group: str | None = None
+
+
+class TaskUpdate(BaseModel):
+    done: int | None = None
+    total: int | None = None
+    detail: str | None = None
+
+
+class TaskDone(BaseModel):
+    ok: bool = True
+    detail: str | None = None
+
+
+def tasks_router(tasks: Tasks) -> APIRouter:
+    router = APIRouter()
+
+    @router.post("/tasks")
+    def open_task(req: NewTask):
+        return {"id": tasks.open(req.label, req.total, req.group)}
+
+    @router.patch("/tasks/{task_id}")
+    def update_task(task_id: str, req: TaskUpdate):
+        if not tasks.update(task_id, req.done, req.total, req.detail):
+            raise HTTPException(404, "no running task with that id")
+        return {"ok": True}
+
+    @router.post("/tasks/{task_id}/finish")
+    def finish_task(task_id: str, req: TaskDone):
+        if not tasks.finish(task_id, req.ok, req.detail):
+            raise HTTPException(404, "no running task with that id")
+        return {"ok": True}
+
+    return router
 
 
 class Publisher(threading.Thread):
@@ -167,6 +287,7 @@ class Publisher(threading.Thread):
         self.services = services
         self.stopping = threading.Event()
         self.awaiting: dict[str, str | None] = {}  # milestone -> process (None: the whole workload)
+        self.tasks: Tasks | None = None  # clients' long tasks, lapsed when they stop reporting
         self._lock = threading.Lock()
         self._error = ""
 
@@ -213,10 +334,13 @@ class Publisher(threading.Thread):
         who = sorted({s["who"] for s in sessions})
         b.set_fact("attached", ", ".join(who) or "nobody", "attached")
         waiting = waiting_for(c.store, sessions)
-        if waiting:
-            b.set_fact("waiting", "; ".join(waiting), "waiting")
+        b.set_waiting(waiting)
+        if waiting:  # also as a fact, for renderers that predate `waiting`
+            b.set_fact("waiting", "; ".join(w.title for w in waiting), "waiting")
         else:
             b.drop_fact("waiting")
+        if self.tasks is not None:
+            self.tasks.lapse()
 
         sup = c.supervisor
         procs = {p["name"]: p for p in sup.processes()}

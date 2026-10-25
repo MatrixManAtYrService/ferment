@@ -27,7 +27,7 @@ from ferment.client import WHO_HEADER
 from ferment.databases import Database
 from ferment.server import clock as clock_mod
 from ferment.server import logs
-from ferment.server.board import Publisher, Steps, board_router
+from ferment.server.board import Publisher, Steps, Tasks, board_router, tasks_router
 from ferment.server.builds import Builder
 from ferment.server.data import DataStore, Loader, data_root, data_router
 from ferment.server.sources import SourceStore, SourceStoreError
@@ -58,6 +58,12 @@ class Heartbeat(BaseModel):
 class NewNeed(BaseModel):
     capability: str  # ferment.needs: relay:<host:port> | fetch:<git host>
     purpose: str  # what's waiting, e.g. "fmnt apply"
+
+
+class NewAction(BaseModel):
+    key: str  # what to do, in the raiser's terms: it alone maps keys to commands
+    title: str
+    detail: str = ""
 
 
 class NewSourceRequest(BaseModel):
@@ -142,10 +148,13 @@ def create_app(
     app.state.board = board
     app.state.publisher = publisher
     app.include_router(board_router(board))
+    tasks = Tasks(board)
+    publisher.tasks = tasks
+    app.include_router(tasks_router(tasks))
     datastore = DataStore(data_root(controller.state_dir))
     loader = None
     if database is not None and hasattr(database, "client_args"):  # MySQL; MariaDB is the no-archive fallback
-        loader = Loader(datastore, database.client_args, lambda group, keys: steps(group, keys), broadcast)
+        loader = Loader(datastore, database.client_args, tasks, broadcast)
     app.include_router(data_router(store, datastore, loader, who, broadcast))
     app.state.datastore, app.state.loader = datastore, loader
 
@@ -266,6 +275,30 @@ def create_app(
     # Work waiting for something only an attached client provides
     # (ferment.needs). The waiting client keeps its need fresh; the board says
     # what's waiting, and whether anyone attached serves it.
+
+    # Actions: something only one attached person can do (sign in to a data
+    # source). The client that raised one resolves it once it's done.
+
+    @app.get("/actions")
+    def actions():
+        return store.actions()
+
+    @app.post("/actions")
+    def raise_action(req: NewAction, request: Request):
+        w = who(request)
+        fresh = not any(a["key"] == req.key and a["who"] == w for a in store.actions())
+        a = store.raise_action(req.key, req.title, req.detail, w)
+        if fresh:
+            broadcast("action_needed", w, f"waiting on {w}: {req.title}")
+        return a
+
+    @app.delete("/actions/{action_id}")
+    def resolve_action(action_id: int, request: Request):
+        a = store.resolve_action(action_id)
+        if a is None:
+            raise HTTPException(404, f"no action {action_id}")
+        broadcast("action_done", who(request), f"done: {a['title']}")
+        return a
 
     @app.get("/needs")
     def needs():

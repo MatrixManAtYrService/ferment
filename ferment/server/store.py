@@ -12,6 +12,7 @@ What lives here is what the server knows that no workload database does:
 - deployments  which build of each service the workload runs
 - needs        clients waiting for a capability only an attached client provides (ferment.needs)
 - data_requests  data the VM needs that only an attached client can get (ferment.data)
+- actions      things waiting on a person at one attached machine (sign in to a data source, ...)
 
 The server runs on real time, so rows carry real time; anything that happened
 "in the workload" also carries the fake time it happened at.
@@ -138,6 +139,18 @@ MIGRATIONS = [
         claimed_at  TEXT,
         finished_at TEXT,
         error       TEXT
+    );
+    """,
+    """
+    CREATE TABLE actions (
+        id          INTEGER PRIMARY KEY,
+        key         TEXT NOT NULL,          -- what to do, in the raiser's own terms (it maps keys to commands)
+        title       TEXT NOT NULL,
+        detail      TEXT NOT NULL DEFAULT '',
+        who         TEXT NOT NULL,          -- whose turn: the attached client that raised it
+        raised_at   TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        resolved_at TEXT
     );
     """,
 ]
@@ -482,6 +495,45 @@ class Store:
                 "UPDATE data_requests SET status = ?, result = ?, error = ?, finished_at = ? WHERE id = ?",
                 (status, json.dumps(result) if result is not None else None, error, _now(), request_id),
             )
+
+    # -- actions --------------------------------------------------------------------
+
+    def raise_action(self, key: str, title: str, detail: str, who: str) -> dict:
+        """One open action per (key, who): raising it again updates it."""
+        now = _now()
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE actions SET title = ?, detail = ?, updated_at = ? "
+                "WHERE key = ? AND who = ? AND resolved_at IS NULL",
+                (title, detail, now, key, who),
+            )
+            if cur.rowcount == 0:
+                self.db.execute(
+                    "INSERT INTO actions (key, title, detail, who, raised_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (key, title, detail, who, now, now),
+                )
+        return self._rows("SELECT * FROM actions WHERE key = ? AND who = ? AND resolved_at IS NULL", key, who)[0]
+
+    def resolve_action(self, action_id: int) -> dict | None:
+        with self.lock:
+            self.db.execute(
+                "UPDATE actions SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL", (_now(), action_id)
+            )
+        rows = self._rows("SELECT * FROM actions WHERE id = ?", action_id)
+        return rows[0] if rows else None
+
+    def actions(self) -> list[dict]:
+        return self._rows("SELECT * FROM actions WHERE resolved_at IS NULL ORDER BY id")
+
+    def release_data_request(self, request_id: int, who: str) -> bool:
+        """The claimer gives a request back (it can't serve it right now)."""
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE data_requests SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
+                "WHERE id = ? AND status = 'claimed' AND claimed_by = ?",
+                (request_id, who),
+            )
+            return cur.rowcount == 1
 
     # -- needs ----------------------------------------------------------------------
 

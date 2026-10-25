@@ -197,3 +197,60 @@ def test_a_server_without_a_board_still_gets_its_broadcasts_shown(serve, monkeyp
     finally:
         follower.stop.set()
     assert "mine" not in out.getvalue()
+
+
+def _waiting_snapshot(*items):
+    from ferment.board import WaitItem
+
+    b = Board()
+    b.set_waiting([WaitItem(**i) for i in items])
+    return b.snapshot()
+
+
+def test_the_queue_shows_whats_waiting_and_what_enter_would_run(monkeypatch):
+    ran = []
+    resolve = {"eda.gcloud-login": ["eda", "auth", "gcloud-login", "--server-auth"]}.get
+    view, _ = terminal_view(resolve=resolve, on_acted=lambda key, code: ran.append(("acted", key, code)))
+    view.update(
+        _waiting_snapshot(
+            {"id": "data-x", "kind": "requests", "title": "3 data requests need someone", "detail": "asked by you"},
+            {
+                "id": "action-1",
+                "kind": "action",
+                "title": "eda: sign in to gcloud",
+                "detail": "2 requests waiting",
+                "who": "me@here",
+                "key": "eda.gcloud-login",
+            },
+            {"id": "action-2", "kind": "action", "title": "eda: db login", "who": "them@there", "key": "eda.x"},
+        )  # fmt: skip
+    )
+    view.interactive = True
+    text = drawn(view)
+    assert "▶ 3 data requests need someone" in text and "eda: sign in to gcloud" in text
+    view.key("down")
+    text = drawn(view)
+    assert "▶ eda: sign in to gcloud" in text and "enter: eda auth gcloud-login --server-auth" in text
+
+    monkeypatch.setattr(
+        "ferment.boardview.subprocess.run", lambda argv: ran.append(argv) or type("R", (), {"returncode": 0})()
+    )
+    view.key("enter")
+    assert ran == [["eda", "auth", "gcloud-login", "--server-auth"], ("acted", "eda.gcloud-login", 0)]
+
+    view.key("down")  # someone else's action: shown, not runnable here
+    assert "them@there's to do, on their machine" in drawn(view)
+    view.key("enter")
+    assert len(ran) == 2
+    view.key("down")  # wraps around
+    assert "▶ 3 data requests" in drawn(view)
+
+
+def test_counted_progress_shows_done_of_total():
+    b = Board()
+    b.plan([Milestone(id="t", label="pull na", group="pull na", total=188, done=0)])
+    b.start("t")
+    b.set_progress("t", 30, detail="billing_bookkeeper.fee_summary")
+    view, _ = terminal_view()
+    view.update(b.snapshot())
+    assert "30/188  billing_bookkeeper.fee_summary" in drawn(view)

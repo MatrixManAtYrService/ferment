@@ -157,16 +157,16 @@ class Loader:
         self,
         datastore: DataStore,
         client_args: Callable[[], list[str]],
-        steps: Callable[[str, list[str]], Callable[[str], None]],
+        tasks,
         broadcast: Callable[..., None],
         run: Callable[[list[str], Iterator[bytes]], str] | None = None,
     ):
         """`client_args()`: the database's CLI client (ferment.databases);
-        `steps(group, keys)`: board milestones, called with a key as it's done;
+        `tasks`: the board's (ferment.server.board.Tasks), for progress;
         `run(argv, stdin_chunks)`: run a client on input, '' or its error."""
         self.data = datastore
         self.client_args = client_args
-        self.steps = steps
+        self.tasks = tasks
         self.broadcast = broadcast
         self.run = run or _run_client
         self.state: dict = {"state": "idle"}
@@ -199,7 +199,7 @@ class Loader:
 
     def _load(self, by_db: dict[str, list[dict]], who: str) -> None:
         name = self.state["dataset"]
-        step = self.steps(f"load {name}", sorted(by_db))
+        task = self.tasks.open(f"load {name}", total=self.state["total"], lease=False)
         self.broadcast("data_loading", who, f"{who} is loading {name} ({', '.join(sorted(by_db))})")
         began = real_now()
         try:
@@ -214,19 +214,18 @@ class Loader:
                 for f in load_order(by_db[db]):
                     table = f"{db}.{f['key']['table']}"
                     self.state["current"] = table
+                    self.tasks.update(task, done=self.state["done"], detail=f"{table} ({f['size'] / 1e6:.0f} MB gz)")
                     err = self.run([*self.client_args(), db], self._chunks(f))
                     if err:
                         raise RuntimeError(f"{table} ({f['key']['selector']}): {err}")
                     self.state["done"] += 1
-                step(db)
         except Exception as e:  # report it, and leave the board saying so
             self.state.update(state="failed", error=str(e))
-            fail = getattr(step, "fail", None)
-            if fail is not None:
-                fail(str(e))
+            self.tasks.finish(task, ok=False, detail=str(e))
             self.broadcast("data_load_failed", who, f"loading {name} failed: {e}")
             return
         took = (real_now() - began).total_seconds() / 60
+        self.tasks.finish(task, detail=f"{self.state['total']} fragments in {took:.0f}m")
         self.state.update(state="done", current=None, finished_at=real_now().isoformat())
         self.broadcast("data_loaded", who, f"loaded {name}: {self.state['total']} fragments in {took:.0f}m")
 
@@ -306,6 +305,13 @@ def data_router(
     def claim(request_id: int, request: Request):
         if not store.claim_data_request(request_id, who(request)):
             raise HTTPException(409, "already claimed")
+        return store.data_request(request_id)
+
+    @r.post("/data-requests/{request_id}/release")
+    def release(request_id: int, request: Request):
+        """Its claimer can't serve it right now (e.g. waiting on a sign-in): back to the queue."""
+        if not store.release_data_request(request_id, who(request)):
+            raise HTTPException(409, "not claimed by you")
         return store.data_request(request_id)
 
     @r.post("/data-requests/{request_id}/finish")

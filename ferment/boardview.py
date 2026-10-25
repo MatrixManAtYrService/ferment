@@ -5,14 +5,29 @@ it, so the feed scrolls into ordinary scrollback (search, copy, tmux all
 work) while what must stay in view does. Milestones print a line as they
 finish, then roll up in the pinned area once their whole group is done.
 
+What's waiting on someone (the board's `waiting`) is a queue in the pinned
+area, with the chosen item's details beside it. In a terminal, ↑/↓ (or k/j)
+choose and enter acts: for an action that's this machine's to take and that
+`resolve` knows how to do, the board steps aside, the command runs in the
+terminal (so a browser can open, prompts work), and the board comes back.
+The command comes from `resolve`, this client's own map of action keys, never
+from the fermenter.
+
 When the output isn't a terminal, the view prints plain lines instead: the
 feed, and milestones as they finish.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import os
+import select
+import shlex
+import subprocess
+import sys
 import threading
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from typing import Annotated
 
@@ -25,7 +40,7 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
-from ferment.board import FeedEntry, Milestone, Service, Snapshot
+from ferment.board import FeedEntry, Milestone, Service, Snapshot, WaitItem
 from ferment.broadcasts import BroadcastWatcher
 from ferment.server.board import KEEPALIVE
 
@@ -44,7 +59,17 @@ class BoardView:
     ports this client forwards: services show addresses that work here, and
     forwards no service covers are pinned on their own."""
 
-    def __init__(self, console: Console, title: str, me: str, forwards: dict[str, tuple[int, int]] | None = None):
+    def __init__(
+        self,
+        console: Console,
+        title: str,
+        me: str,
+        forwards: dict[str, tuple[int, int]] | None = None,
+        resolve: Callable[[str], list[str] | None] | None = None,
+        on_acted: Callable[[str, int], None] | None = None,
+    ):
+        """`resolve(key)`: the command this client runs for an action key, or
+        None; `on_acted(key, exit code)`: called after it ran."""
         self.console = console
         self.title = title
         self.me = me
@@ -56,13 +81,87 @@ class BoardView:
         self.conn = "connecting"  # connecting, up, lost, legacy (a server without a board)
         self.local: dict[str, tuple[str, str]] = {}  # what only this client knows: key -> (text, style)
         self._spinners: dict[str, Spinner] = {}
+        self.resolve = resolve or (lambda key: None)
+        self.on_acted = on_acted
+        self.chosen: str | None = None  # the waiting item's id
+        self.interactive = False  # keys are being read
+        self._live: Live | None = None
+        self._keys: _KeyReader | None = None
 
     def live(self) -> AbstractContextManager:
         """Pin the board while the block runs (a no-op when not a terminal).
-        Anything printed meanwhile, from any thread, lands above it."""
+        Anything printed meanwhile, from any thread, lands above it. With a
+        terminal on stdin too, keys choose and act on what's waiting."""
         if self.plain:
             return nullcontext()
-        return Live(self, console=self.console, refresh_per_second=4, redirect_stdout=True, redirect_stderr=True)
+        return self._pinned()
+
+    @contextlib.contextmanager
+    def _pinned(self) -> Iterator[None]:
+        self._live = Live(self, console=self.console, refresh_per_second=4, redirect_stdout=True, redirect_stderr=True)
+        with self._live:
+            if sys.stdin.isatty():
+                self._keys = _KeyReader(self.key)
+                self._keys.start()
+                self.interactive = True
+            try:
+                yield
+            finally:
+                if self._keys is not None:
+                    self._keys.close()
+                self.interactive = False
+
+    # -- keys ---------------------------------------------------------------------------
+
+    def _waiting(self) -> list[WaitItem]:
+        with self._lock:
+            return list(self.snap.waiting) if self.snap is not None else []
+
+    def _choice(self, items: list[WaitItem]) -> WaitItem | None:
+        if not items:
+            return None
+        return next((w for w in items if w.id == self.chosen), items[0])
+
+    def key(self, k: str) -> None:
+        items = self._waiting()
+        cur = self._choice(items)
+        if cur is None:
+            return
+        i = items.index(cur)
+        if k in ("up", "k"):
+            self.chosen = items[(i - 1) % len(items)].id
+        elif k in ("down", "j"):
+            self.chosen = items[(i + 1) % len(items)].id
+        elif k == "enter":
+            self.act(cur)
+
+    def runnable(self, w: WaitItem) -> list[str] | None:
+        if w.kind != "action" or w.who != self.me or w.key is None:
+            return None
+        return self.resolve(w.key)
+
+    def act(self, w: WaitItem) -> None:
+        argv = self.runnable(w)
+        if argv is None:
+            return
+        live, keys = self._live, self._keys
+        if keys is not None:
+            keys.pause()
+        if live is not None:
+            live.stop()
+        self.console.print(Text.assemble(("running: ", "bold"), shlex.join(argv)))
+        try:
+            code = subprocess.run(argv).returncode
+        except OSError as e:
+            self.console.print(Text(f"couldn't run it: {e}", "red"))
+            code = 127
+        self.console.print(Text("done" if code == 0 else f"exit {code}", "green" if code == 0 else "red"))
+        if live is not None:
+            live.start()
+        if keys is not None:
+            keys.resume()
+        if self.on_acted is not None:
+            self.on_acted(w.key or "", code)
 
     # -- input --------------------------------------------------------------------------
 
@@ -130,7 +229,42 @@ class BoardView:
         parts += [Text("  " + text, style) for text, style in local]
         if snap is not None and snap.milestones:
             parts.append(self._milestones(snap.milestones))
+        if snap is not None and snap.waiting:
+            parts.append(self._queue(snap.waiting))
         return Group(*parts)
+
+    def _queue(self, items: list[WaitItem]) -> RenderableType:
+        cur = self._choice(items)
+        left = Table.grid()
+        left.add_column(no_wrap=True, max_width=56)
+        for w in items:
+            mine = self.runnable(w) is not None
+            mark = "▶ " if w is cur and self.interactive else "  "
+            style = "bold yellow" if mine else ("yellow" if w.kind == "action" else "")
+            left.add_row(Text(mark + w.title, style, overflow="ellipsis"))
+        right = Text()
+        if cur is not None:
+            right.append(cur.title + "\n", "bold")
+            if cur.detail:
+                right.append(cur.detail + "\n")
+            if cur.since:
+                right.append(f"since {_local_time(cur.since)}\n", "dim")
+            argv = self.runnable(cur)
+            if argv is not None:
+                right.append("enter: ", "bold green").append(shlex.join(argv), "green")
+            elif cur.kind == "action":
+                right.append(f"{cur.who}'s to do, on their machine", "dim")
+        grid = Table(
+            title="waiting", title_justify="left", title_style="bold", show_header=False, box=None, pad_edge=False
+        )
+        grid.add_column(ratio=1)
+        grid.add_column(ratio=1)
+        grid.add_row(left, right)
+        if self.interactive:
+            grid.caption = "↑↓ choose · enter act"
+            grid.caption_justify = "left"
+            grid.caption_style = "dim"
+        return grid
 
     def _header(self, snap: Snapshot | None, conn: str) -> Text:
         t = Text(self.title, "bold")
@@ -207,7 +341,10 @@ class BoardView:
             if m.state != "running":
                 continue
             spin = self._spinners.setdefault(m.id, Spinner("dots", style="yellow"))
-            if m.progress is None:
+            if m.total:
+                bar = ProgressBar(total=100, completed=(m.progress or 0) * 100, width=24)
+                count = f"{m.done or 0}/{m.total}" + (f"  {m.detail}" if m.detail else "")
+            elif m.progress is None:
                 bar, count = ProgressBar(total=None, width=24, pulse=True), f"{m.lines} lines" if m.lines else ""
                 if m.detail:
                     count = m.detail
@@ -221,6 +358,64 @@ class BoardView:
         if pending:
             rows.append(Text("    next: " + ", ".join(pending), "dim"))
         return Group(*rows)
+
+
+_KEYS = {b"\x1b[A": "up", b"\x1bOA": "up", b"\x1b[B": "down", b"\x1bOB": "down", b"\r": "enter", b"\n": "enter",
+         b"k": "k", b"j": "j"}  # fmt: skip
+
+
+class _KeyReader(threading.Thread):
+    """Keys from a terminal on stdin, in cbreak mode (ctrl-c still works),
+    handed to `on_key`. Paused while a command has the terminal."""
+
+    def __init__(self, on_key: Callable[[str], None]):
+        super().__init__(daemon=True)
+        import termios
+        import tty
+
+        self.on_key = on_key
+        self.fd = sys.stdin.fileno()
+        self._termios = termios
+        self._saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._idle = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            if self._paused.is_set():
+                self._idle.set()
+                self._stop.wait(0.1)
+                continue
+            self._idle.clear()
+            ready, _, _ = select.select([self.fd], [], [], 0.2)
+            if not ready or self._paused.is_set():
+                continue
+            data = os.read(self.fd, 16)
+            k = _KEYS.get(data)
+            if k is not None:
+                try:
+                    self.on_key(k)
+                except Exception as e:  # a key must never take the view down
+                    print(f"key {k}: {e}", file=sys.stderr)
+
+    def pause(self) -> None:
+        """Give the terminal back as it was (for a command), and stop reading."""
+        self._paused.set()
+        if threading.current_thread() is not self:
+            self._idle.wait(1)
+        self._termios.tcsetattr(self.fd, self._termios.TCSADRAIN, self._saved)
+
+    def resume(self) -> None:
+        import tty
+
+        tty.setcbreak(self.fd)
+        self._paused.clear()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._termios.tcsetattr(self.fd, self._termios.TCSADRAIN, self._saved)
 
 
 class Follower(threading.Thread):
