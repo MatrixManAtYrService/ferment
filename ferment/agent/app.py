@@ -78,7 +78,7 @@ def create_agent_app(
 
     def prepare_volume() -> None:
         try:
-            for what in volume.ensure(database_running=supervisor.running):
+            for what in volume.ensure(workload_running=supervisor.running):
                 print(f"volume: {what}", flush=True)
         except Exception as e:
             volume_error.append(str(e))

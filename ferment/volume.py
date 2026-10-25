@@ -1,4 +1,4 @@
-"""Checkpoints as filesystem snapshots of the workload database's data dir.
+"""Checkpoints as filesystem snapshots of the workload's data.
 
 Dumping a database at every checkpoint (ferment.archive) costs time in
 proportion to its size: fine for an empty stack, an hour a checkpoint for a
@@ -15,8 +15,10 @@ in the same instant). Clock changes and restores stop the workload anyway.
 
 The filesystem is an image file on the VM's own disk, loop-mounted at
 `<state>/volume` (sparse: it takes what's written), with subvolumes
-`live` (the data dir; `<data dir>` becomes a link to it) and
-`snapshots/<id>`. `Volume` runs where the database does (the workload
+`live` and `snapshots/<id>`. `live` holds every directory of state the
+workload keeps (the database's data dir, a scheduler's metadata: `dirs`),
+each at `live/<name>` with its usual path a link there, so one snapshot cuts
+them all in the same instant. `Volume` runs where the database does (the workload
 agent); `VolumeSnapshots` is the checkpoint store on the server's side,
 calling it through the agent.
 
@@ -54,16 +56,17 @@ class Volume:
     def __init__(
         self,
         state: Path,
-        data_dir: Path,
+        dirs: dict[str, Path],
         btrfs_bin: str | None = None,
         run: Callable[[list[str]], str] = _sh,
         size_bytes: Callable[[], int] | None = None,
     ):
-        """`data_dir`: the database's (moved onto the volume by `ensure`).
-        `btrfs_bin`: btrfs-progs' bin dir (FERMENT_BTRFS_BIN): by path,
-        because sudo resets PATH."""
+        """`dirs`: name -> where the workload expects it (moved onto the volume
+        by `ensure`; the first is the database's data dir). `btrfs_bin`:
+        btrfs-progs' bin dir (FERMENT_BTRFS_BIN): by path, because sudo resets
+        PATH."""
         self.state = state
-        self.data_dir = data_dir
+        self.dirs = dirs
         self.bin = btrfs_bin or os.environ.get("FERMENT_BTRFS_BIN", "")
         self.run = run
         self.image = state / "volume.btrfs"
@@ -79,11 +82,23 @@ class Volume:
     def mounted(self) -> bool:
         return self.mount.is_mount()
 
-    def ensure(self, database_running: bool = False) -> list[str]:
-        """Make the volume ready and the data dir live on it; what it did.
+    def _relayout(self) -> bool:
+        """Snapshots from before `dirs` had the first one's contents at the root
+        of `live`: move them into `live/<first>` (renames: instant)."""
+        first = next(iter(self.dirs))
+        loose = [p for p in self.live.iterdir() if p.name not in self.dirs]
+        if (self.live / first).exists() or not loose:
+            return False
+        (self.live / first).mkdir()
+        for p in loose:
+            p.rename(self.live / first / p.name)
+        return True
+
+    def ensure(self, workload_running: bool = False) -> list[str]:
+        """Make the volume ready and every dir live on it; what it did.
 
         Idempotent (and re-run after a reboot, which unmounts it). Moving an
-        existing data dir onto it copies it once, so the database mustn't be
+        existing dir onto it copies it once, so the workload mustn't be
         running then."""
         done = []
         if not self.image.exists():
@@ -102,18 +117,27 @@ class Volume:
             self.run(["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(self.live)])
             done.append("made the live subvolume")
         self.snapshots.mkdir(exist_ok=True)
-        if self.data_dir.is_symlink():
-            if Path(os.readlink(self.data_dir)) != self.live:
-                raise VolumeError(f"{self.data_dir} links to {os.readlink(self.data_dir)}, not {self.live}")
-            return done
-        if self.data_dir.exists():
-            if database_running:
-                raise VolumeError(f"{self.data_dir} needs moving onto the volume, but the database is running")
-            # Copied, not moved in place: a different filesystem. Once, ever.
-            self.run(["cp", "-a", f"{self.data_dir}/.", f"{self.live}/"])
-            shutil.rmtree(self.data_dir)
-            done.append(f"moved {self.data_dir} onto it")
-        self.data_dir.symlink_to(self.live)
+        if self._relayout():
+            done.append(f"moved the old layout into live/{next(iter(self.dirs))}")
+        for name, path in self.dirs.items():
+            target = self.live / name
+            if path.is_symlink():
+                linked = Path(os.readlink(path))
+                if linked == target:
+                    continue
+                if linked != self.live:  # the old layout's link is the one we may replace
+                    raise VolumeError(f"{path} links to {linked}, not {target}")
+                path.unlink()
+            elif path.exists():
+                if workload_running:
+                    raise VolumeError(f"{path} needs moving onto the volume, but the workload is running")
+                # Copied, not moved in place: a different filesystem. Once, ever.
+                target.mkdir(exist_ok=True)
+                self.run(["cp", "-a", f"{path}/.", f"{target}/"])
+                shutil.rmtree(path)
+                done.append(f"moved {path} onto it")
+            target.mkdir(exist_ok=True)
+            path.symlink_to(target)
         return done
 
     def _snapshot_path(self, sid: str) -> Path:
@@ -135,6 +159,9 @@ class Volume:
             raise VolumeError(f"no snapshot {sid}")
         self._btrfs("subvolume", "delete", str(self.live))
         self._btrfs("subvolume", "snapshot", str(path), str(self.live))
+        self._relayout()  # a checkpoint from before `dirs`
+        for name in self.dirs:  # ...or from before one of them was kept here
+            (self.live / name).mkdir(exist_ok=True)
 
     def delete(self, sid: str) -> None:
         path = self._snapshot_path(sid)

@@ -35,7 +35,8 @@ class FakeBtrfs:
 
 def _volume(tmp_path, monkeypatch) -> tuple[Volume, FakeBtrfs]:
     fake = FakeBtrfs()
-    v = Volume(tmp_path, tmp_path / "mysql84", btrfs_bin="/nix/btrfs/bin", run=fake, size_bytes=lambda: 10**9)
+    dirs = {"mysql84": tmp_path / "mysql84", "airflow3": tmp_path / "airflow3"}
+    v = Volume(tmp_path, dirs, btrfs_bin="/nix/btrfs/bin", run=fake, size_bytes=lambda: 10**9)
     monkeypatch.setattr(Volume, "mounted", lambda self: fake.mounted)
     return v, fake
 
@@ -57,8 +58,8 @@ def test_an_existing_data_dir_moves_onto_the_volume_once(tmp_path, monkeypatch):
 def test_moving_refuses_while_the_database_runs(tmp_path, monkeypatch):
     v, _ = _volume(tmp_path, monkeypatch)
     (tmp_path / "mysql84").mkdir()
-    with pytest.raises(VolumeError, match="database is running"):
-        v.ensure(database_running=True)
+    with pytest.raises(VolumeError, match="workload is running"):
+        v.ensure(workload_running=True)
     assert (tmp_path / "mysql84").is_dir() and not (tmp_path / "mysql84").is_symlink()
 
 
@@ -150,3 +151,39 @@ def test_binlogs_never_expire_by_the_fake_clock(tmp_path):
     from ferment.databases import MySQL
 
     assert "--binlog-expire-logs-auto-purge=OFF" in MySQL(tmp_path)._server_args(3306, tmp_path / "s.sock")
+
+
+def test_every_dir_lives_in_the_one_subvolume_so_a_snapshot_cuts_them_together(tmp_path, monkeypatch):
+    v, _ = _volume(tmp_path, monkeypatch)
+    (tmp_path / "airflow3").mkdir()
+    (tmp_path / "airflow3" / "airflow.db").write_text("runs: day 1")
+    v.ensure()
+    assert (tmp_path / "airflow3").resolve() == (v.live / "airflow3").resolve()
+    (tmp_path / "mysql84" / "t.ibd").write_text("rows: day 1")
+    v.snapshot("ckpt-1")
+    (tmp_path / "airflow3" / "airflow.db").write_text("runs: day 2")
+    (tmp_path / "mysql84" / "t.ibd").write_text("rows: day 2")
+    v.restore("ckpt-1")
+    assert (tmp_path / "airflow3" / "airflow.db").read_text() == "runs: day 1"
+    assert (tmp_path / "mysql84" / "t.ibd").read_text() == "rows: day 1"
+
+
+def test_the_old_one_dir_layout_is_converted_and_its_checkpoints_still_restore(tmp_path, monkeypatch):
+    v, fake = _volume(tmp_path, monkeypatch)
+    # As the first volumes were: the data dir's contents at live's root, linked from mysql84.
+    fake.mounted = True
+    v.image.write_bytes(b"")
+    v.live.mkdir(parents=True)
+    (v.live / "ibdata1").write_text("old rows")
+    (tmp_path / "mysql84").symlink_to(v.live)
+    v.snapshots.mkdir()
+    v.snapshot("ckpt-old")
+
+    done = v.ensure()
+    assert "moved the old layout into live/mysql84" in done
+    assert (tmp_path / "mysql84" / "ibdata1").read_text() == "old rows" and (tmp_path / "airflow3").is_dir()
+
+    (tmp_path / "mysql84" / "ibdata1").write_text("new rows")
+    v.restore("ckpt-old")  # an old-layout snapshot: converted as it comes back
+    assert (tmp_path / "mysql84" / "ibdata1").read_text() == "old rows"
+    assert (tmp_path / "airflow3").is_dir()  # not dangling, though that checkpoint predates it
