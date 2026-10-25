@@ -137,7 +137,7 @@ class AgentClient:
 
     @contextlib.contextmanager
     def offline_db(self) -> Iterator[int]:
-        """For ferment.archive.DoltArchive(offline=...)."""
+        """mysqld on the live data dir while the workload is stopped (e.g. to read a checkpoint's data)."""
         port = self._request("POST", "/db/offline")["port"]
         try:
             yield port

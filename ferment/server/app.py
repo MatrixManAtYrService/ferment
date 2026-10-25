@@ -21,7 +21,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ferment import needs as needs_mod
-from ferment.archive import DoltArchive
 from ferment.board import Board, Service
 from ferment.client import WHO_HEADER
 from ferment.databases import Database
@@ -556,11 +555,9 @@ def _stepped(s: Steps, run: Callable[[], dict]) -> dict:
 
 
 def _mount_database(app: FastAPI, controller: TimeController, database: Database) -> None:
-    archive = next((v for v in controller.versioned if isinstance(v, DoltArchive)), None)
-
     @app.get("/db")
     def db_info():
-        return {"kind": database.kind, "versioned": archive is not None, "client": database.client}
+        return {"kind": database.kind, "versioned": bool(controller.versioned), "client": database.client}
 
     # Runs the stock CLI client server-side, so callers need no driver, no
     # route to the database port, and no opinion about the fake clock.
@@ -573,15 +570,3 @@ def _mount_database(app: FastAPI, controller: TimeController, database: Database
         if result.returncode != 0:
             raise HTTPException(400, result.stderr.strip())
         return {"output": result.stdout}
-
-    if archive is not None:
-
-        @app.get("/db/diff")
-        def db_diff(from_ref: str, to_ref: str = "HEAD"):
-            """Refs: checkpoint names, ckpt-<id>, or dolt commits (in the archive)."""
-            return archive.diff(from_ref, to_ref)
-
-        @app.get("/db/diff/{database_name}/{table}")
-        def db_row_diff(database_name: str, table: str, from_ref: str, to_ref: str = "HEAD"):
-            """Row by row: what changed in one table between two checkpoints."""
-            return archive.row_diff(database_name, table, from_ref, to_ref)

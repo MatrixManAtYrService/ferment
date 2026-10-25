@@ -102,7 +102,7 @@ def test_checkpoints_through_the_agent_are_volume_snapshots():
     store.restore(parts)
     assert agent.calls == [("snapshot", "ckpt-7"), ("restore", "ckpt-7")]
     with pytest.raises(VolumeError, match="before snapshots"):
-        store.restore({"dolt:billing": "abc"})
+        store.restore({"other:billing": "abc"})
 
 
 def test_the_agent_prepares_the_volume_before_the_workload_and_guards_restores(tmp_path, monkeypatch):

@@ -7,7 +7,7 @@ Both speak the MySQL protocol on 127.0.0.1:<port>. On a split fermenter
 - MySQL 8.4 (the default): the line production runs, so services, their
   migrations, and their queries behave as they do in production. Root over
   TCP with no password (a loopback-only sandbox). Its history is kept by
-  ferment.archive.DoltArchive: "MySQL runs, Dolt remembers".
+  checkpoints are snapshots of its data dir's volume (ferment.volume).
 - MariaDB: the older fallback; no archive.
 
 No TLS where a client might check validity dates: a server's self-signed cert

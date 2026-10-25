@@ -45,7 +45,7 @@ class Supervisor:
         return bool(procs) and all(self.is_ready(p) for p in procs)
 
 
-class FakeDolt:
+class FakeStore:
     """Versioned store whose 'data' is a counter; snapshots remember it."""
 
     def __init__(self):
@@ -55,22 +55,22 @@ class FakeDolt:
         ref = f"c{len(self.commits) + 1}"
         self.commits[ref] = self.data
         self.calls.append(("snapshot", running, tags))
-        return {"dolt:billing": ref}
+        return {"fake:billing": ref}
 
     def restore(self, parts):
-        self.data = self.commits[parts["dolt:billing"]]
+        self.data = self.commits[parts["fake:billing"]]
         self.calls.append(("restore", parts))
 
 
 @pytest.fixture
 def setup(tmp_path):
-    dolt = FakeDolt()
+    store = FakeStore()
     system = {"t": dt.datetime.now(dt.UTC)}
     clock = GuestClock(
         tmp_path / "time.json", set_system_time=lambda when: system.update(t=when), system_now=lambda: system["t"]
     )
-    tc = TimeController(Stack(), Supervisor(), tmp_path, versioned=[dolt], clock=clock)
-    return tc, dolt
+    tc = TimeController(Stack(), Supervisor(), tmp_path, versioned=[store], clock=clock)
+    return tc, store
 
 
 def test_store_migrates_once_and_survives_reopen(tmp_path):
@@ -81,33 +81,33 @@ def test_store_migrates_once_and_survives_reopen(tmp_path):
 
 
 def test_clock_change_checkpoints_the_stopped_workload_at_the_old_time(setup):
-    tc, dolt = setup
+    tc, store = setup
     tc.set_time(dt.datetime(2026, 10, 3, 12, tzinfo=dt.UTC), wait_ready=False)
-    dolt.data = 1
+    store.data = 1
     out = tc.set_time(dt.datetime(2026, 10, 4, 12, tzinfo=dt.UTC), who="alice")
     cp = out["checkpoint"]
     assert cp["kind"] == "clock-change" and cp["who"] == "alice"
     assert cp["fake_time"].startswith("2026-10-03")  # where the clock was, not where it's going
-    assert cp["parts"] == {"dolt:billing": "c2"}
-    _, running, tags = dolt.calls[-1]
+    assert cp["parts"] == {"fake:billing": "c2"}
+    _, running, tags = store.calls[-1]
     assert running is False  # cut while stopped: consistent across stores
     assert tags == [f"ckpt-{cp['id']}"]
     assert out["fake_now"].startswith("2026-10-04")
 
 
 def test_restore_returns_data_and_clock_and_can_be_undone(setup):
-    tc, dolt = setup
+    tc, store = setup
     tc.set_time(dt.datetime(2026, 10, 3, 12, tzinfo=dt.UTC), wait_ready=False)
-    dolt.data = 1
+    store.data = 1
     tc.checkpoint("loaded", name="loaded", who="bob")
-    dolt.data = 2
+    store.data = 2
     tc.set_time(dt.datetime(2026, 10, 9, 12, tzinfo=dt.UTC))
     out = tc.restore("loaded", who="bob")
-    assert dolt.data == 1
+    assert store.data == 1
     assert out["fake_now"].startswith("2026-10-03")  # clock went back too
     undo = out["previous"]["id"]
     tc.restore(str(undo))
-    assert dolt.data == 2 and tc.status()["fake_now"].startswith("2026-10-09")
+    assert store.data == 2 and tc.status()["fake_now"].startswith("2026-10-09")
 
 
 def test_checkpoint_names_are_validated_and_unique(setup):
@@ -122,13 +122,13 @@ def test_checkpoint_names_are_validated_and_unique(setup):
 
 
 def test_failed_clock_change_checkpoint_leaves_workload_running(setup):
-    tc, dolt = setup
+    tc, store = setup
     tc.set_time(dt.datetime(2026, 10, 3, 12, tzinfo=dt.UTC), wait_ready=False)
 
     def boom(*a, **k):
-        raise RuntimeError("dolt broke")
+        raise RuntimeError("the store broke")
 
-    dolt.snapshot = boom
+    store.snapshot = boom
     with pytest.raises(RuntimeError):
         tc.set_time(dt.datetime(2026, 10, 4, 12, tzinfo=dt.UTC))
     assert tc.supervisor.running

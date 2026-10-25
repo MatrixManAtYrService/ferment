@@ -61,7 +61,7 @@ MIGRATIONS = [
     );
     CREATE TABLE checkpoint_parts (
         checkpoint_id INTEGER NOT NULL REFERENCES checkpoints(id),
-        store       TEXT NOT NULL,          -- e.g. "dolt:billing_bookkeeper"
+        store       TEXT NOT NULL,          -- e.g. "volume:data"
         ref         TEXT NOT NULL,          -- that store's own commit/snapshot id
         PRIMARY KEY (checkpoint_id, store)
     );

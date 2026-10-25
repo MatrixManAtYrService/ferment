@@ -20,8 +20,9 @@ The filesystem is an image file on the VM's own disk, loop-mounted at
 agent); `VolumeSnapshots` is the checkpoint store on the server's side,
 calling it through the agent.
 
-What this doesn't give is diffs between checkpoints (`fmnt db diff`): that's
-the Dolt archive's job, for small stacks or, later, for chosen tables.
+What this doesn't give yet is diffs between checkpoints. They can come from
+the snapshots themselves: a mysqld on a writable copy of each, CHECKSUM
+TABLE to find the tables that differ, then a keyed row diff of just those.
 """
 
 from __future__ import annotations

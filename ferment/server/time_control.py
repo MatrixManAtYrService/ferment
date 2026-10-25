@@ -31,7 +31,7 @@ class CheckpointError(ValueError):
 
 
 class Versioned(Protocol):
-    """A store that can be one part of a checkpoint (e.g. ferment.archive.DoltArchive)."""
+    """A store that can be one part of a checkpoint (e.g. ferment.volume.VolumeSnapshots)."""
 
     def snapshot(self, message: str, tags: list[str], *, running: bool) -> dict[str, str]: ...
 

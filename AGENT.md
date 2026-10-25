@@ -14,7 +14,6 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/relay.py` | make a client-reachable `host:port` appear on a NixOS VM under its own name (`-R` + /etc/hosts + socat) |
 | `ferment/lifetime.py` | durations, in-guest poweroff timer |
 | `ferment/server/clock.py` | `GuestClock`: the VM's clock is the workload's; offset to real time |
-| `ferment/archive.py` | `DoltArchive`: checkpoints of the live MySQL in Dolt (MySQL runs, Dolt remembers) |
 | `ferment/procompose.py` | `Process`, `render`, `WorkloadSupervisor` |
 | `ferment/agent/` | the workload agent (`app.py`: clock, process-compose, logs, offline DB, probes) and `AgentClient` (`client.py`), which the server drives it through; see `docs/split-vms.md` |
 | `ferment/server/` | `TimeController` (clock, checkpoints, restore), `create_app` (routes, event log), `store.py` (SQLite: sessions, events, checkpoints) |
@@ -27,7 +26,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/fulfill.py` | `SourceFulfiller`: an attached client fetching code the VM asked for (source requests) |
 | `ferment/server/sources.py`, `builds.py` | VM side: bare repos from bundles, worktrees, builds (real time, SOURCE_DATE_EPOCH = commit time, cached per input; each a script in its own systemd unit that outlives the server, finished via an exit-status file) |
 | `ferment/volume.py` | checkpoints as btrfs snapshots of MySQL's data dir: `Volume` (workload agent: loop-mounted image, `live` + `snapshots/<id>`), `VolumeSnapshots` (the server's Versioned store, through the agent) |
-| `ferment/databases.py` | MariaDB / Dolt processes; Dolt checkpoints, log, diff, restore |
+| `ferment/databases.py` | MySQL 8.4 (the workload's) and MariaDB (fallback) processes; an offline mysqld on the data dir |
 | `ferment/config.py` | `~/.config/ferment/config.toml` |
 | `ferment/progress.py` | `Task`: a client's long work on the board with done/total (server: `Tasks` in `server/board.py`, lapses when its client stops reporting) |
 | `ferment/needs.py` | capabilities (`relay:`, `fetch:`, `data:`) and `Waiting`: a client waiting for one says so on the board |
@@ -48,8 +47,8 @@ README.md: users only need uv.
   providers must keep that guest's clock from being synced back (see
   vm/lima.py), and nothing that needs real time (builds, TLS, observability)
   runs there: it goes on the control VM (docs/split-vms.md).
-- Services run on MySQL. Checkpoints are volume snapshots; Dolt, when used,
-  only stores copies (for diffs).
+- Services run on MySQL. Checkpoints are volume snapshots (ferment.volume);
+  a checkpoint diff, when it's built, compares snapshots.
 - No TLS between real-time and faked processes: certs minted under the fake
   clock look not-yet-valid or expired to everyone else.
 - Store schema changes are new entries appended to `store.MIGRATIONS`; never
