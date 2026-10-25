@@ -26,6 +26,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/sources.py` | client side of shipping code: resolve refs, mirror, incremental git bundles |
 | `ferment/fulfill.py` | `SourceFulfiller`: an attached client fetching code the VM asked for (source requests) |
 | `ferment/server/sources.py`, `builds.py` | VM side: bare repos from bundles, worktrees, builds (real time, SOURCE_DATE_EPOCH = commit time, cached per input; each a script in its own systemd unit that outlives the server, finished via an exit-status file) |
+| `ferment/volume.py` | checkpoints as btrfs snapshots of MySQL's data dir: `Volume` (workload agent: loop-mounted image, `live` + `snapshots/<id>`), `VolumeSnapshots` (the server's Versioned store, through the agent) |
 | `ferment/databases.py` | MariaDB / Dolt processes; Dolt checkpoints, log, diff, restore |
 | `ferment/config.py` | `~/.config/ferment/config.toml` |
 | `ferment/progress.py` | `Task`: a client's long work on the board with done/total (server: `Tasks` in `server/board.py`, lapses when its client stops reporting) |
@@ -47,7 +48,8 @@ README.md: users only need uv.
   providers must keep that guest's clock from being synced back (see
   vm/lima.py), and nothing that needs real time (builds, TLS, observability)
   runs there: it goes on the control VM (docs/split-vms.md).
-- Services run on MySQL; Dolt only stores checkpoint history.
+- Services run on MySQL. Checkpoints are volume snapshots; Dolt, when used,
+  only stores copies (for diffs).
 - No TLS between real-time and faked processes: certs minted under the fake
   clock look not-yet-valid or expired to everyone else.
 - Store schema changes are new entries appended to `store.MIGRATIONS`; never

@@ -144,6 +144,16 @@ class AgentClient:
         finally:
             self._request("DELETE", "/db/offline")
 
+    def snapshot_volume(self, sid: str) -> str:
+        """For ferment.volume.VolumeSnapshots."""
+        return self._request("POST", f"/volume/snapshots/{sid}")["id"]
+
+    def restore_volume(self, sid: str) -> None:
+        self._request("POST", f"/volume/snapshots/{sid}/restore")
+
+    def volume(self) -> dict:
+        return self._request("GET", "/volume")
+
     def place(self, local_path: str) -> str:
         """Where the workload's machine has this file (a built artifact),
         uploading it first if it lacks it. A nix store path is copied with its

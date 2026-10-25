@@ -26,10 +26,11 @@ ferment provides the pieces that make that practical:
   the kernel, and file timestamps agree by construction. The server
   remembers the offset to real time and puts the date back after a reboot;
   providers keep the guest from syncing its clock (e.g. Lima's guest agent).
-- **databases and history** (`ferment.databases`, `ferment.archive`): MySQL
-  8.4 runs the workload; each checkpoint is copied into Dolt (one repo per
-  database), which gives commits, tags, table/row diffs, and restores. MySQL
-  runs, Dolt remembers.
+- **databases and checkpoints** (`ferment.databases`, `ferment.volume`,
+  `ferment.archive`): MySQL 8.4 runs the workload, its data dir on a btrfs
+  volume, so a checkpoint is a snapshot (instant at any size, copy-on-write)
+  and a restore swaps one back. Optionally each checkpoint is also copied
+  into Dolt (one repo per database), for table/row diffs between them.
 - **process-compose supervision** (`ferment.procompose`): one parent for the
   whole workload, so the whole workload shares one clock.
 - **time control and checkpoints** (`ferment.server`): a FastAPI app factory
@@ -66,13 +67,19 @@ system clock is simply set to the workload's date. Everything on the VM
 agrees, at no cost. The trade: things on the VM that check certificate dates
 (downloading packages) see the fake date too, so build near real time.
 
-## Why MySQL runs and Dolt remembers
+## Why checkpoints are snapshots
 
-Dolt can run a lot of MySQL, but real services find the gaps (WITH ROLLUP,
-variables inside stored procedures, some ALTER syntax). So services run on
-MySQL, production's engine, and Dolt holds only history: mysqldump in at each
-checkpoint, `dolt dump` out on restore. Views and routines Dolt can't hold
-are kept as SQL text beside the tables.
+A checkpoint has to be cheap: a clock change takes one, and a month of
+billing is thirty clock changes. Copying the databases into Dolt each time
+(the first design) is fine for an empty stack and an hour per checkpoint
+for a production-sized one. The workload is stopped at a clock change
+anyway, so its data files are consistent on disk, and a btrfs snapshot of
+them is instant and shares every unchanged block. (A snapshot of a running
+MySQL is a crash image, which InnoDB recovers from.)
+
+Dolt stays for what snapshots can't do: diffs between checkpoints. It can't
+run real services' SQL (WITH ROLLUP, variables inside stored procedures,
+some ALTER syntax), so it only ever holds copies.
 
 ## Development
 

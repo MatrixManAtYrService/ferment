@@ -9,6 +9,10 @@ DELETE /workload           stop it
 GET    /logs/{name}        a process's output from byte `offset` on
 POST   /db/offline         run mysqld on the live data dir (workload stopped): {port}
 DELETE /db/offline         stop it
+GET    /volume             the data volume (ferment.volume): its snapshots, what it takes on disk
+POST   /volume/snapshots/{id}           snapshot the database's data dir (a checkpoint)
+POST   /volume/snapshots/{id}/restore   put it back (workload stopped)
+DELETE /volume/snapshots/{id}           drop one
 GET    /probes             clock probe readings (ferment.clockcheck), `since` a fake time
 GET    /artifacts/{sha256}/{filename}   {path, exists}: where a built artifact is (or would be) kept
 PUT    /artifacts/{sha256}/{filename}   upload it (body: the file); checked against its hash
@@ -35,6 +39,7 @@ from ferment.clockcheck import read_probes
 from ferment.databases import MySQL
 from ferment.procompose import Process, WorkloadSupervisor
 from ferment.server.clock import boot_id, sudo_date
+from ferment.volume import Volume, VolumeError
 
 
 class SetClock(BaseModel):
@@ -53,6 +58,7 @@ def create_agent_app(
     supervisor: WorkloadSupervisor,
     *,
     database: MySQL | None = None,
+    volume: Volume | None = None,
     probes: Path | None = None,
     artifacts: Path | None = None,
     set_system_time: Callable[[dt.datetime], None] = sudo_date,
@@ -63,8 +69,35 @@ def create_agent_app(
     offline = contextlib.ExitStack()
     offline_port: list[int] = []  # the offline mysqld's port while it runs
 
+    # The data volume is made ready before any workload runs: the data dir
+    # moves onto it once (a copy: minutes for a big one), and a reboot left
+    # it unmounted. In the background, so /health answers meanwhile; whatever
+    # needs the data waits for it.
+    volume_ready = threading.Event()
+    volume_error: list[str] = []
+
+    def prepare_volume() -> None:
+        try:
+            for what in volume.ensure(database_running=supervisor.running):
+                print(f"volume: {what}", flush=True)
+        except Exception as e:
+            volume_error.append(str(e))
+            print(f"volume: {e}", flush=True)
+        finally:
+            volume_ready.set()
+
+    def await_volume() -> None:
+        if volume is None:
+            return
+        if not volume_ready.wait(3600):
+            raise HTTPException(503, "the data volume is still being prepared")
+        if volume_error:
+            raise HTTPException(500, f"the data volume isn't usable: {volume_error[0]}")
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        if volume is not None:
+            threading.Thread(target=prepare_volume, daemon=True).start()
         yield
         with lock:
             offline.close()
@@ -77,7 +110,10 @@ def create_agent_app(
 
     @app.get("/health")
     def health():
-        return {"healthy": True}
+        out: dict = {"healthy": True}
+        if volume is not None:
+            out["volume"] = "error" if volume_error else "ready" if volume_ready.is_set() else "preparing"
+        return out
 
     @app.get("/clock")
     def get_clock():
@@ -100,6 +136,7 @@ def create_agent_app(
 
     @app.put("/workload")
     def launch(req: Launch):
+        await_volume()
         with lock:
             supervisor.launch([Process(**p) for p in req.processes])
         return {"running": supervisor.running}
@@ -119,12 +156,49 @@ def create_agent_app(
     def start_offline():
         if database is None:
             raise HTTPException(404, "this workload has no database the agent manages")
+        await_volume()
         with lock:
             if supervisor.running:
                 raise HTTPException(409, "the workload is running; stop it first")
             if not offline_port:
                 offline_port.append(offline.enter_context(database.offline_server()))
             return {"port": offline_port[0]}
+
+    def _volume() -> Volume:
+        if volume is None:
+            raise HTTPException(404, "this workload keeps no data volume")
+        await_volume()
+        return volume
+
+    @app.get("/volume")
+    def get_volume():
+        return _volume().usage()
+
+    @app.post("/volume/snapshots/{sid}")
+    def snapshot(sid: str):
+        try:
+            return {"id": _volume().snapshot(sid)}
+        except VolumeError as e:
+            raise HTTPException(409, str(e))
+
+    @app.post("/volume/snapshots/{sid}/restore")
+    def restore(sid: str):
+        with lock:
+            if supervisor.running:
+                raise HTTPException(409, "the workload is running; stop it first")
+            try:
+                _volume().restore(sid)
+            except VolumeError as e:
+                raise HTTPException(409, str(e))
+        return {"ok": True}
+
+    @app.delete("/volume/snapshots/{sid}")
+    def drop(sid: str):
+        try:
+            _volume().delete(sid)
+        except VolumeError as e:
+            raise HTTPException(409, str(e))
+        return {"ok": True}
 
     @app.delete("/db/offline")
     def stop_offline():
