@@ -9,7 +9,9 @@ stands where those services expect the outbound proxy and:
   closed (511, "precache it") and is remembered, so a run's misses are the
   list of what to fetch before the next one;
 - fakes writes (200, no body), counting them, so a run shows what it tried
-  to change;
+  to change; except POSTs under a configured prefix (`read_posts`), which
+  are reads in POST's clothing (a query whose arguments are the body: COS's
+  app event searches take a merchant list) and are cached like GETs;
 - takes entries through the same toolbox API (`/cache/put`, `/cache/get`)
   the proxy that fetches them (eda's egress, in record mode) writes to.
 
@@ -17,12 +19,14 @@ Keys are the outbound proxy's own: `METHOD upstream_path?sorted-query`, for
 requests to `/proxy/<env>/<upstream_path>`, plus ` #<sha256(body)[:16]>`
 when a read carries a body (some are GETs whose arguments are JSON),
 computed from the incoming request so a recording and a replay agree. A
-miss keeps its body, so precaching can send the same request.
+miss keeps its body and the headers that shape the answer (content type,
+the Clover env), so precaching can send the same request.
 
 The cache lives in SQLite outside the workload's snapshot volume: restoring
 a checkpoint keeps what was precached.
 
-    python -m ferment.egress --port 44445 --db state/egress/egress.sqlite --cache fermenter
+    python -m ferment.egress --port 44445 --db state/egress/egress.sqlite --cache fermenter \
+        --read-post cos/v3/internal/app_
 """
 
 from __future__ import annotations
@@ -41,6 +45,8 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 READS = {"GET", "HEAD"}
+# Headers a miss keeps (lowercase): what the answer depends on beyond the key.
+KEPT_HEADERS = ("content-type", "x-clover-appenv")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
@@ -48,7 +54,8 @@ CREATE TABLE IF NOT EXISTS entries (
     content_type TEXT, meta TEXT, stored_at TEXT NOT NULL, PRIMARY KEY (cache, key));
 CREATE TABLE IF NOT EXISTS misses (
     cache TEXT NOT NULL, key TEXT NOT NULL, env TEXT NOT NULL, count INTEGER NOT NULL,
-    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', PRIMARY KEY (cache, key));
+    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+    headers TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (cache, key));
 CREATE TABLE IF NOT EXISTS writes (
     cache TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, count INTEGER NOT NULL,
     last_seen TEXT NOT NULL, PRIMARY KEY (cache, method, path));
@@ -74,8 +81,11 @@ class EgressCache:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.executescript(SCHEMA)
-        if "body" not in {r[1] for r in self.db.execute("PRAGMA table_info(misses)")}:  # made before bodies counted
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(misses)")}
+        if "body" not in have:  # made before bodies counted
             self.db.execute("ALTER TABLE misses ADD COLUMN body TEXT NOT NULL DEFAULT ''")
+        if "headers" not in have:  # made before headers were kept
+            self.db.execute("ALTER TABLE misses ADD COLUMN headers TEXT NOT NULL DEFAULT '{}'")
         self.lock = threading.Lock()
 
     def get(self, cache: str, key: str) -> dict | None:
@@ -104,13 +114,14 @@ class EgressCache:
         ).fetchall()
         return [dict(zip(("key", "status_code", "bytes", "stored_at"), r, strict=True)) for r in rows]
 
-    def miss(self, cache: str, key: str, env: str, body: str = "") -> None:
+    def miss(self, cache: str, key: str, env: str, body: str = "", headers: dict | None = None) -> None:
         now = _now()
         with self.lock:
             self.db.execute(
-                "INSERT INTO misses (cache, key, env, count, first_seen, last_seen, body) VALUES (?, ?, ?, 1, ?, ?, ?) "
+                "INSERT INTO misses (cache, key, env, count, first_seen, last_seen, body, headers) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?) "
                 "ON CONFLICT (cache, key) DO UPDATE SET count = count + 1, last_seen = excluded.last_seen",
-                (cache, key, env, now, now, body),
+                (cache, key, env, now, now, body, json.dumps(headers or {})),
             )
 
     def wrote(self, cache: str, method: str, path: str) -> None:
@@ -123,10 +134,11 @@ class EgressCache:
 
     def misses(self, cache: str) -> list[dict]:
         rows = self.db.execute(
-            "SELECT key, env, count, first_seen, last_seen, body FROM misses WHERE cache = ? ORDER BY first_seen",
+            "SELECT key, env, count, first_seen, last_seen, body, headers FROM misses WHERE cache = ? ORDER BY first_seen",
             (cache,),
         ).fetchall()
-        return [dict(zip(("key", "env", "count", "first_seen", "last_seen", "body"), r, strict=True)) for r in rows]
+        names = ("key", "env", "count", "first_seen", "last_seen", "body", "headers")
+        return [{**dict(zip(names, r, strict=True)), "headers": json.loads(r[6])} for r in rows]
 
     def stats(self, cache: str) -> dict:
         one = lambda q: self.db.execute(q, (cache,)).fetchone()[0]  # noqa: E731
@@ -157,7 +169,8 @@ class CachePut(BaseModel):
     meta: dict = {}
 
 
-def create_egress_app(cache: EgressCache, default_cache: str) -> FastAPI:
+def create_egress_app(cache: EgressCache, default_cache: str, read_posts: tuple[str, ...] = ()) -> FastAPI:
+    """`read_posts`: upstream path prefixes whose POSTs are reads (cached, not faked)."""
     app = FastAPI(title="egress cache")
 
     @app.get("/health")
@@ -167,14 +180,15 @@ def create_egress_app(cache: EgressCache, default_cache: str) -> FastAPI:
     @app.api_route("/proxy/{env}/{upstream_path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
     async def proxy(env: str, upstream_path: str, request: Request) -> Response:
         method = request.method.upper()
-        if method not in READS:
+        if method not in READS and not (method == "POST" and upstream_path.startswith(read_posts)):
             cache.wrote(default_cache, method, upstream_path)
             return Response(status_code=200)  # faked, as the recording proxy fakes them
         body = await request.body()
         key = cache_key(method, upstream_path, list(request.query_params.multi_items()), body)
         hit = cache.get(default_cache, key)
         if hit is None:
-            cache.miss(default_cache, key, env, body.decode(errors="replace"))
+            kept = {h: request.headers[h] for h in KEPT_HEADERS if h in request.headers}
+            cache.miss(default_cache, key, env, body.decode(errors="replace"), kept)
             return Response(
                 content=f"egress cache: miss for {key} (precache it; a run never reaches the real thing)".encode(),
                 status_code=511,
@@ -222,8 +236,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--db", type=Path, required=True)
     p.add_argument("--cache", default="fermenter", help="cache name requests are served from")
     p.add_argument("--host", default="127.0.0.1")
+    p.add_argument(
+        "--read-post", action="append", default=[], metavar="PREFIX",
+        help="upstream path prefix whose POSTs are reads (cached like GETs); repeatable",
+    )  # fmt: skip
     a = p.parse_args(argv)
-    uvicorn.run(create_egress_app(EgressCache(a.db), a.cache), host=a.host, port=a.port)
+    uvicorn.run(create_egress_app(EgressCache(a.db), a.cache, tuple(a.read_post)), host=a.host, port=a.port)
 
 
 if __name__ == "__main__":

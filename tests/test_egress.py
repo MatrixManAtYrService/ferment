@@ -54,3 +54,21 @@ def test_a_get_with_a_body_is_keyed_by_it_and_its_miss_keeps_the_body(tmp_path):
     (m,) = client.get("/misses").json()
     assert m["key"] == cache_key("GET", "cos/v3/developer-apps", [], body.encode()) and m["body"] == body
     assert m["key"] != cache_key("GET", "cos/v3/developer-apps", [], b'["APP3"]')
+
+
+def test_a_post_under_a_read_prefix_is_a_read_keyed_by_its_body_and_others_stay_faked(tmp_path):
+    client = TestClient(
+        create_egress_app(EgressCache(tmp_path / "e.sqlite"), "fermenter", read_posts=("cos/v3/internal/app_",))
+    )
+    path = "cos/v3/internal/app_install_uninstall_events"
+    headers = {"content-type": "text/plain", "x-clover-appenv": "usprod", "x-other": "dropped"}
+    r = client.post(f"/proxy/na/{path}?start=a&stop=b", content="M1,M2", headers=headers)
+    assert r.status_code == 511  # a miss, not a faked 200
+    (m,) = client.get("/misses").json()
+    key = cache_key("POST", path, [("start", "a"), ("stop", "b")], b"M1,M2")
+    assert m["key"] == key and m["body"] == "M1,M2"
+    assert m["headers"] == {"content-type": "text/plain", "x-clover-appenv": "usprod"}
+    client.post("/cache/put", json={"key": key, "status_code": 200, "body": "[{}]", "content_type": "application/json"})
+    assert client.post(f"/proxy/na/{path}?stop=b&start=a", content="M1,M2", headers=headers).json() == [{}]
+    assert client.post("/proxy/na/cos/v3/merchants/M1/notes", content="x").status_code == 200  # still a faked write
+    assert client.get("/stats").json()["writes_faked"] == 1
