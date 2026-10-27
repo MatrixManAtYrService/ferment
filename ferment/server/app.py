@@ -46,6 +46,12 @@ class NewCheckpoint(BaseModel):
     value: Any = None
 
 
+class Adopt(BaseModel):
+    stage: str
+    fingerprint: str
+    value: Any = None
+
+
 class NewSession(BaseModel):
     client: str
     relays: list[str] = []
@@ -220,6 +226,17 @@ def create_app(
         label = f"{cp['id']}" + (f" [{cp['name']}]" if cp["name"] else "") + (f" (stage {req.stage})" if stage else "")
         broadcast("checkpoint", w, f"{w} checkpointed {label}: {req.message}")
         return cp
+
+    @app.post("/checkpoints/{ref}/stage")
+    def adopt(ref: str, req: Adopt, request: Request):
+        """Mark an existing checkpoint as `stage`'s snapshot (made by hand, before the stage was)."""
+        cp = store.checkpoint(ref)
+        if cp is None:
+            raise HTTPException(404, f"no checkpoint {ref!r}")
+        w = who(request)
+        out = store.adopt(cp["id"], req.stage, req.fingerprint, req.value)
+        broadcast("checkpoint", w, f"{w} adopted checkpoint {cp['id']} as stage {req.stage}")
+        return out
 
     @app.get("/stages/{stage}")
     def stage(stage: str, fingerprint: str | None = None):

@@ -174,6 +174,12 @@ def test_a_stage_is_found_by_its_inputs_and_keeps_what_it_returned(setup):
         tc.restore(str(found["id"]))
         assert store.data == 1
 
+        hand = client.post("/checkpoints", json={"message": "by hand", "name": "day-ready"}).json()
+        assert client.post("/checkpoints/nope/stage", json={"stage": "s", "fingerprint": "f"}).status_code == 404
+        client.post("/checkpoints/day-ready/stage", json={"stage": "ready", "fingerprint": "r1", "value": [1]})
+        (adopted,) = client.get("/stages/ready", params={"fingerprint": "r1"}).json()
+        assert (adopted["id"], adopted["name"], adopted["value"]) == (hand["id"], "day-ready", [1])
+
 
 def test_reach_reports_instead_of_raising(setup):
     tc, _ = setup

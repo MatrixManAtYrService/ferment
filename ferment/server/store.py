@@ -368,6 +368,15 @@ class Store:
         }
         return cp
 
+    def adopt(self, checkpoint_id: int, stage: str, fingerprint: str, value: object) -> dict:
+        """Make an existing checkpoint a stage's: one taken by hand that the stage's steps would make."""
+        with self.lock:
+            self.db.execute(
+                "UPDATE checkpoints SET stage = ?, fingerprint = ?, value = ? WHERE id = ?",
+                (stage, fingerprint, json.dumps(value), checkpoint_id),
+            )
+        return self.checkpoint(str(checkpoint_id))  # type: ignore[return-value]
+
     def stage(self, stage: str, fingerprint: str | None = None) -> list[dict]:
         """A stage's checkpoints, newest first; with `fingerprint`, only those made from the same inputs."""
         sql = "SELECT id FROM checkpoints WHERE stage = ?" + (" AND fingerprint = ?" if fingerprint else "")
