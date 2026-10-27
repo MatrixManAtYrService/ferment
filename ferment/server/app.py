@@ -12,7 +12,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -40,6 +40,10 @@ class SetTime(BaseModel):
 class NewCheckpoint(BaseModel):
     message: str
     name: str | None = None
+    # A stage's checkpoint: the step's name, a hash of its inputs, what it returned.
+    stage: str | None = None
+    fingerprint: str | None = None
+    value: Any = None
 
 
 class NewSession(BaseModel):
@@ -207,10 +211,20 @@ def create_app(
     @app.post("/checkpoints")
     def checkpoint(req: NewCheckpoint, request: Request):
         w = who(request)
-        cp = controller.checkpoint(req.message, req.name, who=w)
-        label = f"{cp['id']}" + (f" [{cp['name']}]" if cp["name"] else "")
+        stage = None
+        if req.stage is not None:
+            if not req.fingerprint:
+                raise HTTPException(422, "a stage's checkpoint needs its fingerprint")
+            stage = {"stage": req.stage, "fingerprint": req.fingerprint, "value": req.value}
+        cp = controller.checkpoint(req.message, req.name, who=w, stage=stage)
+        label = f"{cp['id']}" + (f" [{cp['name']}]" if cp["name"] else "") + (f" (stage {req.stage})" if stage else "")
         broadcast("checkpoint", w, f"{w} checkpointed {label}: {req.message}")
         return cp
+
+    @app.get("/stages/{stage}")
+    def stage(stage: str, fingerprint: str | None = None):
+        """A stage's checkpoints, newest first (only those with `fingerprint`, if given)."""
+        return store.stage(stage, fingerprint)
 
     @app.post("/checkpoints/{ref}/restore")
     def restore(ref: str, request: Request):

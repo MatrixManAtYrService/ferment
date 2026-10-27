@@ -109,8 +109,11 @@ class TimeController:
             self.clock.ensure()
             self._launch()
 
-    def _checkpoint(self, *, message: str, kind: str, who: str, name: str | None, running: bool) -> dict:
-        """Snapshot every versioned store and record it. Caller holds the lock."""
+    def _checkpoint(
+        self, *, message: str, kind: str, who: str, name: str | None, running: bool, stage: dict | None = None
+    ) -> dict:
+        """Snapshot every versioned store and record it. Caller holds the lock.
+        `stage`: {stage, fingerprint, value}, for a checkpoint a named step made."""
         if name is not None:
             if not CHECKPOINT_NAME.match(name):
                 raise CheckpointError(f"bad checkpoint name {name!r}: start with a letter; letters, digits, . _ -")
@@ -130,6 +133,7 @@ class TimeController:
             offset_seconds=round(self.clock.offset.total_seconds()),
             parts=parts,
             parent=self.store.head(),
+            **(stage or {}),
         )
 
     def set_time(
@@ -163,10 +167,15 @@ class TimeController:
             ready = self._wait_ready(step) if wait_ready else None
         return {**self.status(), "ready": ready, "checkpoint": checkpoint}
 
-    def checkpoint(self, message: str, name: str | None = None, who: str = "unknown") -> dict:
+    def checkpoint(
+        self, message: str, name: str | None = None, who: str = "unknown", stage: dict | None = None
+    ) -> dict:
         """Checkpoint now, without stopping the workload."""
         with self.lock:
-            return self._checkpoint(message=message, kind="manual", who=who, name=name, running=self.supervisor.running)
+            return self._checkpoint(
+                message=message, kind="stage" if stage else "manual", who=who, name=name,
+                running=self.supervisor.running, stage=stage,
+            )  # fmt: skip
 
     def restore(self, ref: str, wait_ready: bool = True, who: str = "unknown", step: Step = _nothing) -> dict:
         """Put every versioned store back to checkpoint `ref` (id or name) and

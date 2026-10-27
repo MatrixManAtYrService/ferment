@@ -155,6 +155,26 @@ def test_api_records_who_did_what_and_who_is_here(setup):
         assert not any(a.endswith("/heartbeat") for _, a in actions)  # heartbeats aren't events
 
 
+def test_a_stage_is_found_by_its_inputs_and_keeps_what_it_returned(setup):
+    tc, store = setup
+    with TestClient(create_app(tc)) as client:
+        assert (
+            client.post("/checkpoints", json={"message": "m", "stage": "backout"}).status_code == 422
+        )  # no fingerprint
+        store.data = 1
+        made = {"message": "stage backout", "stage": "backout", "fingerprint": "f1", "value": {"run_started": "t0"}}
+        first = client.post("/checkpoints", json=made).json()
+        assert (first["kind"], first["value"]) == ("stage", {"run_started": "t0"})
+        store.data = 2
+        client.post("/checkpoints", json={**made, "fingerprint": "f2", "value": None})
+        assert [c["fingerprint"] for c in client.get("/stages/backout").json()] == ["f2", "f1"]
+        (found,) = client.get("/stages/backout", params={"fingerprint": "f1"}).json()
+        assert found["id"] == first["id"] and found["value"] == {"run_started": "t0"}
+        assert client.get("/stages/backout", params={"fingerprint": "f3"}).json() == []
+        tc.restore(str(found["id"]))
+        assert store.data == 1
+
+
 def test_reach_reports_instead_of_raising(setup):
     tc, _ = setup
     with TestClient(create_app(tc)) as client:

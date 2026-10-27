@@ -163,6 +163,15 @@ MIGRATIONS = [
         value       TEXT NOT NULL
     );
     """,
+    """
+    -- A stage: a checkpoint that a named step made, from inputs summed up as
+    -- its fingerprint, keeping what the step returned (JSON) so a run that
+    -- restores it instead of running the step still has it.
+    ALTER TABLE checkpoints ADD COLUMN stage TEXT;
+    ALTER TABLE checkpoints ADD COLUMN fingerprint TEXT;
+    ALTER TABLE checkpoints ADD COLUMN value TEXT;
+    CREATE INDEX checkpoints_stage ON checkpoints (stage, fingerprint);
+    """,
 ]
 
 # A claimed source request not finished in this long is up for grabs again
@@ -292,15 +301,30 @@ class Store:
         offset_seconds: int,
         parts: dict[str, str],
         parent: int | None = None,
+        stage: str | None = None,
+        fingerprint: str | None = None,
+        value: object = None,
     ) -> dict:
         """Records it as the head too: what later ones descend from."""
         with self.lock:
             self.db.execute("BEGIN")
             try:
                 cur = self.db.execute(
-                    "INSERT INTO checkpoints (name, message, kind, who, real_time, fake_time, offset_seconds, parent) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (name, message, kind, who, _now(), fake_time, offset_seconds, parent),
+                    "INSERT INTO checkpoints (name, message, kind, who, real_time, fake_time, offset_seconds, parent, "
+                    "stage, fingerprint, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        name,
+                        message,
+                        kind,
+                        who,
+                        _now(),
+                        fake_time,
+                        offset_seconds,
+                        parent,
+                        stage,
+                        fingerprint,
+                        None if stage is None else json.dumps(value),
+                    ),  # fmt: skip
                 )
                 cid = int(cur.lastrowid)
                 self.db.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('head', ?)", (str(cid),))
@@ -338,10 +362,17 @@ class Store:
         if not rows:
             return None
         cp = rows[0]
+        cp["value"] = None if cp["value"] is None else json.loads(cp["value"])
         cp["parts"] = {
             r["store"]: r["ref"] for r in self._rows("SELECT * FROM checkpoint_parts WHERE checkpoint_id = ?", cp["id"])
         }
         return cp
+
+    def stage(self, stage: str, fingerprint: str | None = None) -> list[dict]:
+        """A stage's checkpoints, newest first; with `fingerprint`, only those made from the same inputs."""
+        sql = "SELECT id FROM checkpoints WHERE stage = ?" + (" AND fingerprint = ?" if fingerprint else "")
+        ids = [r["id"] for r in self._rows(sql + " ORDER BY id DESC", stage, *([fingerprint] if fingerprint else []))]
+        return [self.checkpoint(str(i)) for i in ids]  # type: ignore[misc]
 
     def checkpoints(self, limit: int = 50) -> list[dict]:
         ids = [r["id"] for r in self._rows("SELECT id FROM checkpoints ORDER BY id DESC LIMIT ?", limit)]
