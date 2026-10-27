@@ -15,6 +15,14 @@ stands where those services expect the outbound proxy and:
 - takes entries through the same toolbox API (`/cache/put`, `/cache/get`)
   the proxy that fetches them (eda's egress, in record mode) writes to.
 
+Entries are kept in named recordings (the `cache` of each call); a run is
+served from the active one (`PUT /recording`), and precaching writes into
+it. Each entry carries the hash of its response, and every hit and miss is
+numbered as it happens (`seq`): `/hits?after=` and `/misses?after=` are one
+attempt's, from the `seq` read before it (not a time: every attempt
+restarts the fake clock), and `manifest()` over a run's hits identifies the
+answers it was given.
+
 Keys are the outbound proxy's own: `METHOD upstream_path?sorted-query`, for
 requests to `/proxy/<env>/<upstream_path>`, plus ` #<sha256(body)[:16]>`
 when a read carries a body (some are GETs whose arguments are JSON),
@@ -37,6 +45,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -59,6 +68,10 @@ CREATE TABLE IF NOT EXISTS misses (
 CREATE TABLE IF NOT EXISTS writes (
     cache TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, count INTEGER NOT NULL,
     last_seen TEXT NOT NULL, PRIMARY KEY (cache, method, path));
+CREATE TABLE IF NOT EXISTS served (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, cache TEXT NOT NULL, key TEXT NOT NULL,
+    response_hash TEXT, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
@@ -68,6 +81,19 @@ def cache_key(method: str, upstream_path: str, query: list[tuple[str, str]], bod
     q = urlencode(sorted(query))
     key = f"{method.upper()} {upstream_path}" + (f"?{q}" if q else "")
     return key + (f" #{hashlib.sha256(body).hexdigest()[:16]}" if body else "")
+
+
+def response_hash(status_code: int, content_type: str | None, body: str) -> str:
+    """What an entry answers, as a hash: equal hashes, equal answers."""
+    return hashlib.sha256(json.dumps([status_code, content_type, body]).encode()).hexdigest()
+
+
+def manifest(served: Iterable[tuple[str, str]]) -> str:
+    """A recording's manifest over the entries a run was served, as (key,
+    response hash) pairs: the same answers to the same requests, the same
+    manifest, however often or in whatever order they were asked for."""
+    lines = "".join(f"{k}\t{h}\n" for k, h in sorted(set(served)))
+    return hashlib.sha256(lines.encode()).hexdigest()
 
 
 def _now() -> str:
@@ -86,19 +112,48 @@ class EgressCache:
             self.db.execute("ALTER TABLE misses ADD COLUMN body TEXT NOT NULL DEFAULT ''")
         if "headers" not in have:  # made before headers were kept
             self.db.execute("ALTER TABLE misses ADD COLUMN headers TEXT NOT NULL DEFAULT '{}'")
+        if "response_hash" not in {r[1] for r in self.db.execute("PRAGMA table_info(entries)")}:  # made before hashes
+            self.db.execute("ALTER TABLE entries ADD COLUMN response_hash TEXT")
+            rows = self.db.execute("SELECT cache, key, status_code, content_type, body FROM entries").fetchall()
+            self.db.executemany(
+                "UPDATE entries SET response_hash = ? WHERE cache = ? AND key = ?",
+                [(response_hash(st, ct, b), c, k) for c, k, st, ct, b in rows],
+            )
         self.lock = threading.Lock()
+
+    def recording(self, default: str) -> str:
+        """The recording runs are served from (`default` until one is chosen)."""
+        row = self.db.execute("SELECT value FROM settings WHERE name = 'recording'").fetchone()
+        return default if row is None else row[0]
+
+    def use(self, name: str) -> None:
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('recording', ?)", (name,))
 
     def get(self, cache: str, key: str) -> dict | None:
         row = self.db.execute(
-            "SELECT status_code, body, content_type FROM entries WHERE cache = ? AND key = ?", (cache, key)
+            "SELECT status_code, body, content_type, response_hash FROM entries WHERE cache = ? AND key = ?",
+            (cache, key),
         ).fetchone()
-        return None if row is None else {"status_code": row[0], "body": row[1], "content_type": row[2]}
+        names = ("status_code", "body", "content_type", "response_hash")
+        return None if row is None else dict(zip(names, row, strict=True))
 
     def put(self, cache: str, key: str, status_code: int, body: str, content_type: str | None, meta: dict) -> None:
         with self.lock:
             self.db.execute(
-                "INSERT OR REPLACE INTO entries VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (cache, key, status_code, body, content_type, json.dumps(meta), _now()),
+                "INSERT OR REPLACE INTO entries "
+                "(cache, key, status_code, body, content_type, meta, stored_at, response_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    cache,
+                    key,
+                    status_code,
+                    body,
+                    content_type,
+                    json.dumps(meta),
+                    _now(),
+                    response_hash(status_code, content_type, body),
+                ),  # fmt: skip
             )
             self.db.execute("DELETE FROM misses WHERE cache = ? AND key = ?", (cache, key))
 
@@ -110,13 +165,25 @@ class EgressCache:
 
     def entries(self, cache: str) -> list[dict]:
         rows = self.db.execute(
-            "SELECT key, status_code, LENGTH(body), stored_at FROM entries WHERE cache = ? ORDER BY key", (cache,)
+            "SELECT key, status_code, LENGTH(body), stored_at, response_hash FROM entries WHERE cache = ? ORDER BY key",
+            (cache,),
         ).fetchall()
-        return [dict(zip(("key", "status_code", "bytes", "stored_at"), r, strict=True)) for r in rows]
+        names = ("key", "status_code", "bytes", "stored_at", "response_hash")
+        return [dict(zip(names, r, strict=True)) for r in rows]
+
+    def hit(self, cache: str, key: str, response_hash: str) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO served (cache, key, response_hash, at) VALUES (?, ?, ?, ?)",
+                (cache, key, response_hash, _now()),
+            )
 
     def miss(self, cache: str, key: str, env: str, body: str = "", headers: dict | None = None) -> None:
         now = _now()
         with self.lock:
+            self.db.execute(
+                "INSERT INTO served (cache, key, response_hash, at) VALUES (?, ?, NULL, ?)", (cache, key, now)
+            )
             self.db.execute(
                 "INSERT INTO misses (cache, key, env, count, first_seen, last_seen, body, headers) "
                 "VALUES (?, ?, ?, 1, ?, ?, ?, ?) "
@@ -132,10 +199,30 @@ class EgressCache:
                 (cache, method, path, _now()),
             )
 
-    def misses(self, cache: str) -> list[dict]:
+    def seq(self) -> int:
+        """The number of the last hit or miss (0 before any)."""
+        return self.db.execute("SELECT COALESCE(MAX(seq), 0) FROM served").fetchone()[0]
+
+    def hits(self, cache: str, after: int = 0) -> list[dict]:
         rows = self.db.execute(
-            "SELECT key, env, count, first_seen, last_seen, body, headers FROM misses WHERE cache = ? ORDER BY first_seen",
-            (cache,),
+            "SELECT seq, key, response_hash FROM served "
+            "WHERE cache = ? AND seq > ? AND response_hash IS NOT NULL ORDER BY seq",
+            (cache, after),
+        ).fetchall()
+        return [dict(zip(("seq", "key", "response_hash"), r, strict=True)) for r in rows]
+
+    def misses(self, cache: str, after: int | None = None) -> list[dict]:
+        """What's still missing; with `after`, only what was missed since that `seq`."""
+        since = (
+            ""
+            if after is None
+            else " AND key IN (SELECT key FROM served WHERE cache = ? AND seq > ? AND response_hash IS NULL)"
+        )
+        rows = self.db.execute(
+            "SELECT key, env, count, first_seen, last_seen, body, headers FROM misses WHERE cache = ?"
+            + since
+            + " ORDER BY first_seen",
+            (cache,) if after is None else (cache, cache, after),
         ).fetchall()
         names = ("key", "env", "count", "first_seen", "last_seen", "body", "headers")
         return [{**dict(zip(names, r, strict=True)), "headers": json.loads(r[6])} for r in rows]
@@ -147,6 +234,7 @@ class EgressCache:
             "entries": one("SELECT COUNT(*) FROM entries WHERE cache = ?"),
             "misses": one("SELECT COUNT(*) FROM misses WHERE cache = ?"),
             "writes_faked": one("SELECT COALESCE(SUM(count), 0) FROM writes WHERE cache = ?"),
+            "seq": self.seq(),
         }
 
 
@@ -160,6 +248,10 @@ class CacheDrop(BaseModel):
     keys: list[str]
 
 
+class Recording(BaseModel):
+    name: str
+
+
 class CachePut(BaseModel):
     cache_name: str | None = None
     key: str
@@ -170,8 +262,12 @@ class CachePut(BaseModel):
 
 
 def create_egress_app(cache: EgressCache, default_cache: str, read_posts: tuple[str, ...] = ()) -> FastAPI:
-    """`read_posts`: upstream path prefixes whose POSTs are reads (cached, not faked)."""
+    """`default_cache`: the recording served until another is chosen. `read_posts`:
+    upstream path prefixes whose POSTs are reads (cached, not faked)."""
     app = FastAPI(title="egress cache")
+
+    def active() -> str:
+        return cache.recording(default_cache)
 
     @app.get("/health")
     def health():
@@ -179,51 +275,71 @@ def create_egress_app(cache: EgressCache, default_cache: str, read_posts: tuple[
 
     @app.api_route("/proxy/{env}/{upstream_path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
     async def proxy(env: str, upstream_path: str, request: Request) -> Response:
-        method = request.method.upper()
+        method, name = request.method.upper(), active()
         if method not in READS and not (method == "POST" and upstream_path.startswith(read_posts)):
-            cache.wrote(default_cache, method, upstream_path)
+            cache.wrote(name, method, upstream_path)
             return Response(status_code=200)  # faked, as the recording proxy fakes them
         body = await request.body()
         key = cache_key(method, upstream_path, list(request.query_params.multi_items()), body)
-        hit = cache.get(default_cache, key)
+        hit = cache.get(name, key)
         if hit is None:
             kept = {h: request.headers[h] for h in KEPT_HEADERS if h in request.headers}
-            cache.miss(default_cache, key, env, body.decode(errors="replace"), kept)
+            cache.miss(name, key, env, body.decode(errors="replace"), kept)
             return Response(
                 content=f"egress cache: miss for {key} (precache it; a run never reaches the real thing)".encode(),
                 status_code=511,
                 media_type="text/plain",
             )
+        cache.hit(name, key, hit["response_hash"])
         body = b"" if method == "HEAD" else hit["body"].encode()
         return Response(content=body, status_code=hit["status_code"], media_type=hit["content_type"])
+
+    @app.get("/recording")
+    def recording():
+        return {"name": active()}
+
+    @app.put("/recording")
+    def use(req: Recording):
+        cache.use(req.name)
+        return {"name": req.name}
 
     # The toolbox API the recording proxy talks to.
 
     @app.post("/cache/put")
     def put(req: CachePut):
-        cache.put(req.cache_name or default_cache, req.key, req.status_code, req.body, req.content_type, req.meta)
+        cache.put(req.cache_name or active(), req.key, req.status_code, req.body, req.content_type, req.meta)
         return {"ok": True}
 
     @app.post("/cache/get")
     def get(req: CacheGet):
-        hit = cache.get(req.cache_name or default_cache, req.key)
+        hit = cache.get(req.cache_name or active(), req.key)
         return {"hit": False, "detail": f"cache miss for {req.key}"} if hit is None else {"hit": True, **hit}
 
     @app.post("/cache/drop")
     def drop(req: CacheDrop):
-        return {"dropped": cache.drop(req.cache_name or default_cache, req.keys)}
+        return {"dropped": cache.drop(req.cache_name or active(), req.keys)}
 
     @app.get("/entries")
     def entries(cache_name: str | None = None):
-        return cache.entries(cache_name or default_cache)
+        return cache.entries(cache_name or active())
 
     @app.get("/misses")
-    def misses(cache_name: str | None = None):
-        return cache.misses(cache_name or default_cache)
+    def misses(cache_name: str | None = None, after: int | None = None):
+        return cache.misses(cache_name or active(), after)
+
+    @app.get("/hits")
+    def hits(cache_name: str | None = None, after: int = 0):
+        return cache.hits(cache_name or active(), after)
+
+    @app.get("/manifest")
+    def manifest_(cache_name: str | None = None, after: int = 0):
+        """The manifest over what was served since `after`, and how many entries it covers."""
+        pairs = {(h["key"], h["response_hash"]) for h in cache.hits(cache_name or active(), after)}
+        return {"manifest": manifest(pairs), "entries": len(pairs)}
 
     @app.get("/stats")
     def stats(cache_name: str | None = None):
-        return cache.stats(cache_name or default_cache)
+        return cache.stats(cache_name or active())
 
     return app
 
@@ -234,7 +350,7 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--db", type=Path, required=True)
-    p.add_argument("--cache", default="fermenter", help="cache name requests are served from")
+    p.add_argument("--cache", default="fermenter", help="recording served until `PUT /recording` chooses another")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument(
         "--read-post", action="append", default=[], metavar="PREFIX",
