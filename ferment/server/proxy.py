@@ -3,7 +3,9 @@ fermenter's, so attached clients reach it through the tunnel they have.
 
 Bytes go both ways as they came (still encoded), streamed; hop-by-hop headers
 don't. `token`, if given, supplies a bearer token for calls under `auth_paths`
-that come without one, and is asked for a fresh one once on a 401.
+that come without one, and is asked for a fresh one once on a 401 or 403
+(a token issued before the fake clock moved back reads as not yet valid:
+Airflow says 403 "Invalid JWT token").
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ def proxy_router(
                 upstream = await http.send(req, stream=True)
             except httpx.HTTPError as e:
                 return Response(f"{base} isn't answering: {e}\n", status_code=502)
-            if upstream.status_code == 401 and add and attempt == 0:
+            if upstream.status_code in (401, 403) and add and attempt == 0:
                 await upstream.aclose()
                 continue  # expired: once more with a new one
             break
