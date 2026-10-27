@@ -100,6 +100,22 @@ def test_builds_succeed_reuse_and_fail_loudly(upstream, tmp_path):
     assert glob["status"] == "failed" and "matched 0 files" in glob["error"]
 
 
+def test_an_inputs_checkout_is_as_committed_for_every_build(upstream, tmp_path):
+    url = str(upstream)
+    c1 = sources.resolve(url, "development")
+    vm = SourceStore(tmp_path / "vm")
+    for name in ("svc", "lib"):
+        vm.receive(name, sources.bundle(sources.fetch(url, c1), c1))
+    store = Store(tmp_path / "vm" / "f.db")
+    builder = Builder(store, vm, tmp_path / "vm" / "logs")
+    edit = 'echo patched > "$FERMENT_INPUT_LIB/pom.txt"'  # a prepare step's codemod on the input
+    assert wait(store, builder.request("svc", c1, edit, None, "me", inputs={"lib": c1})["id"])["status"] == "succeeded"
+    read = wait(
+        store, builder.request("svc", c1, 'cat "$FERMENT_INPUT_LIB/pom.txt"', None, "me", inputs={"lib": c1})["id"]
+    )
+    assert "patched" not in builder.log(read["id"])[0]
+
+
 def test_source_requests_are_claimed_once_and_expire(tmp_path, monkeypatch):
     import datetime as dt
 
