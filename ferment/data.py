@@ -98,10 +98,13 @@ class DataFulfiller(threading.Thread):
     POLL = 3.0
     RETRY = 60.0  # after an ActionNeeded, try again this often until it works
 
-    def __init__(self, server_url: str, handlers: dict[str, Handler]):
+    def __init__(self, server_url: str, handlers: dict[str, Handler], available: Callable[[str], bool] | None = None):
+        """`available(capability)`: whether this client can serve it right now
+        (e.g. its eda answers); None: always. A request it can't serve stays queued."""
         super().__init__(daemon=True)
         self.url = server_url
         self.handlers = handlers
+        self.available = available or (lambda _cap: True)
         self.headers = {WHO_HEADER: whoami()}
         self.fragments = Fragments(server_url, self.headers)
         self.stop = threading.Event()
@@ -113,23 +116,29 @@ class DataFulfiller(threading.Thread):
 
     def run(self) -> None:
         while not self.stop.wait(self.POLL):
-            if self.retry.is_set():
-                self.retry.clear()
-                for p in self.paused.values():
-                    p["until"] = 0.0
-            for cap in self.handlers:
-                if cap in self.paused and time.monotonic() < self.paused[cap]["until"]:
-                    continue
-                try:
-                    r = httpx.get(f"{self.url}/data-requests", params={"capability": cap}, timeout=10)
-                    pending = r.json() if r.status_code == 200 else []
-                except (httpx.HTTPError, ValueError):
-                    continue  # tunnel not up yet, a blip, or a server without data requests
-                for req in pending:
-                    if self.stop.is_set():
-                        return
-                    if self._claim(req["id"]) and not self.fulfill(req):
-                        break  # paused: the rest wait too
+            self.poll()
+
+    def poll(self) -> None:
+        """One round: claim and serve what's queued for what this client can serve now."""
+        if self.retry.is_set():
+            self.retry.clear()
+            for p in self.paused.values():
+                p["until"] = 0.0
+        for cap in self.handlers:
+            if cap in self.paused and time.monotonic() < self.paused[cap]["until"]:
+                continue
+            if not self.available(cap):
+                continue
+            try:
+                r = httpx.get(f"{self.url}/data-requests", params={"capability": cap}, timeout=10)
+                pending = r.json() if r.status_code == 200 else []
+            except (httpx.HTTPError, ValueError):
+                continue  # tunnel not up yet, a blip, or a server without data requests
+            for req in pending:
+                if self.stop.is_set():
+                    return
+                if self._claim(req["id"]) and not self.fulfill(req):
+                    break  # paused: the rest wait too
 
     def _claim(self, request_id: int) -> bool:
         try:

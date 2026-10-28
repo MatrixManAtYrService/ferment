@@ -62,6 +62,9 @@ class NewSession(BaseModel):
 
 class Heartbeat(BaseModel):
     client_time: dt.datetime | None = None
+    # What the client serves now, when that changed since it attached (None: as before).
+    fetches: list[str] | None = None
+    provides: list[str] | None = None
 
 
 class NewNeed(BaseModel):
@@ -278,7 +281,8 @@ def create_app(
 
     @app.post("/sessions/{session_id}/heartbeat")
     def heartbeat(session_id: int, request: Request, req: Heartbeat | None = None):
-        if not store.touch_session(session_id):
+        fetches, provides = (req.fetches, req.provides) if req is not None else (None, None)
+        if not store.touch_session(session_id, fetches, provides):
             raise HTTPException(404, "no open session with that id")
         if req is not None and req.client_time is not None:
             controller.clock.observe(req.client_time, who(request))

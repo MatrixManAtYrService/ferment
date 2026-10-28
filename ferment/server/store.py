@@ -263,10 +263,21 @@ class Store:
             )
             return int(cur.lastrowid)
 
-    def touch_session(self, session_id: int) -> bool:
+    def touch_session(
+        self, session_id: int, fetches: list[str] | None = None, provides: list[str] | None = None
+    ) -> bool:
+        """A heartbeat; with `fetches`/`provides`, what the session serves now
+        (a client's services come and go while it stays attached)."""
+        sets, args = ["last_seen = ?"], [_now()]
+        if fetches is not None:
+            sets.append("fetches = ?")
+            args.append(json.dumps(fetches))
+        if provides is not None:
+            sets.append("provides = ?")
+            args.append(json.dumps(provides))
         with self.lock:
             cur = self.db.execute(
-                "UPDATE sessions SET last_seen = ? WHERE id = ? AND closed_at IS NULL", (_now(), session_id)
+                f"UPDATE sessions SET {', '.join(sets)} WHERE id = ? AND closed_at IS NULL", (*args, session_id)
             )
             return cur.rowcount == 1
 

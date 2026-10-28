@@ -233,6 +233,21 @@ def test_a_sign_in_pauses_requests_until_the_person_acts(app):
     assert client.get("/actions").json() == [] and "data:test" not in f.paused
 
 
+def test_a_request_waits_while_its_source_is_down_here(app, monkeypatch):
+    client, _ = app
+    served = []
+    up = {"data:test": False}
+    monkeypatch.setattr(data.httpx, "get", lambda url, **kw: client.get(url.removeprefix("http://f"), **kw))
+    monkeypatch.setattr(data.httpx, "post", lambda url, **kw: client.post(url.removeprefix("http://f"), **kw))
+    f = data.DataFulfiller("http://f", {"data:test": lambda spec, fr: served.append(spec) or {}}, available=up.get)
+    req = client.post("/data-requests", json={"capability": "data:test", "spec": {"t": 1}}).json()
+    f.poll()
+    assert served == [] and client.get(f"/data-requests/{req['id']}").json()["status"] == "pending"  # not claimed
+    up["data:test"] = True
+    f.poll()
+    assert served == [{"t": 1}]
+
+
 def test_tasks_report_progress_and_lapse_when_their_client_goes(app):
     from ferment.progress import Task
 

@@ -181,6 +181,19 @@ def test_a_stage_is_found_by_its_inputs_and_keeps_what_it_returned(setup):
         assert (adopted["id"], adopted["name"], adopted["value"]) == (hand["id"], "day-ready", [1])
 
 
+def test_a_heartbeat_can_say_what_the_session_serves_now(setup):
+    tc, _ = setup
+    with TestClient(create_app(tc)) as client:
+        sid = client.post(
+            "/sessions", json={"client": "vpn", "fetches": ["git.corp"], "provides": ["data:eda"]}
+        ).json()["id"]
+        client.post(f"/sessions/{sid}/heartbeat", json={"provides": []})  # eda went away; git still there
+        (s,) = client.get("/sessions").json()
+        assert (s["fetches"], s["provides"]) == (["git.corp"], [])
+        client.post(f"/sessions/{sid}/heartbeat", json={})  # says nothing new: unchanged
+        assert client.get("/sessions").json()[0]["fetches"] == ["git.corp"]
+
+
 def test_reach_reports_instead_of_raising(setup):
     tc, _ = setup
     with TestClient(create_app(tc)) as client:

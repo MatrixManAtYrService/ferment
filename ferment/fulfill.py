@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from collections.abc import Callable
 
 import httpx
 
@@ -21,10 +22,13 @@ from ferment.client import WHO_HEADER, whoami
 class SourceFulfiller(threading.Thread):
     POLL = 3.0
 
-    def __init__(self, server_url: str, hosts: list[str]):
+    def __init__(self, server_url: str, hosts: list[str], available: Callable[[str], bool] | None = None):
+        """`available(capability)`: whether this client can serve it right now
+        (e.g. its route to the git host is up); None: always."""
         super().__init__(daemon=True)
         self.url = server_url
         self.hosts = set(hosts)
+        self.available = available or (lambda _cap: True)
         self.headers = {WHO_HEADER: whoami()}
         self.stop = threading.Event()
 
@@ -38,7 +42,8 @@ class SourceFulfiller(threading.Thread):
             except (httpx.HTTPError, ValueError):
                 continue  # tunnel not up yet, or a blip
             for req in pending:
-                if sources.repo_host(req["repo"]) in self.hosts and self._claim(req["id"]):
+                host = sources.repo_host(req["repo"])
+                if host in self.hosts and self.available(f"fetch:{host}") and self._claim(req["id"]):
                     self.fulfill(req)
 
     def _claim(self, request_id: int) -> bool:
