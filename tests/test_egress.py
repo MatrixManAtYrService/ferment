@@ -139,3 +139,14 @@ def test_entries_from_before_response_hashes_get_one(tmp_path):
     db.close()
     cache = EgressCache(tmp_path / "e.sqlite")
     assert cache.get("fermenter", "GET a")["response_hash"] == response_hash(200, None, "x")
+
+
+def test_many_entries_are_stored_at_once_and_stop_being_misses(tmp_path):
+    client = TestClient(create_egress_app(EgressCache(tmp_path / "e.sqlite"), "fermenter"))
+    client.get("/proxy/na/cos/v1/a")
+    out = client.post("/cache/put_many", json={"entries": [
+        {"key": "GET cos/v1/a", "status_code": 200, "body": "a", "meta": {"synthetic": "test"}},
+        {"key": "GET cos/v1/b", "status_code": 200, "body": "b"},
+    ]}).json()  # fmt: skip
+    assert out == {"stored": 2} and client.get("/misses").json() == []
+    assert client.get("/proxy/na/cos/v1/b").text == "b"

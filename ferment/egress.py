@@ -261,6 +261,11 @@ class CachePut(BaseModel):
     meta: dict = {}
 
 
+class CachePutMany(BaseModel):
+    cache_name: str | None = None
+    entries: list[CachePut]
+
+
 def create_egress_app(cache: EgressCache, default_cache: str, read_posts: tuple[str, ...] = ()) -> FastAPI:
     """`default_cache`: the recording served until another is chosen. `read_posts`:
     upstream path prefixes whose POSTs are reads (cached, not faked)."""
@@ -309,6 +314,14 @@ def create_egress_app(cache: EgressCache, default_cache: str, read_posts: tuple[
     def put(req: CachePut):
         cache.put(req.cache_name or active(), req.key, req.status_code, req.body, req.content_type, req.meta)
         return {"ok": True}
+
+    @app.post("/cache/put_many")
+    def put_many(req: CachePutMany):
+        """Many entries at once (e.g. synthetic answers built from tables): each as /cache/put stores it."""
+        name = req.cache_name or active()
+        for e in req.entries:
+            cache.put(e.cache_name or name, e.key, e.status_code, e.body, e.content_type, e.meta)
+        return {"stored": len(req.entries)}
 
     @app.post("/cache/get")
     def get(req: CacheGet):
