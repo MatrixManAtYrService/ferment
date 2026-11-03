@@ -205,3 +205,23 @@ def test_items_can_be_a_json_list_and_composing_can_stop(tmp_path):
     assert got.json() == [{"id": "A1"}]
     client.put("/compositions", json={"method": "GET", "path": "cos/v3/developer-apps", "spec": None})
     assert client.request("GET", "/proxy/na/cos/v3/developer-apps", content=b'["A1"]').status_code == 511
+
+
+def test_reads_and_writes_from_many_threads_at_once_see_their_own_rows(tmp_path):
+    """The server's threads share one connection: concurrent requests mustn't read each other's rows."""
+    import concurrent.futures
+
+    client = TestClient(create_egress_app(EgressCache(tmp_path / "e.sqlite"), "fermenter", ("cos/v3/internal/app_",)))
+    _units(client, {f"M{i}": [{"e": i}] for i in range(50)}, complete=True)
+    params = {**DAY, "page": "0", "pageSize": "1000"}
+
+    def ask(n: int) -> int:
+        i, j = n % 50, (n + 1) % 50
+        r = client.post(f"/proxy/na/{EVENTS}", params=params, content=f"M{i},M{j}".encode())
+        assert r.status_code == 200, r.text
+        assert r.json() == [{"e": i}, {"e": j}]
+        client.post("/cache/put", json={"key": f"GET x/{n}", "status_code": 200, "body": str(n)})
+        return client.get(f"/proxy/na/x/{n}").status_code
+
+    with concurrent.futures.ThreadPoolExecutor(16) as pool:
+        assert set(pool.map(ask, range(400))) == {200}

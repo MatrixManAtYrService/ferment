@@ -144,10 +144,48 @@ def _now() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
 
 
+class _Rows:
+    def __init__(self, rows: list, rowcount: int):
+        self.rows, self.rowcount = rows, rowcount
+
+    def fetchone(self):  # noqa: ANN201
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self) -> list:
+        return self.rows
+
+    def __iter__(self):  # noqa: ANN204
+        return iter(self.rows)
+
+
+class _Locked:
+    """One SQLite connection shared by the server's threads (the proxy's event
+    loop and the threadpool's endpoints): each statement runs, and its rows
+    are read, under one lock. Unlocked, two requests at once interleave on the
+    connection and one reads the other's (or no) rows."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn, self.lock = conn, threading.RLock()
+
+    def execute(self, sql: str, args: tuple | list = ()) -> _Rows:
+        with self.lock:
+            cur = self.conn.execute(sql, args)
+            return _Rows(cur.fetchall(), cur.rowcount)
+
+    def executemany(self, sql: str, args: Iterable) -> _Rows:
+        with self.lock:
+            cur = self.conn.executemany(sql, args)
+            return _Rows([], cur.rowcount)
+
+    def executescript(self, sql: str) -> None:
+        with self.lock:
+            self.conn.executescript(sql)
+
+
 class EgressCache:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.db = _Locked(sqlite3.connect(path, check_same_thread=False, isolation_level=None))
         self.db.executescript(SCHEMA)
         have = {r[1] for r in self.db.execute("PRAGMA table_info(misses)")}
         if "body" not in have:  # made before bodies counted
