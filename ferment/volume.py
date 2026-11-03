@@ -169,6 +169,11 @@ class Volume:
             path.symlink_to(target)
         return done
 
+    def fit(self) -> list[str]:
+        """Refit the image to the disk now (it's only done by `ensure` otherwise): as
+        the disk's free space changes (snapshots dropped, logs grown), so does the cap."""
+        return self._fit() if self.mounted() and self.image.exists() else []
+
     def _cap(self) -> int:
         """The image's size: what it has, plus what the disk has left beyond
         the reserve (so it can never take the reserve), in whole GiB."""

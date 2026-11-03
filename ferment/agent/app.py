@@ -30,6 +30,7 @@ import datetime as dt
 import hashlib
 import re
 import threading
+import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -56,6 +57,9 @@ class Launch(BaseModel):
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,200}$")
+
+
+VOLUME_REFIT_S = 60.0
 
 
 def create_agent_app(
@@ -89,6 +93,16 @@ def create_agent_app(
             print(f"volume: {e}", flush=True)
         finally:
             volume_ready.set()
+        # The cap follows the disk: room freed (snapshots dropped) lets the volume
+        # grow, room taken (logs) shrinks it if what's in it fits. A load that fills
+        # the volume between refits fails; the next refit gives it the room back.
+        while not volume_error:
+            time.sleep(VOLUME_REFIT_S)
+            try:
+                for what in volume.fit():
+                    print(f"volume: {what}", flush=True)
+            except Exception as e:  # noqa: BLE001 - a refit that fails is retried next round
+                print(f"volume: refit: {e}", flush=True)
 
     def await_volume() -> None:
         if volume is None:
