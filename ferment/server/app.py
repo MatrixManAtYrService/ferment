@@ -17,7 +17,7 @@ from typing import Annotated, Any
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from ferment import needs as needs_mod
@@ -370,6 +370,16 @@ def create_app(
     @app.get("/sources/{name}")
     def source(name: str):
         return {"commits": sources.commits(name)}
+
+    @app.get("/sources/{name}/bundle")
+    def download_source(name: str, commit: str, have: list[str] = Query(default=[])):  # noqa: B008
+        """`commit` as a git bundle (less what `have` covers): for a machine that
+        can reach the fermenter but not the repo (e.g. off the VPN)."""
+        try:
+            data = sources.bundle(name, commit, have)
+        except SourceStoreError as e:
+            raise HTTPException(404, str(e)) from e
+        return Response(content=data, media_type="application/octet-stream")
 
     @app.post("/sources/{name}")
     async def upload_source(name: str, request: Request):

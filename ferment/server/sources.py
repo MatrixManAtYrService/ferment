@@ -66,6 +66,20 @@ class SourceStore:
             heads = _git("bundle", "list-heads", f.name, cwd=repo)
         return [line.split()[0] for line in heads.splitlines() if line.strip()]
 
+    def bundle(self, name: str, commit: str, have: list[str] = ()) -> bytes:  # type: ignore[assignment]
+        """A git bundle carrying `commit` as refs/ferment/<commit>, minus history
+        reachable from `have` (what the asker holds): the way back out, for a
+        machine that can't fetch the repo itself but can reach the fermenter."""
+        if not self.has(name, commit):
+            raise SourceStoreError(f"{name} has no commit {commit}")
+        repo = self._repo(name)
+        _git("update-ref", f"refs/ferment/{commit}", commit, cwd=repo)
+        exclude = [f"^{c}" for c in have if SHA.match(c) and c != commit and self.has(name, c)]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "x.bundle"
+            _git("bundle", "create", "--quiet", str(out), f"refs/ferment/{commit}", *exclude, cwd=repo)
+            return out.read_bytes()
+
     def worktree(self, name: str, commit: str) -> Path:
         """A checkout of `commit` (made once, then reused).
 

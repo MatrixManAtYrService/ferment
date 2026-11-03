@@ -256,3 +256,23 @@ def test_an_old_linked_worktree_is_replaced_by_a_real_checkout(upstream, tmp_pat
     assert (old / ".git").is_file()
     tree = vm.worktree("svc", c1)
     assert tree == old and (tree / ".git").is_dir()
+
+
+def test_a_commit_goes_back_out_as_a_bundle_less_what_the_asker_has(upstream, tmp_path):
+    """For a machine that reaches the fermenter but not the repo: it fetches from the store."""
+    url = str(upstream)
+    store = SourceStore(tmp_path / "vm")
+    c1 = sources.resolve(url, "development")
+    here = tmp_path / "here"
+    git(tmp_path, "clone", "--quiet", url, str(here))  # what the asker already has: c1
+    store.receive("app", sources.bundle(sources.fetch(url, c1), c1))
+    c2 = commit(upstream, "v2\n")
+    store.receive("app", sources.bundle(sources.fetch(url, c2), c2, have=[c1]))
+
+    out = tmp_path / "x.bundle"
+    out.write_bytes(store.bundle("app", c2, have=[c1]))
+    git(here, "fetch", "--quiet", str(out), f"refs/ferment/{c2}")
+    git(here, "merge", "--quiet", "--ff-only", "FETCH_HEAD")
+    assert git(here, "rev-parse", "HEAD") == c2 and (here / "pom.txt").read_text() == "v2\n"
+    with pytest.raises(SourceStoreError, match="no commit"):
+        store.bundle("app", "0" * 40)
