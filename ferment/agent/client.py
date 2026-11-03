@@ -144,6 +144,10 @@ class AgentClient:
         finally:
             self._request("DELETE", "/db/offline")
 
+    def measure_now(self) -> dict:
+        """A sample of the workload's VM (ferment.measure.collect)."""
+        return self._request("GET", "/measure/now")
+
     def snapshot_volume(self, sid: str) -> dict:
         """For ferment.volume.VolumeSnapshots: {id, binlog (file:position, or None)}."""
         return self._request("POST", f"/volume/snapshots/{sid}")

@@ -38,6 +38,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ferment import measure
 from ferment.clockcheck import read_probes
 from ferment.databases import MySQL
 from ferment.procompose import Process, WorkloadSupervisor
@@ -172,6 +173,14 @@ def create_agent_app(
             raise HTTPException(404, "this workload keeps no data volume")
         await_volume()
         return volume
+
+    cpu = measure.CpuMeter()
+
+    @app.get("/measure/now")
+    def measure_now():
+        """This VM now: CPU, memory, pressure, disks, and each workload process's tree's memory."""
+        disks = {"root": Path("/")} | ({"volume": volume.mount} if volume is not None and volume.mounted() else {})
+        return measure.collect(cpu, disks, supervisor.processes() if supervisor.running else [])
 
     @app.get("/volume")
     def get_volume():

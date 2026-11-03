@@ -186,6 +186,25 @@ MIGRATIONS = [
         real_time   TEXT NOT NULL
     );
     """,
+    """
+    -- What the VMs used (ferment.measure): one sample per VM per interval, in
+    -- real time, and marks naming stretches of it (an experiment, a stage).
+    CREATE TABLE samples (
+        id          INTEGER PRIMARY KEY,
+        real_time   TEXT NOT NULL,
+        vm          TEXT NOT NULL,
+        sample      TEXT NOT NULL           -- JSON
+    );
+    CREATE INDEX samples_time ON samples (real_time);
+    CREATE TABLE marks (
+        id          INTEGER PRIMARY KEY,
+        label       TEXT NOT NULL,
+        who         TEXT NOT NULL,
+        started     TEXT NOT NULL,
+        ended       TEXT
+    );
+    CREATE INDEX marks_label ON marks (label);
+    """,
 ]
 
 # A claimed source request not finished in this long is up for grabs again
@@ -405,6 +424,39 @@ class Store:
                 (checkpoint_id, shelf, prefix, base, json.dumps(parts), size, _now()),
             )
         return self.checkpoint(str(checkpoint_id))["archive"]  # type: ignore[index]
+
+    # -- measurements -------------------------------------------------------------
+
+    def add_sample(self, real_time: str, vm: str, sample: dict) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO samples (real_time, vm, sample) VALUES (?, ?, ?)", (real_time, vm, json.dumps(sample))
+            )
+
+    def samples(self, start: str, end: str, vm: str | None = None) -> list[dict]:
+        sql = "SELECT real_time, vm, sample FROM samples WHERE real_time >= ? AND real_time <= ?"
+        rows = self._rows(sql + (" AND vm = ?" if vm else "") + " ORDER BY id", start, end, *([vm] if vm else []))
+        return [{**r, "sample": json.loads(r["sample"])} for r in rows]
+
+    def add_mark(self, label: str, who: str, started: str) -> dict:
+        with self.lock:
+            cur = self.db.execute("INSERT INTO marks (label, who, started) VALUES (?, ?, ?)", (label, who, started))
+        return self.mark(int(cur.lastrowid))  # type: ignore[return-value]
+
+    def end_mark(self, mark_id: int, ended: str) -> dict | None:
+        with self.lock:
+            self.db.execute("UPDATE marks SET ended = ? WHERE id = ? AND ended IS NULL", (ended, mark_id))
+        return self.mark(mark_id)
+
+    def mark(self, mark_id: int) -> dict | None:
+        rows = self._rows("SELECT * FROM marks WHERE id = ?", mark_id)
+        return rows[0] if rows else None
+
+    def marks(self, label: str | None = None, limit: int = 100) -> list[dict]:
+        """Newest first; `label`: those starting with it."""
+        if label:
+            return self._rows("SELECT * FROM marks WHERE label LIKE ? ORDER BY id DESC LIMIT ?", f"{label}%", limit)
+        return self._rows("SELECT * FROM marks ORDER BY id DESC LIMIT ?", limit)
 
     def archives_based_on(self, checkpoint_id: int) -> list[int]:
         """Archived checkpoints taken relative to this one."""

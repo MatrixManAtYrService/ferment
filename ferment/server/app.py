@@ -12,6 +12,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
@@ -20,6 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from ferment import measure as measure_mod
 from ferment import needs as needs_mod
 from ferment.board import Board, Service
 from ferment.client import WHO_HEADER
@@ -35,6 +37,10 @@ from ferment.server.time_control import CheckpointError, TimeController
 
 class SetTime(BaseModel):
     at: dt.datetime
+
+
+class NewMark(BaseModel):
+    label: str
 
 
 class NewCheckpoint(BaseModel):
@@ -122,17 +128,30 @@ def create_app(
     database: Database | None = None,
     before_deploy: Callable[[str, dict, Callable[[str], None]], None] | None = None,
     services: Callable[[], list[Service]] | None = None,
+    measure: dict[str, Callable[[], dict]] | None = None,
 ) -> FastAPI:
     """`before_deploy(name, build, say)` runs before a service is (re)deployed,
     e.g. its schema migrations; raising stops the deploy. `services` lists
     what people can open or connect to, for the board (ferment.board); their
-    up/down state comes from the workload process of the same name."""
+    up/down state comes from the workload process of the same name.
+    `measure`: VM name -> a sample of it (ferment.measure), taken every
+    interval and kept; default, this machine as "vm"."""
     store = controller.store
     log_path = controller.state_dir / "logs" / "fermenter.jsonl"
     logs.configure(log_path)
     # The VM's own clock reads the fake date: the board is stamped in real time.
     board = Board(now=clock_mod.real_now)
     publisher = Publisher(board, controller, services)
+    if measure is None:
+        cpu = measure_mod.CpuMeter()
+        remote = getattr(controller.supervisor, "measure_now", None)  # the workload agent, on its own VM
+        if remote is not None:  # split: this VM by its largest processes, the workload's by the agent
+            measure = {"control": lambda: measure_mod.collect(cpu, {"root": Path("/")}), "workload": remote}
+        else:
+            measure = {"vm": lambda: measure_mod.collect(cpu, {"root": Path("/")}, controller.supervisor.processes())}
+    sampler = measure_mod.Sampler(
+        measure, lambda vm, sample: store.add_sample(clock_mod.real_now().isoformat(), vm, sample)
+    )
 
     def broadcast(event: str, who_: str, message: str, **fields) -> None:
         logs.broadcast(event, who_, message, **fields)
@@ -151,7 +170,9 @@ def create_app(
         publisher.await_ready(started.ids["ready"])
         publisher.refresh()
         publisher.start()
+        sampler.start()
         yield
+        sampler.stop()
         publisher.stop()
         controller.stop()
 
@@ -280,6 +301,45 @@ def create_app(
         dropped = controller.prune(kind, keep)
         broadcast("checkpoint", who(request), f"{who(request)} pruned {len(dropped)} {kind} checkpoint(s)")
         return {"dropped": dropped}
+
+    # -- what the VMs used (ferment.measure) ---------------------------------------
+
+    def _window(start: str | None, end: str | None, mark: int | None) -> tuple[str, str]:
+        now = clock_mod.real_now().isoformat()
+        if mark is not None:
+            m = store.mark(mark)
+            if m is None:
+                raise HTTPException(404, f"no mark {mark}")
+            return m["started"], m["ended"] or now
+        return start or "0000", end or now
+
+    @app.get("/measure")
+    def measure_samples(start: str | None = None, end: str | None = None, mark: int | None = None,
+                        vm: str | None = None):  # fmt: skip
+        """Samples (real time) between `start` and `end` (ISO), or over mark `mark`."""
+        return store.samples(*_window(start, end, mark), vm)
+
+    @app.get("/measure/summary")
+    def measure_summary(start: str | None = None, end: str | None = None, mark: int | None = None):
+        """Per VM and number: peak, p95, mean, n; over a window or a mark."""
+        lo, hi = _window(start, end, mark)
+        return {"start": lo, "end": hi, "vms": measure_mod.summarize(store.samples(lo, hi))}
+
+    @app.post("/measure/marks")
+    def start_mark(req: NewMark, request: Request):
+        """Name a stretch of time from now (`POST /measure/marks/{id}/end` ends it)."""
+        return store.add_mark(req.label, who(request), clock_mod.real_now().isoformat())
+
+    @app.post("/measure/marks/{mark_id}/end")
+    def end_mark(mark_id: int):
+        out = store.end_mark(mark_id, clock_mod.real_now().isoformat())
+        if out is None:
+            raise HTTPException(404, f"no mark {mark_id}")
+        return out
+
+    @app.get("/measure/marks")
+    def list_marks(label: str | None = None, limit: int = 100):
+        return store.marks(label, limit)
 
     @app.get("/stages/{stage}")
     def stage(stage: str, fingerprint: str | None = None):
