@@ -22,6 +22,7 @@ from ferment.procompose import Process
 from ferment.server import clock as clock_mod
 from ferment.server.clock import GuestClock
 from ferment.server.store import Store
+from ferment.shelf import Shelf
 
 CHECKPOINT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 
@@ -37,7 +38,10 @@ class Versioned(Protocol):
 
     def restore(self, parts: dict[str, str]) -> None: ...
 
-    # Optional: `drop(parts)` frees a checkpoint's part for good.
+    # Optional: `drop(parts)` frees a checkpoint's part for good; for the shelf,
+    # `archive_name` (its object's name), `send(parts, base_parts)` (its data as
+    # a stream, relative to an earlier checkpoint's) and `receive(parts, chunks)`
+    # (made again from one).
 
 
 # Told each step of a clock change, restore, or relaunch as it finishes:
@@ -86,8 +90,14 @@ class TimeController:
         versioned: list[Versioned] | None = None,
         store: Store | None = None,
         clock: GuestClock | None = None,
+        shelf: Shelf | None = None,
+        shelf_prefix: str = "snapshots",
+        provenance: str = "unknown",
     ):
+        """`shelf`: where checkpoints' data goes before it's dropped (under
+        `shelf_prefix`, labelled `provenance`), so it can be made again."""
         self.stack = stack
+        self.shelf, self.shelf_prefix, self.provenance = shelf, shelf_prefix, provenance
         self.versioned = versioned or []
         self.clock = clock or GuestClock(state_dir / "time.json")
         clock_mod.use(self.clock)
@@ -179,10 +189,89 @@ class TimeController:
                 running=self.supervisor.running, stage=stage,
             )  # fmt: skip
 
+    def _present_ancestor(self, cp: dict) -> dict | None:
+        """The nearest checkpoint `cp` descends from whose data is here: what
+        it's archived relative to (the least that differs)."""
+        parent = cp.get("parent")
+        while parent is not None:
+            p = self.store.checkpoint(str(parent))
+            if p is None:
+                return None
+            if p["parts"]:
+                return p
+            parent = p.get("parent")
+        return None
+
+    def archive(self, ref: str) -> dict:
+        """Put checkpoint `ref`'s data on the shelf (once): relative to the
+        nearest ancestor that's here, so it's only what changed since."""
+        with self.lock:
+            return self._archive(self._get(ref))
+
+    def _get(self, ref: str) -> dict:
+        cp = self.store.checkpoint(ref)
+        if cp is None:
+            raise CheckpointError(f"no checkpoint {ref!r}")
+        return cp
+
+    def _archive(self, cp: dict) -> dict:
+        """Caller holds the lock (nothing it's sent relative to may go meanwhile)."""
+        if cp["archive"]:
+            return cp["archive"]
+        if self.shelf is None:
+            raise CheckpointError("this fermenter has no shelf to archive to")
+        if not cp["parts"]:
+            raise CheckpointError(f"checkpoint {cp['id']}'s data was dropped before shelves: nothing to archive")
+        base = self._present_ancestor(cp)
+        prefix = f"{self.shelf_prefix}/{cp['id']}"
+        about = {k: cp.get(k) for k in ("id", "name", "message", "kind", "fake_time", "parent", "stage", "fingerprint")}
+        size = 0
+        for store in self.versioned:
+            send = getattr(store, "send", None)
+            if send is None:
+                continue
+            meta = {
+                "checkpoint": about,
+                "parts": cp["parts"],
+                "base": base and base["id"],
+                "provenance": self.provenance,
+            }
+            key = f"{prefix}/{store.archive_name}"  # type: ignore[attr-defined]
+            size += self.shelf.put(key, send(cp["parts"], base and base["parts"]), meta)["bytes"]
+        return self.store.add_archive(
+            cp["id"], shelf=self.shelf.url, prefix=prefix, base=base and base["id"], parts=cp["parts"], size=size
+        )
+
+    def _unarchive(self, cp: dict) -> dict:
+        """Make a dropped checkpoint's data again from the shelf (its base first,
+        if that was dropped too). Caller holds the lock."""
+        archive = cp["archive"]
+        if archive is None or self.shelf is None:
+            raise CheckpointError(f"checkpoint {cp['id']} has no versioned data to restore (only a clock reading)")
+        if archive["shelf"] != self.shelf.url:
+            raise CheckpointError(f"checkpoint {cp['id']} is archived on {archive['shelf']}, not {self.shelf.url}")
+        if archive["base"] is not None:
+            base = self._get(str(archive["base"]))
+            if not base["parts"]:
+                self._unarchive(base)
+        for store in self.versioned:
+            receive = getattr(store, "receive", None)
+            if receive is not None:
+                receive(archive["parts"], self.shelf.get(f"{archive['prefix']}/{store.archive_name}"))  # type: ignore[attr-defined]
+        self.store.set_parts(cp["id"], archive["parts"])
+        return self._get(str(cp["id"]))
+
+    def unarchive(self, ref: str) -> dict:
+        """Bring a dropped checkpoint's data back from the shelf (without restoring it)."""
+        with self.lock:
+            cp = self._get(ref)
+            return cp if cp["parts"] else self._unarchive(cp)
+
     def drop(self, ref: str) -> dict:
         """Free checkpoint `ref`'s data (a volume snapshot holds what's changed
         since, and they add up). Named and stage checkpoints are kept, and so is
-        the one the workload is on. It stays in the tree, unrestorable."""
+        the one the workload is on. With a shelf, it's archived first and can
+        be restored still; without one it stays in the tree, unrestorable."""
         cp = self.store.checkpoint(ref)
         if cp is None:
             raise CheckpointError(f"no checkpoint {ref!r}")
@@ -191,6 +280,8 @@ class TimeController:
         with self.lock:
             if cp["id"] == self.store.head():
                 raise CheckpointError(f"checkpoint {cp['id']} is where the workload is: keeping it")
+            if self.shelf is not None and cp["parts"]:
+                cp = {**cp, "archive": self._archive(cp)}
             for store in self.versioned:
                 drop = getattr(store, "drop", None)
                 if drop is not None and cp["parts"]:
@@ -215,12 +306,10 @@ class TimeController:
         """Put every versioned store back to checkpoint `ref` (id or name) and
         the clock back to the date it was taken at. The state being left is
         checkpointed first, so a restore can itself be undone."""
-        cp = self.store.checkpoint(ref)
-        if cp is None:
-            raise CheckpointError(f"no checkpoint {ref!r}")
-        if not cp["parts"]:
-            raise CheckpointError(f"checkpoint {ref!r} has no versioned data to restore (only a clock reading)")
+        cp = self._get(ref)
         with self.lock:
+            if not cp["parts"]:
+                cp = self._unarchive(cp)  # from the shelf, or it says there's nothing to restore
             self.supervisor.stop()
             step("stop")
             left = self._checkpoint(

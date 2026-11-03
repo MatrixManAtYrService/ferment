@@ -530,3 +530,9 @@ def test_lima_mounts_only_the_caches_a_vm_asks_for():
     assert plain["mounts"] == []
     cached = lima.lima_config(VMSpec(name="a", ttl=dt.timedelta(hours=1), caches=["maven"]), cache_root="/c")
     assert cached["mounts"] == [{"location": "/c/maven", "mountPoint": f"{CACHE_MOUNT}/maven", "writable": True}]
+    elsewhere = lima.lima_config(
+        VMSpec(name="a", ttl=dt.timedelta(hours=1), caches=["maven", "shelf"]),
+        cache_root="/c",
+        cache_locations={"shelf": "/Volumes/Ferment/shelf"},
+    )
+    assert [m["location"] for m in elsewhere["mounts"]] == ["/c/maven", "/Volumes/Ferment/shelf"]

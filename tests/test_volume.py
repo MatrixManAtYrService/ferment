@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from ferment.volume import BINLOG_PART, PART, Volume, VolumeError, VolumeSnapshots
+from ferment.volume import BINLOG_PART, PART, Receiver, Volume, VolumeError, VolumeSnapshots
 
 
 class FakeBtrfs:
@@ -265,3 +265,40 @@ def test_a_scratch_dir_in_use_waits_for_the_workload_to_stop(tmp_path, monkeypat
         f"{tmp_path / 'mysql84-tmp'} moves onto it when the workload is stopped (in use now)"
     ]
     assert (tmp_path / "mysql84-tmp" / "#sql1.ibd").exists()
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="needs zstd")
+def test_send_and_receive_pipe_through_zstd_and_a_broken_stream_leaves_nothing(tmp_path, monkeypatch):
+    v, _ = _volume(tmp_path, monkeypatch)
+    v.ensure()
+    (tmp_path / "mysql84" / "t.ibd").write_text("rows")
+    v.snapshot("ckpt-1")
+    payload = os.urandom(3 << 20)
+    # btrfs's own commands stand in: `send` is cat; `receive` makes the snapshot's directory and writes into it
+    monkeypatch.setattr(v, "_snapshot_path", lambda sid: v.snapshots / sid)
+    (tmp_path / "stream").write_bytes(payload)
+    sent = b"".join(v._stream(["cat", str(tmp_path / "stream")], 1 << 16))
+    assert sent != payload and len(sent) < len(payload) + 1024  # zstd'd
+
+    def receiver(sid):
+        made = v.snapshots / sid
+        return Receiver(
+            "zstd", ["sh", "-c", f"mkdir {made} && cat > {made}/data"], made, drop=lambda: shutil.rmtree(made)
+        )
+
+    r = receiver("ckpt-2")
+    for i in range(0, len(sent), 1000):
+        r.write(sent[i : i + 1000])
+    r.close()
+    assert (v.snapshots / "ckpt-2" / "data").read_bytes() == payload
+
+    r = receiver("ckpt-3")
+    r.write(sent[: len(sent) // 2])  # the sender died partway
+    with pytest.raises(VolumeError, match="receiving ckpt-3"):
+        r.close()
+    assert not (v.snapshots / "ckpt-3").exists()
+
+    with pytest.raises(VolumeError, match="no snapshot ckpt-9"):
+        v.send("ckpt-9")  # before any byte
+    with pytest.raises(VolumeError, match="cat"):
+        b"".join(v._stream(["cat", str(tmp_path / "missing")], 1 << 16))

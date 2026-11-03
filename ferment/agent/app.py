@@ -24,6 +24,7 @@ serializes everything that starts or stops processes.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import datetime as dt
 import hashlib
@@ -34,6 +35,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ferment.clockcheck import read_probes
@@ -207,6 +209,32 @@ def create_agent_app(
         except VolumeError as e:
             raise HTTPException(409, str(e))
         return {"ok": True}
+
+    @app.get("/volume/snapshots/{sid}/send")
+    def send(sid: str, parent: str | None = None):
+        """Snapshot `sid` as a stream (relative to `parent`): for the shelf."""
+        try:
+            return StreamingResponse(_volume().send(sid, parent), media_type="application/zstd")
+        except VolumeError as e:
+            raise HTTPException(404, str(e))
+
+    @app.put("/volume/snapshots/{sid}/receive")
+    async def receive(sid: str, request: Request):
+        """Make snapshot `sid` again from a stream `send` gave."""
+        try:
+            r = _volume().receive(sid)
+        except VolumeError as e:
+            raise HTTPException(409, str(e))
+        try:
+            async for chunk in request.stream():
+                await asyncio.to_thread(r.write, chunk)
+            await asyncio.to_thread(r.close)
+        except VolumeError as e:
+            raise HTTPException(422, str(e))
+        except BaseException:
+            r.abort()
+            raise
+        return {"id": sid}
 
     @app.get("/db/changes")
     def db_changes(start: str, stop: str | None = None):

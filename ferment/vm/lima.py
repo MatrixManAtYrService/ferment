@@ -4,8 +4,9 @@ Free and fast to iterate on, and close enough to a cloud VM for everything
 above the provider: the VM is reached only over ssh (Lima's own port
 forwarding and home-directory mounts are switched off so nothing works here
 that would not work in the cloud). The exception is caches (VMSpec.caches):
-directories under `cache_root` on the Lima host, mounted writable at
-CACHE_MOUNT/<name>, kept when the VM goes.
+directories under `cache_root` on the Lima host (or wherever
+`cache_locations` puts one: e.g. the shelf on an external drive), mounted
+writable at CACHE_MOUNT/<name>, kept when the VM goes.
 
 The Lima host can be this machine or another one (`host`: an ssh
 destination). Remotely, every limactl call runs over ssh, and clients reach
@@ -125,10 +126,18 @@ fi
 """
 
 
-def lima_config(spec: VMSpec, *, private_network: bool = False, cache_root: str = CACHE_ROOT) -> dict:
+def lima_config(
+    spec: VMSpec,
+    *,
+    private_network: bool = False,
+    cache_root: str = CACHE_ROOT,
+    cache_locations: dict[str, str] | None = None,
+) -> dict:
     """`private_network`: on Lima's user-v2 network, where instances reach
     each other (lima-<name>.internal) and still reach the internet.
-    `cache_root`: where spec.caches live on the Lima host."""
+    `cache_root`: where spec.caches live on the Lima host, unless
+    `cache_locations` names a directory for one."""
+    where = cache_locations or {}
     cfg = {
         "vmType": "vz",
         "images": IMAGES,
@@ -138,7 +147,11 @@ def lima_config(spec: VMSpec, *, private_network: bool = False, cache_root: str 
         # A cloud VM can't see the laptop's disk; neither can this one, except
         # for the caches it asked for.
         "mounts": [
-            {"location": f"{cache_root}/{name}", "mountPoint": f"{CACHE_MOUNT}/{name}", "writable": True}
+            {
+                "location": where.get(name, f"{cache_root}/{name}"),
+                "mountPoint": f"{CACHE_MOUNT}/{name}",
+                "writable": True,
+            }
             for name in spec.caches
         ],
         "portForwards": [
@@ -198,12 +211,16 @@ class LimaProvider(Provider):
         control_memory_gib: int | None = None,
         control_disk_gib: int | None = None,
         cache_root: str = CACHE_ROOT,
+        cache_locations: dict[str, str] | None = None,
     ):
         """cpus, memory_gib, disk_gib: the VM that runs the workload (the only
         VM, or a split fermenter's workload VM). control_*: a split
-        fermenter's control VM (the server, builds, the archive)."""
+        fermenter's control VM (the server, builds, the archive).
+        cache_locations: cache name -> a directory on the Lima host for it
+        other than cache_root/<name>."""
         self.lima = LimaHost(host, limactl)
         self.cache_root = cache_root
+        self.cache_locations = dict(cache_locations or {})
         # Names whose guest rebooted since last seen (noticed by ssh_target):
         # callers may need to restart whatever they ran there.
         self.rebooted: set[str] = set()
@@ -324,9 +341,16 @@ class LimaProvider(Provider):
 
         if spec.caches:  # Lima won't mount a directory that doesn't exist
             root = self.cache_root.replace("~", '"$HOME"', 1) if self.cache_root.startswith("~") else self.cache_root
-            self.lima.run("mkdir -p " + " ".join(f"{root}/{shlex.quote(c)}" for c in spec.caches))
+            dirs = [
+                shlex.quote(self.cache_locations[c]) if c in self.cache_locations else f"{root}/{shlex.quote(c)}"
+                for c in spec.caches
+            ]
+            self.lima.run("mkdir -p " + " ".join(dirs))
         cfg = yaml.safe_dump(
-            lima_config(spec, private_network=private_network, cache_root=self.cache_root), sort_keys=False
+            lima_config(
+                spec, private_network=private_network, cache_root=self.cache_root, cache_locations=self.cache_locations
+            ),
+            sort_keys=False,
         )
         # limactl reads the template from stdin with "-"; its progress streams
         # to the terminal (first boot downloads the image, which takes a while).

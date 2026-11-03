@@ -34,11 +34,12 @@ TABLE to find the tables that differ, then a keyed row diff of just those.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 GIB = 1 << 30
@@ -228,6 +229,53 @@ class Volume:
     def list(self) -> list[str]:
         return sorted(p.name for p in self.snapshots.iterdir()) if self.snapshots.exists() else []
 
+    # -- to and from the shelf ---------------------------------------------------------
+
+    def _zstd(self) -> str:
+        return os.environ.get("FERMENT_ZSTD", "zstd")
+
+    def send(self, sid: str, parent: str | None = None, chunk: int = 1 << 20) -> Iterator[bytes]:
+        """Snapshot `sid` as a stream (`btrfs send`, zstd'd) that `receive` makes
+        it again from: whole, or only what differs from snapshot `parent`, which
+        the receiving volume must then have (it or one received from it).
+        Fails before the first byte if either snapshot is missing; a failure
+        partway ends the stream short, so the receiver sees it broken."""
+        path = self._snapshot_path(sid)
+        base = self._snapshot_path(parent) if parent else None
+        for p in (path, base):
+            if p is not None and not p.exists():
+                raise VolumeError(f"no snapshot {p.name}")
+        btrfs = f"{self.bin}/btrfs" if self.bin else "btrfs"
+        argv = ["sudo", "-n", btrfs, "send", "-q", *(["-p", str(base)] if base else []), str(path)]
+        return self._stream(argv, chunk)
+
+    def _stream(self, argv: list[str], chunk: int) -> Iterator[bytes]:
+        send = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        z = subprocess.Popen([self._zstd(), "-q", "-1", "-T0", "-c"], stdin=send.stdout, stdout=subprocess.PIPE)
+        assert send.stdout is not None and z.stdout is not None and send.stderr is not None
+        send.stdout.close()  # z holds it now; a dead z then stops send
+        try:
+            while b := z.stdout.read(chunk):
+                yield b
+        finally:
+            z.stdout.close()
+            z.wait()
+            send.wait()
+            err = send.stderr.read().decode().strip()
+            send.stderr.close()
+        if send.returncode or z.returncode:
+            raise VolumeError(f"{' '.join(argv)}: {err or f'zstd exited {z.returncode}'}")
+
+    def receive(self, sid: str) -> Receiver:
+        """Where a stream from `send` goes to make snapshot `sid` here again
+        (read-only, like any snapshot): write its chunks, then `close()`."""
+        if self._snapshot_path(sid).exists():
+            raise VolumeError(f"snapshot {sid} exists")
+        btrfs = f"{self.bin}/btrfs" if self.bin else "btrfs"
+        made = self._snapshot_path(sid)
+        receive = ["sudo", "-n", btrfs, "receive", "-q", str(self.snapshots)]
+        return Receiver(self._zstd(), receive, made, drop=lambda: self.delete(sid))
+
     def usage(self) -> dict:
         """What the volume takes on the VM's disk, what it may grow to, and what the VM's disk has left."""
         st = os.stat(self.image) if self.image.exists() else None
@@ -237,6 +285,41 @@ class Volume:
             "disk_free_bytes": self.disk()[1],
             "snapshots": self.list(),
         }
+
+
+class Receiver:
+    """`zstd -d | btrfs receive`, fed a chunk at a time. A stream that ends
+    short or fails leaves no snapshot behind."""
+
+    def __init__(self, zstd: str, receive: list[str], made: Path, drop: Callable[[], None]):
+        self.made, self.drop = made, drop
+        self.recv = subprocess.Popen(receive, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.unz = subprocess.Popen([zstd, "-q", "-d", "-c"], stdin=subprocess.PIPE, stdout=self.recv.stdin)
+        assert self.recv.stdin is not None
+        self.recv.stdin.close()  # unz holds it now
+
+    def write(self, chunk: bytes) -> None:
+        assert self.unz.stdin is not None
+        self.unz.stdin.write(chunk)
+
+    def close(self) -> None:
+        assert self.unz.stdin is not None and self.recv.stderr is not None
+        with contextlib.suppress(BrokenPipeError):  # zstd already gave up: said below
+            self.unz.stdin.close()
+        self.unz.wait()
+        self.recv.wait()
+        err = self.recv.stderr.read().decode().strip()
+        if self.unz.returncode or self.recv.returncode or not self.made.exists():
+            self.abort()
+            raise VolumeError(f"receiving {self.made.name}: {err or f'zstd exited {self.unz.returncode}'}")
+
+    def abort(self) -> None:
+        for p in (self.unz, self.recv):
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        if self.made.exists():  # half received: btrfs left a subvolume, writable and incomplete
+            self.drop()
 
 
 def _disk(path: Path) -> tuple[int, int]:
@@ -269,3 +352,16 @@ class VolumeSnapshots:
         if PART not in parts:
             raise VolumeError("that checkpoint has no volume snapshot (it was taken before snapshots were on)")
         self.agent.restore_volume(parts[PART])
+
+    # Optional parts of Versioned, for the shelf: a checkpoint's part as a
+    # stream (relative to an earlier checkpoint's, which the receiver must
+    # have), and made again from one.
+    archive_name = "volume.btrfs.zst"
+
+    def send(self, parts: dict[str, str], base: dict[str, str] | None) -> Iterator[bytes]:
+        if PART not in parts:
+            raise VolumeError("that checkpoint has no volume snapshot")
+        return self.agent.send_volume(parts[PART], (base or {}).get(PART))
+
+    def receive(self, parts: dict[str, str], chunks: Iterator[bytes]) -> None:
+        self.agent.receive_volume(parts[PART], chunks)

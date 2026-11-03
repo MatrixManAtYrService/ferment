@@ -251,6 +251,26 @@ def create_app(
         broadcast("checkpoint", who(request), f"{who(request)} dropped checkpoint {out['id']}'s data")
         return out
 
+    @app.post("/checkpoints/{ref}/archive")
+    def archive_checkpoint(ref: str, request: Request):
+        """Put a checkpoint's data on the shelf (relative to its nearest ancestor that's here)."""
+        try:
+            out = controller.archive(ref)
+        except CheckpointError as e:
+            raise HTTPException(409, str(e)) from e
+        broadcast("checkpoint", who(request), f"{who(request)} archived checkpoint {out['checkpoint_id']}")
+        return out
+
+    @app.post("/checkpoints/{ref}/unarchive")
+    def unarchive_checkpoint(ref: str, request: Request):
+        """Bring a dropped checkpoint's data back from the shelf (restorable again)."""
+        try:
+            out = controller.unarchive(ref)
+        except CheckpointError as e:
+            raise HTTPException(409, str(e)) from e
+        broadcast("checkpoint", who(request), f"{who(request)} brought checkpoint {out['id']} back from the shelf")
+        return out
+
     @app.post("/checkpoints/prune")
     def prune_checkpoints(request: Request, kind: str = "before-restore", keep: int = 3):
         """Drop all but the newest `keep` restorable checkpoints of `kind` (the automatic

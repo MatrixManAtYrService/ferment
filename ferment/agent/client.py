@@ -19,7 +19,7 @@ import hashlib
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -153,6 +153,21 @@ class AgentClient:
 
     def drop_volume(self, sid: str) -> None:
         self._request("DELETE", f"/volume/snapshots/{sid}")
+
+    def send_volume(self, sid: str, parent: str | None = None) -> Iterator[bytes]:
+        """Snapshot `sid` as a stream (ferment.volume.Volume.send); it's read as it's used."""
+        params = {"parent": parent} if parent else {}
+        with self.http.stream("GET", f"/volume/snapshots/{sid}/send", params=params, timeout=None) as r:
+            if r.status_code >= 400:
+                r.read()
+                raise AgentError(f"GET /volume/snapshots/{sid}/send: {r.status_code} {r.text}")
+            yield from r.iter_bytes(1 << 20)
+
+    def receive_volume(self, sid: str, chunks: Iterable[bytes]) -> None:
+        """Make snapshot `sid` from a stream `send_volume` gave."""
+        r = self.http.put(f"/volume/snapshots/{sid}/receive", content=chunks, timeout=None)
+        if r.status_code >= 400:
+            raise AgentError(f"PUT /volume/snapshots/{sid}/receive: {r.status_code} {r.text}")
 
     def db_changes(self, start: str, stop: str | None = None) -> dict:
         params = {"start": start} | ({"stop": stop} if stop else {})

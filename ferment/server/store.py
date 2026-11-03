@@ -172,6 +172,20 @@ MIGRATIONS = [
     ALTER TABLE checkpoints ADD COLUMN value TEXT;
     CREATE INDEX checkpoints_stage ON checkpoints (stage, fingerprint);
     """,
+    """
+    -- A checkpoint's data on the shelf (ferment.shelf): it can be dropped from
+    -- the volume and made again from there. `base`: the checkpoint it was
+    -- taken relative to, which must be here (or made again first) to make it.
+    CREATE TABLE checkpoint_archives (
+        checkpoint_id INTEGER PRIMARY KEY REFERENCES checkpoints(id),
+        shelf       TEXT NOT NULL,          -- the shelf's URL
+        prefix      TEXT NOT NULL,          -- its objects' keys: <prefix>/<store's archive_name>
+        base        INTEGER REFERENCES checkpoints(id),
+        parts       TEXT NOT NULL,          -- JSON: the parts it makes again
+        bytes       INTEGER NOT NULL,
+        real_time   TEXT NOT NULL
+    );
+    """,
 ]
 
 # A claimed source request not finished in this long is up for grabs again
@@ -377,7 +391,28 @@ class Store:
         cp["parts"] = {
             r["store"]: r["ref"] for r in self._rows("SELECT * FROM checkpoint_parts WHERE checkpoint_id = ?", cp["id"])
         }
+        archived = self._rows("SELECT * FROM checkpoint_archives WHERE checkpoint_id = ?", cp["id"])
+        cp["archive"] = {**archived[0], "parts": json.loads(archived[0]["parts"])} if archived else None
         return cp
+
+    def add_archive(
+        self, checkpoint_id: int, *, shelf: str, prefix: str, base: int | None, parts: dict, size: int
+    ) -> dict:
+        with self.lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO checkpoint_archives "
+                "(checkpoint_id, shelf, prefix, base, parts, bytes, real_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (checkpoint_id, shelf, prefix, base, json.dumps(parts), size, _now()),
+            )
+        return self.checkpoint(str(checkpoint_id))["archive"]  # type: ignore[index]
+
+    def set_parts(self, checkpoint_id: int, parts: dict[str, str]) -> None:
+        """A dropped checkpoint's parts, made again (from the shelf)."""
+        with self.lock:
+            self.db.executemany(
+                "INSERT OR REPLACE INTO checkpoint_parts (checkpoint_id, store, ref) VALUES (?, ?, ?)",
+                [(checkpoint_id, store, ref) for store, ref in parts.items()],
+            )
 
     def adopt(self, checkpoint_id: int, stage: str, fingerprint: str, value: object) -> dict:
         """Make an existing checkpoint a stage's: one taken by hand that the stage's steps would make."""
