@@ -13,7 +13,15 @@ stands where those services expect the outbound proxy and:
   are reads in POST's clothing (a query whose arguments are the body: COS's
   app event searches take a merchant list) and are cached like GETs;
 - takes entries through the same toolbox API (`/cache/put`, `/cache/get`)
-  the proxy that fetches them (eda's egress, in record mode) writes to.
+  the proxy that fetches them (eda's egress, in record mode) writes to;
+- composes an answer from units when a read asks about many things at once
+  (a merchant list in the body): a recording's composition for that path
+  says how the request lists its items, which query parameters pick the
+  units (a time window, say) and how it pages. Each item's unit is an entry
+  of its own (`unit_key`), a JSON list; the answer is theirs concatenated
+  in the request's order, then paged. However the caller batches its items,
+  the units are the same. An item with no unit is a miss, unless its window
+  was marked complete (`unit_key(..., COMPLETE)`): then it has none.
 
 Entries are kept in named recordings (the `cache` of each call); a run is
 served from the active one (`PUT /recording`), and precaching writes into
@@ -72,7 +80,12 @@ CREATE TABLE IF NOT EXISTS served (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, cache TEXT NOT NULL, key TEXT NOT NULL,
     response_hash TEXT, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS compositions (
+    cache TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, spec TEXT NOT NULL,
+    PRIMARY KEY (cache, method, path));
 """
+# An item that stands for every item of a unit's window: stored, the window is complete.
+COMPLETE = "*"
 
 
 def cache_key(method: str, upstream_path: str, query: list[tuple[str, str]], body: bytes = b"") -> str:
@@ -81,6 +94,35 @@ def cache_key(method: str, upstream_path: str, query: list[tuple[str, str]], bod
     q = urlencode(sorted(query))
     key = f"{method.upper()} {upstream_path}" + (f"?{q}" if q else "")
     return key + (f" #{hashlib.sha256(body).hexdigest()[:16]}" if body else "")
+
+
+def unit_key(method: str, upstream_path: str, by: dict[str, str], item: str) -> str:
+    """The key of one item's unit of a composed read: its method and path, the
+    query parameters that pick the unit, and the item."""
+    q = urlencode(sorted(by.items()))
+    return f"UNIT {method.upper()} {upstream_path}" + (f"?{q}" if q else "") + f" @{item}"
+
+
+class Composition(BaseModel):
+    """How a read about many items is answered from their units. `items`: how
+    the body lists them ("csv", or "json": a JSON list). `by`: the query
+    parameters that pick the unit. `page`/`page_size`: the paging parameters
+    (0-based page), if it pages."""
+
+    items: str = "csv"
+    by: list[str] = []
+    page: str | None = None
+    page_size: str | None = None
+
+    def item_list(self, body: bytes) -> list[str] | None:
+        text = body.decode(errors="replace")
+        if self.items == "json":
+            try:
+                got = json.loads(text or "[]")
+            except ValueError:
+                return None
+            return [str(i) for i in got] if isinstance(got, list) else None
+        return [i.strip() for i in text.split(",") if i.strip()]
 
 
 def response_hash(status_code: int, content_type: str | None, body: str) -> str:
@@ -129,6 +171,47 @@ class EgressCache:
     def use(self, name: str) -> None:
         with self.lock:
             self.db.execute("INSERT OR REPLACE INTO settings VALUES ('recording', ?)", (name,))
+
+    def compose_as(self, cache: str, method: str, path: str, spec: Composition | None) -> None:
+        """Answer `method path` reads from units (None: stop)."""
+        with self.lock:
+            if spec is None:
+                self.db.execute("DELETE FROM compositions WHERE cache = ? AND method = ? AND path = ?",
+                                (cache, method, path))  # fmt: skip
+            else:
+                self.db.execute("INSERT OR REPLACE INTO compositions VALUES (?, ?, ?, ?)",
+                                (cache, method, path, spec.model_dump_json()))  # fmt: skip
+
+    def compositions(self, cache: str) -> list[dict]:
+        rows = self.db.execute("SELECT method, path, spec FROM compositions WHERE cache = ?", (cache,)).fetchall()
+        return [{"method": m, "path": p, "spec": json.loads(s)} for m, p, s in rows]
+
+    def compose(self, cache: str, method: str, path: str, query: list[tuple[str, str]], body: bytes) -> dict | None:
+        """The answer composed from units, if `method path` is composed and every
+        item has one (or its window is complete); else None (a miss)."""
+        row = self.db.execute(
+            "SELECT spec FROM compositions WHERE cache = ? AND method = ? AND path = ?", (cache, method, path)
+        ).fetchone()
+        if row is None:
+            return None
+        spec = Composition.model_validate_json(row[0])
+        items, params = spec.item_list(body), dict(query)
+        if items is None or any(b not in params for b in spec.by):
+            return None
+        by = {b: params[b] for b in spec.by}
+        complete = self.get(cache, unit_key(method, path, by, COMPLETE)) is not None
+        out: list = []
+        for item in items:
+            unit = self.get(cache, unit_key(method, path, by, item))
+            if unit is None and not complete:
+                return None
+            out += [] if unit is None else json.loads(unit["body"])
+        if spec.page is not None and spec.page_size is not None and spec.page_size in params:
+            size, page = int(params[spec.page_size]), int(params.get(spec.page, "0"))
+            out = out[page * size : (page + 1) * size]
+        text = json.dumps(out, separators=(",", ":"))
+        return {"status_code": 200, "body": text, "content_type": "application/json",
+                "response_hash": response_hash(200, "application/json", text)}  # fmt: skip
 
     def get(self, cache: str, key: str) -> dict | None:
         row = self.db.execute(
@@ -252,6 +335,13 @@ class Recording(BaseModel):
     name: str
 
 
+class CompositionPut(BaseModel):
+    cache_name: str | None = None
+    method: str
+    path: str
+    spec: Composition | None  # None: stop composing it
+
+
 class CachePut(BaseModel):
     cache_name: str | None = None
     key: str
@@ -285,8 +375,9 @@ def create_egress_app(cache: EgressCache, default_cache: str, read_posts: tuple[
             cache.wrote(name, method, upstream_path)
             return Response(status_code=200)  # faked, as the recording proxy fakes them
         body = await request.body()
-        key = cache_key(method, upstream_path, list(request.query_params.multi_items()), body)
-        hit = cache.get(name, key)
+        query = list(request.query_params.multi_items())
+        key = cache_key(method, upstream_path, query, body)
+        hit = cache.get(name, key) or cache.compose(name, method, upstream_path, query, body)
         if hit is None:
             kept = {h: request.headers[h] for h in KEPT_HEADERS if h in request.headers}
             cache.miss(name, key, env, body.decode(errors="replace"), kept)
@@ -322,6 +413,16 @@ def create_egress_app(cache: EgressCache, default_cache: str, read_posts: tuple[
         for e in req.entries:
             cache.put(e.cache_name or name, e.key, e.status_code, e.body, e.content_type, e.meta)
         return {"stored": len(req.entries)}
+
+    @app.put("/compositions")
+    def compose_as(req: CompositionPut):
+        """Answer a path's reads from units (see Composition), in a recording."""
+        cache.compose_as(req.cache_name or active(), req.method.upper(), req.path, req.spec)
+        return {"ok": True}
+
+    @app.get("/compositions")
+    def compositions(cache_name: str | None = None):
+        return cache.compositions(cache_name or active())
 
     @app.post("/cache/get")
     def get(req: CacheGet):

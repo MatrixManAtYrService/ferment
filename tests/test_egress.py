@@ -1,6 +1,8 @@
+import json
+
 from fastapi.testclient import TestClient
 
-from ferment.egress import EgressCache, cache_key, create_egress_app, manifest, response_hash
+from ferment.egress import COMPLETE, EgressCache, cache_key, create_egress_app, manifest, response_hash, unit_key
 
 
 def test_keys_are_the_recording_proxys_own():
@@ -150,3 +152,56 @@ def test_many_entries_are_stored_at_once_and_stop_being_misses(tmp_path):
     ]}).json()  # fmt: skip
     assert out == {"stored": 2} and client.get("/misses").json() == []
     assert client.get("/proxy/na/cos/v1/b").text == "b"
+
+
+EVENTS = "cos/v3/internal/app_metered_events"
+DAY = {"start": "2026-10-23T00:00:00.000Z", "stop": "2026-10-24T00:00:00.000Z"}
+
+
+def _units(client, units: dict[str, list], complete: bool = False) -> None:
+    client.put("/compositions", json={"method": "POST", "path": EVENTS,
+                                      "spec": {"items": "csv", "by": ["start", "stop"], "page": "page",
+                                               "page_size": "pageSize"}})  # fmt: skip
+    entries = [{"key": unit_key("POST", EVENTS, DAY, m), "status_code": 200, "body": json.dumps(evs)}
+               for m, evs in units.items()]  # fmt: skip
+    if complete:
+        entries.append({"key": unit_key("POST", EVENTS, DAY, COMPLETE), "status_code": 200, "body": "[]"})
+    client.post("/cache/put_many", json={"entries": entries})
+
+
+def test_a_read_about_many_items_is_composed_from_their_units_however_they_are_batched(tmp_path):
+    client = TestClient(create_egress_app(EgressCache(tmp_path / "e.sqlite"), "fermenter", ("cos/v3/internal/app_",)))
+    _units(client, {"M1": [{"e": 1}, {"e": 2}], "M2": [{"e": 3}], "M3": []})
+    params = {**DAY, "page": "0", "pageSize": "1000"}
+    got = client.post(f"/proxy/na/{EVENTS}", params=params, content=b"M2,M1")
+    assert got.status_code == 200 and got.json() == [{"e": 3}, {"e": 1}, {"e": 2}]  # the request's order
+    assert client.post(f"/proxy/na/{EVENTS}", params=params, content=b"M3,M1").json() == [{"e": 1}, {"e": 2}]
+    paged = {**DAY, "page": "1", "pageSize": "2"}
+    assert client.post(f"/proxy/na/{EVENTS}", params=paged, content=b"M1,M2").json() == [{"e": 3}]
+    # Served like any hit: numbered, with its answer's hash (so manifests cover it).
+    hits = client.get("/hits").json()
+    assert len(hits) == 3 and all(h["response_hash"] for h in hits)
+    assert client.get("/compositions").json()[0]["spec"]["by"] == ["start", "stop"]
+
+
+def test_an_item_without_a_unit_misses_unless_its_window_is_complete(tmp_path):
+    client = TestClient(create_egress_app(EgressCache(tmp_path / "e.sqlite"), "fermenter", ("cos/v3/internal/app_",)))
+    _units(client, {"M1": [{"e": 1}]})
+    params = {**DAY, "page": "0", "pageSize": "1000"}
+    assert client.post(f"/proxy/na/{EVENTS}", params=params, content=b"M1,M9").status_code == 511
+    assert [m["body"] for m in client.get("/misses").json()] == ["M1,M9"]  # the request, as any miss keeps it
+    other_day = {"start": "2026-10-22T00:00:00.000Z", "stop": "2026-10-23T00:00:00.000Z", "pageSize": "1000"}
+    _units(client, {}, complete=True)
+    assert client.post(f"/proxy/na/{EVENTS}", params=params, content=b"M1,M9").json() == [{"e": 1}]
+    assert client.post(f"/proxy/na/{EVENTS}", params=other_day, content=b"M1").status_code == 511  # not its window
+
+
+def test_items_can_be_a_json_list_and_composing_can_stop(tmp_path):
+    client = TestClient(create_egress_app(EgressCache(tmp_path / "e.sqlite"), "fermenter"))
+    client.put("/compositions", json={"method": "GET", "path": "cos/v3/developer-apps", "spec": {"items": "json"}})
+    client.post("/cache/put", json={"key": unit_key("GET", "cos/v3/developer-apps", {}, "A1"), "status_code": 200,
+                                    "body": '[{"id": "A1"}]'})  # fmt: skip
+    got = client.request("GET", "/proxy/na/cos/v3/developer-apps", content=b'["A1"]')
+    assert got.json() == [{"id": "A1"}]
+    client.put("/compositions", json={"method": "GET", "path": "cos/v3/developer-apps", "spec": None})
+    assert client.request("GET", "/proxy/na/cos/v3/developer-apps", content=b'["A1"]').status_code == 511
