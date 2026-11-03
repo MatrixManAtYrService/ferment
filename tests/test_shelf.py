@@ -151,5 +151,8 @@ def test_forever_drops_named_ones_on_request_and_takes_the_shelf_copy_too(shelve
     assert not tc.store.checkpoint("a")["parts"] and sorted(store.commits) == ["c1", "c4"]  # loaded, the before-restore
     with pytest.raises(CheckpointError, match="no versioned data"):
         tc.restore("a", wait_ready=False)
-    with pytest.raises(CheckpointError, match="where the workload is"):
-        tc.drop("loaded", forever=True)
+    head = tc.store.head()
+    with pytest.raises(CheckpointError, match="named or a stage|where the workload is"):
+        tc.drop(str(head))
+    tc.drop(str(head), forever=True)  # the live data stays; only the way back to it goes
+    assert not tc.store.checkpoint(str(head))["parts"]

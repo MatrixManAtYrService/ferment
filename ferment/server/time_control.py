@@ -281,9 +281,9 @@ class TimeController:
         if (cp["name"] or cp.get("stage")) and not forever:
             raise CheckpointError(f"checkpoint {cp['id']} is named or a stage's: keeping it")
         with self.lock:
-            if cp["id"] == self.store.head():
+            if cp["id"] == self.store.head() and not forever:
                 raise CheckpointError(f"checkpoint {cp['id']} is where the workload is: keeping it")
-            if forever:
+            if forever:  # the live data isn't the snapshot's: only the way back to it goes
                 needed = self.store.archives_based_on(cp["id"])
                 if needed:
                     raise CheckpointError(
