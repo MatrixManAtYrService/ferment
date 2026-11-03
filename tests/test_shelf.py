@@ -130,3 +130,26 @@ def test_without_a_shelf_a_drop_is_for_good(shelved):
     tc.drop(str(a["id"]))
     with pytest.raises(CheckpointError, match="no versioned data"):
         tc.restore(str(a["id"]), wait_ready=False)
+
+
+def test_forever_drops_named_ones_on_request_and_takes_the_shelf_copy_too(shelved):
+    tc, store, shelf = shelved
+    tc.checkpoint("loaded", name="loaded")
+    store.data = 1
+    tc.checkpoint("a", name="a")
+    store.data = 2
+    b = tc.checkpoint("b")
+    tc.restore("loaded", wait_ready=False)
+    tc.drop(str(b["id"]))  # archived relative to a
+    with pytest.raises(CheckpointError, match="named"):
+        tc.drop("a")  # not without forever
+    with pytest.raises(CheckpointError, match=rf"base of archived checkpoint\(s\) \[{b['id']}\]"):
+        tc.drop("a", forever=True)
+    tc.drop(str(b["id"]), forever=True)  # already dropped: just its shelf copy
+    assert shelf.list() == [] and tc.store.checkpoint(str(b["id"]))["archive"] is None
+    tc.drop("a", forever=True)
+    assert not tc.store.checkpoint("a")["parts"] and sorted(store.commits) == ["c1", "c4"]  # loaded, the before-restore
+    with pytest.raises(CheckpointError, match="no versioned data"):
+        tc.restore("a", wait_ready=False)
+    with pytest.raises(CheckpointError, match="where the workload is"):
+        tc.drop("loaded", forever=True)

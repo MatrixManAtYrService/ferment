@@ -242,13 +242,15 @@ def create_app(
         return out
 
     @app.delete("/checkpoints/{ref}")
-    def drop_checkpoint(ref: str, request: Request):
-        """Free a checkpoint's data (kept in the tree, unrestorable). Not named, stage or current ones."""
+    def drop_checkpoint(ref: str, request: Request, forever: bool = False):
+        """Free a checkpoint's data (archived first, with a shelf). Not named, stage or current
+        ones, unless `forever`: then named and stage ones too, and from the shelf as well."""
         try:
-            out = controller.drop(ref)
+            out = controller.drop(ref, forever=forever)
         except CheckpointError as e:
             raise HTTPException(409, str(e)) from e
-        broadcast("checkpoint", who(request), f"{who(request)} dropped checkpoint {out['id']}'s data")
+        how = "for good" if forever else "(kept on the shelf)" if out.get("archive") else ""
+        broadcast("checkpoint", who(request), f"{who(request)} dropped checkpoint {out['id']}'s data {how}".strip())
         return out
 
     @app.post("/checkpoints/{ref}/archive")

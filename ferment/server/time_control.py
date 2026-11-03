@@ -267,26 +267,46 @@ class TimeController:
             cp = self._get(ref)
             return cp if cp["parts"] else self._unarchive(cp)
 
-    def drop(self, ref: str) -> dict:
+    def drop(self, ref: str, forever: bool = False) -> dict:
         """Free checkpoint `ref`'s data (a volume snapshot holds what's changed
         since, and they add up). Named and stage checkpoints are kept, and so is
         the one the workload is on. With a shelf, it's archived first and can
-        be restored still; without one it stays in the tree, unrestorable."""
-        cp = self.store.checkpoint(ref)
-        if cp is None:
-            raise CheckpointError(f"no checkpoint {ref!r}")
-        if cp["name"] or cp.get("stage"):
+        be restored still; without one it stays in the tree, unrestorable.
+
+        `forever`: its data goes from the volume and the shelf both, named or a
+        stage's too (asked for by name: prune never does this). Not while an
+        archive elsewhere was taken relative to it (that one couldn't be made
+        again): forget those first. It stays in the tree, a clock reading."""
+        cp = self._get(ref)
+        if (cp["name"] or cp.get("stage")) and not forever:
             raise CheckpointError(f"checkpoint {cp['id']} is named or a stage's: keeping it")
         with self.lock:
             if cp["id"] == self.store.head():
                 raise CheckpointError(f"checkpoint {cp['id']} is where the workload is: keeping it")
-            if self.shelf is not None and cp["parts"]:
+            if forever:
+                needed = self.store.archives_based_on(cp["id"])
+                if needed:
+                    raise CheckpointError(
+                        f"checkpoint {cp['id']} is the base of archived checkpoint(s) {needed}: "
+                        "drop those forever first"
+                    )
+            elif self.shelf is not None and cp["parts"]:
                 cp = {**cp, "archive": self._archive(cp)}
             for store in self.versioned:
                 drop = getattr(store, "drop", None)
                 if drop is not None and cp["parts"]:
                     drop(cp["parts"])
             self.store.drop_parts(cp["id"])
+            if forever and cp["archive"]:
+                if self.shelf is None or cp["archive"]["shelf"] != self.shelf.url:
+                    raise CheckpointError(
+                        f"checkpoint {cp['id']}'s archive is on {cp['archive']['shelf']}, which isn't mounted here"
+                    )
+                for store in self.versioned:
+                    if getattr(store, "archive_name", None):
+                        self.shelf.delete(f"{cp['archive']['prefix']}/{store.archive_name}")  # type: ignore[attr-defined]
+                self.store.delete_archive(cp["id"])
+                cp = {**cp, "archive": None}
         return {**cp, "parts": {}}
 
     def prune(self, kind: str = "before-restore", keep: int = 3) -> list[int]:

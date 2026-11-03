@@ -406,6 +406,15 @@ class Store:
             )
         return self.checkpoint(str(checkpoint_id))["archive"]  # type: ignore[index]
 
+    def archives_based_on(self, checkpoint_id: int) -> list[int]:
+        """Archived checkpoints taken relative to this one."""
+        rows = self._rows("SELECT checkpoint_id FROM checkpoint_archives WHERE base = ?", checkpoint_id)
+        return [r["checkpoint_id"] for r in rows]
+
+    def delete_archive(self, checkpoint_id: int) -> None:
+        with self.lock:
+            self.db.execute("DELETE FROM checkpoint_archives WHERE checkpoint_id = ?", (checkpoint_id,))
+
     def set_parts(self, checkpoint_id: int, parts: dict[str, str]) -> None:
         """A dropped checkpoint's parts, made again (from the shelf)."""
         with self.lock:
