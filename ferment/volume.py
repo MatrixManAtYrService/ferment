@@ -15,7 +15,12 @@ in the same instant). Clock changes and restores stop the workload anyway.
 
 The filesystem is an image file on the VM's own disk, loop-mounted at
 `<state>/volume` (sparse: it takes what's written), with subvolumes
-`live` and `snapshots/<id>`. `live` holds every directory of state the
+`live` and `snapshots/<id>`. The image is capped so that, full, it still
+leaves the VM's disk `reserve` bytes: a volume that fills fails the
+workload's writes, but not the VM's (logs, the journal, the server). A
+directory `scratch/` beside the subvolumes holds what needs room but no
+snapshots (`scratch` dirs: the database's temp files), each linked from its
+usual path like `dirs`. `live` holds every directory of state the
 workload keeps (the database's data dir, a scheduler's metadata: `dirs`),
 each at `live/<name>` with its usual path a link there, so one snapshot cuts
 them all in the same instant. `Volume` runs where the database does (the workload
@@ -36,6 +41,8 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+GIB = 1 << 30
+RESERVE = 15 * GIB  # what a full volume still leaves on the VM's disk
 SNAPSHOT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PART = "volume:data"
 BINLOG_PART = "volume:binlog"  # where the binlog was at the snapshot: file:position
@@ -59,22 +66,27 @@ class Volume:
         dirs: dict[str, Path],
         btrfs_bin: str | None = None,
         run: Callable[[list[str]], str] = _sh,
-        size_bytes: Callable[[], int] | None = None,
+        disk: Callable[[], tuple[int, int]] | None = None,
+        scratch: dict[str, Path] | None = None,
+        reserve: int = RESERVE,
     ):
         """`dirs`: name -> where the workload expects it (moved onto the volume
-        by `ensure`; the first is the database's data dir). `btrfs_bin`:
-        btrfs-progs' bin dir (FERMENT_BTRFS_BIN): by path, because sudo resets
-        PATH."""
+        by `ensure`; the first is the database's data dir). `scratch`: the
+        same, for dirs kept out of snapshots (their contents are dropped on the
+        move). `btrfs_bin`: btrfs-progs' bin dir (FERMENT_BTRFS_BIN): by path,
+        because sudo resets PATH. `disk`: the VM disk's (total, free) bytes."""
         self.state = state
         self.dirs = dirs
+        self.scratch_dirs = scratch or {}
+        self.reserve = reserve
         self.bin = btrfs_bin or os.environ.get("FERMENT_BTRFS_BIN", "")
         self.run = run
         self.image = state / "volume.btrfs"
         self.mount = state / "volume"
         self.live = self.mount / "live"
         self.snapshots = self.mount / "snapshots"
-        # The image may grow to the size of the disk it's on (it's sparse).
-        self.size_bytes = size_bytes or (lambda: os.statvfs(state).f_blocks * os.statvfs(state).f_frsize)
+        self.scratch = self.mount / "scratch"
+        self.disk = disk or (lambda: _disk(state))
 
     def _btrfs(self, *args: str) -> str:
         return self.run(["sudo", "-n", f"{self.bin}/btrfs" if self.bin else "btrfs", *args])
@@ -103,7 +115,7 @@ class Volume:
         done = []
         if not self.image.exists():
             self.state.mkdir(parents=True, exist_ok=True)
-            self.run(["truncate", "-s", str(self.size_bytes()), str(self.image)])
+            self.run(["truncate", "-s", str(self._cap()), str(self.image)])
             mkfs = f"{self.bin}/mkfs.btrfs" if self.bin else "mkfs.btrfs"
             self.run([mkfs, "-q", str(self.image)])
             done.append(f"made {self.image}")
@@ -117,8 +129,24 @@ class Volume:
             self.run(["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(self.live)])
             done.append("made the live subvolume")
         self.snapshots.mkdir(exist_ok=True)
+        self.scratch.mkdir(exist_ok=True)
         if self._relayout():
             done.append(f"moved the old layout into live/{next(iter(self.dirs))}")
+        done += self._fit()
+        for name, path in self.scratch_dirs.items():
+            target = self.scratch / name
+            target.mkdir(exist_ok=True)
+            if path.is_symlink() and Path(os.readlink(path)) == target:
+                continue
+            if workload_running and path.is_dir() and not path.is_symlink() and any(path.iterdir()):
+                done.append(f"{path} moves onto it when the workload is stopped (in use now)")
+                continue
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.exists():
+                shutil.rmtree(path)  # scratch: nothing in it outlives the process using it
+            path.symlink_to(target)
+            done.append(f"{path} is on it now (scratch: not snapshotted)")
         for name, path in self.dirs.items():
             target = self.live / name
             if path.is_symlink():
@@ -139,6 +167,35 @@ class Volume:
             target.mkdir(exist_ok=True)
             path.symlink_to(target)
         return done
+
+    def _cap(self) -> int:
+        """The image's size: what it has, plus what the disk has left beyond
+        the reserve (so it can never take the reserve), in whole GiB."""
+        _, free = self.disk()
+        allocated = os.stat(self.image).st_blocks * 512 if self.image.exists() else 0
+        return max(0, allocated + free - self.reserve) // GIB * GIB
+
+    def _fit(self) -> list[str]:
+        """Resize the mounted image to its cap: smaller when the disk filled up
+        around it (if what's in it fits), bigger when room came back."""
+        size, cap = os.stat(self.image).st_size, self._cap()
+        if abs(size - cap) < GIB:
+            return []
+        loop = self.run(["losetup", "-j", str(self.image)]).split(":", 1)[0]
+        if not loop:
+            return [f"not resized: no loop device for {self.image}"]
+        try:
+            if cap < size:  # the filesystem first, then the file under it
+                self._btrfs("filesystem", "resize", str(cap), str(self.mount))
+                self.run(["truncate", "-s", str(cap), str(self.image)])
+                self.run(["sudo", "-n", "losetup", "-c", loop])
+            else:  # the file first, then the filesystem over it
+                self.run(["truncate", "-s", str(cap), str(self.image)])
+                self.run(["sudo", "-n", "losetup", "-c", loop])
+                self._btrfs("filesystem", "resize", "max", str(self.mount))
+        except VolumeError as e:
+            return [f"not resized to {cap // GIB} GiB (the disk keeps {self.reserve // GIB} GiB free): {e}"]
+        return [f"resized from {size // GIB} to {cap // GIB} GiB (the disk keeps {self.reserve // GIB} GiB free)"]
 
     def _snapshot_path(self, sid: str) -> Path:
         if not SNAPSHOT_ID.match(sid):
@@ -172,14 +229,19 @@ class Volume:
         return sorted(p.name for p in self.snapshots.iterdir()) if self.snapshots.exists() else []
 
     def usage(self) -> dict:
-        """What the volume takes on the VM's disk, and what the VM's disk has left."""
+        """What the volume takes on the VM's disk, what it may grow to, and what the VM's disk has left."""
         st = os.stat(self.image) if self.image.exists() else None
-        fs = os.statvfs(self.state)
         return {
             "image_bytes": st.st_blocks * 512 if st else 0,  # allocated, not apparent: it's sparse
-            "disk_free_bytes": fs.f_bavail * fs.f_frsize,
+            "image_cap_bytes": st.st_size if st else 0,
+            "disk_free_bytes": self.disk()[1],
             "snapshots": self.list(),
         }
+
+
+def _disk(path: Path) -> tuple[int, int]:
+    fs = os.statvfs(path)
+    return fs.f_blocks * fs.f_frsize, fs.f_bavail * fs.f_frsize
 
 
 class VolumeSnapshots:

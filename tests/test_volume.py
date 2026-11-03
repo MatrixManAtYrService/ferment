@@ -1,3 +1,4 @@
+import os
 import shutil
 from pathlib import Path
 
@@ -12,13 +13,19 @@ class FakeBtrfs:
     def __init__(self):
         self.calls: list[list[str]] = []
         self.mounted = False
+        self.resize_fails = False
 
     def __call__(self, argv: list[str]) -> str:
         self.calls.append(argv)
         args = argv[2:] if argv[:2] == ["sudo", "-n"] else argv
         cmd = Path(args[0]).name
         if cmd == "truncate":
-            Path(args[-1]).write_bytes(b"")
+            Path(args[-1]).touch()
+            os.truncate(args[-1], int(args[2]))  # sparse, as on the VM
+        elif cmd == "losetup" and args[1] == "-j":
+            return f"/dev/loop0: []: ({args[2]})"
+        elif cmd == "btrfs" and args[1:3] == ["filesystem", "resize"] and self.resize_fails:
+            raise VolumeError("ERROR: unable to resize: No space left on device")
         elif cmd == "mount":
             self.mounted = True
         elif cmd == "btrfs" and args[1:3] == ["subvolume", "create"]:
@@ -33,10 +40,22 @@ class FakeBtrfs:
         return ""
 
 
-def _volume(tmp_path, monkeypatch) -> tuple[Volume, FakeBtrfs]:
+GIB = 1 << 30
+
+
+def _volume(tmp_path, monkeypatch, disk: list[int] | None = None) -> tuple[Volume, FakeBtrfs]:
+    """`disk`: the VM disk's [total, free] in GiB (a list: a test changes it as the disk fills)."""
     fake = FakeBtrfs()
+    disk = disk if disk is not None else [100, 50]
     dirs = {"mysql84": tmp_path / "mysql84", "airflow3": tmp_path / "airflow3"}
-    v = Volume(tmp_path, dirs, btrfs_bin="/nix/btrfs/bin", run=fake, size_bytes=lambda: 10**9)
+    v = Volume(
+        tmp_path,
+        dirs,
+        btrfs_bin="/nix/btrfs/bin",
+        run=fake,
+        disk=lambda: (disk[0] * GIB, disk[1] * GIB),
+        scratch={"mysql84-tmp": tmp_path / "mysql84-tmp"},
+    )
     monkeypatch.setattr(Volume, "mounted", lambda self: fake.mounted)
     return v, fake
 
@@ -189,3 +208,60 @@ def test_the_old_one_dir_layout_is_converted_and_its_checkpoints_still_restore(t
     v.restore("ckpt-old")  # an old-layout snapshot: converted as it comes back
     assert (tmp_path / "mysql84" / "ibdata1").read_text() == "old rows"
     assert (tmp_path / "airflow3").is_dir()  # not dangling, though that checkpoint predates it
+
+
+def test_a_new_image_leaves_the_reserve_free(tmp_path, monkeypatch):
+    v, _ = _volume(tmp_path, monkeypatch, disk=[100, 50])
+    v.ensure()
+    assert v.image.stat().st_size == 35 * GIB  # 50 free, less the 15 reserve
+
+
+def test_the_image_shrinks_when_the_disk_fills_around_it_and_grows_back(tmp_path, monkeypatch):
+    disk = [100, 50]
+    v, fake = _volume(tmp_path, monkeypatch, disk)
+    v.ensure()
+    disk[1] = 20  # logs and builds took 30 GiB outside the volume
+    fake.calls.clear()
+    assert v.ensure() == ["resized from 35 to 5 GiB (the disk keeps 15 GiB free)"]
+    resize = ["sudo", "-n", "/nix/btrfs/bin/btrfs", "filesystem", "resize", str(5 * GIB), str(v.mount)]
+    assert fake.calls.index(resize) < fake.calls.index(["truncate", "-s", str(5 * GIB), str(v.image)])
+    assert ["sudo", "-n", "losetup", "-c", "/dev/loop0"] in fake.calls
+    disk[1] = 60
+    assert v.ensure() == ["resized from 5 to 45 GiB (the disk keeps 15 GiB free)"]
+    assert v.image.stat().st_size == 45 * GIB
+
+
+def test_a_shrink_that_doesnt_fit_is_reported_and_leaves_the_image(tmp_path, monkeypatch):
+    disk = [100, 50]
+    v, fake = _volume(tmp_path, monkeypatch, disk)
+    v.ensure()
+    disk[1], fake.resize_fails = 20, True
+    (done,) = v.ensure()
+    assert done.startswith("not resized to 5 GiB") and "No space left" in done
+    assert v.image.stat().st_size == 35 * GIB
+
+
+def test_scratch_dirs_live_on_the_volume_but_out_of_snapshots(tmp_path, monkeypatch):
+    v, _ = _volume(tmp_path, monkeypatch)
+    (tmp_path / "mysql84-tmp").mkdir()
+    (tmp_path / "mysql84-tmp" / "#sql1.ibd").write_text("leftover")
+    assert f"{tmp_path / 'mysql84-tmp'} is on it now (scratch: not snapshotted)" in v.ensure()
+    assert (tmp_path / "mysql84-tmp").resolve() == (v.scratch / "mysql84-tmp").resolve()
+    assert not (v.scratch / "mysql84-tmp" / "#sql1.ibd").exists()  # temp files don't move
+    (tmp_path / "mysql84-tmp" / "#sql2.ibd").write_text("sorting")
+    v.snapshot("ckpt-1")
+    assert list((v.snapshots / "ckpt-1").iterdir()) and not (v.snapshots / "ckpt-1" / "mysql84-tmp").exists()
+    assert v.ensure() == []
+
+
+def test_a_scratch_dir_in_use_waits_for_the_workload_to_stop(tmp_path, monkeypatch):
+    v, _ = _volume(tmp_path, monkeypatch)
+    (tmp_path / "mysql84").mkdir()
+    v.ensure()  # the data dir is moved; the workload starts
+    (tmp_path / "mysql84-tmp").unlink()
+    (tmp_path / "mysql84-tmp").mkdir()
+    (tmp_path / "mysql84-tmp" / "#sql1.ibd").write_text("sorting")
+    assert v.ensure(workload_running=True) == [
+        f"{tmp_path / 'mysql84-tmp'} moves onto it when the workload is stopped (in use now)"
+    ]
+    assert (tmp_path / "mysql84-tmp" / "#sql1.ibd").exists()

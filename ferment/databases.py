@@ -119,6 +119,12 @@ class MySQL(Database):
     def data_dir(self) -> Path:
         return self.state_dir / "mysql84"
 
+    @property
+    def tmp_dir(self) -> Path:
+        """Temp tables and sort files: big during a bulk insert or a wide
+        GROUP BY, so not the OS's /tmp (a volume can give it room of its own)."""
+        return self.state_dir / "mysql84-tmp"
+
     def tool(self, name: str) -> str:
         return str(Path(self.bin) / name) if self.bin else name
 
@@ -143,8 +149,9 @@ class MySQL(Database):
             f"CREATE USER IF NOT EXISTS 'root'@'{h}'; GRANT ALL ON *.* TO 'root'@'{h}' WITH GRANT OPTION;"
             for h in hosts
         )
+        dirs = f"{shlex.quote(str(self.state_dir))} {shlex.quote(str(self.tmp_dir))}/"  # tmp may be a link
         return (
-            f"mkdir -p {shlex.quote(str(self.state_dir))}; echo {shlex.quote(sql)} > {init}; "
+            f"mkdir -p {dirs}; echo {shlex.quote(sql)} > {init}; "
             f"[ -d {d}/mysql ] || {mysqld} --no-defaults --initialize-insecure --datadir={d} >/dev/null 2>&1"
         )
 
@@ -159,7 +166,7 @@ class MySQL(Database):
     def _server_args(self, port: int, socket: Path) -> list[str]:
         return [
             self.tool("mysqld"), "--no-defaults", f"--datadir={self.data_dir}", f"--port={port}",
-            f"--socket={socket}", f"--bind-address={self.bind}", "--mysqlx=OFF",
+            f"--socket={socket}", f"--bind-address={self.bind}", "--mysqlx=OFF", f"--tmpdir={self.tmp_dir}",
             f"--pid-file={self.state_dir / f'mysql84.{port}.pid'}", f"--init-file={self._init_file}",
             # The fake clock jumps (a month, or back to a checkpoint): don't let
             # it expire binlogs, which are how checkpoints get diffed.
