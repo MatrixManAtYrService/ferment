@@ -33,7 +33,7 @@ def test_summaries_give_peaks_per_vm_and_nested_number():
 
 def test_process_trees_sum_their_descendants():
     procs = {1: (0, "init", 10), 10: (1, "java", 1024 * 100), 11: (10, "java", 1024 * 50), 12: (1, "mysqld", 1024 * 20)}
-    assert measure._tree_rss_mib(procs, {"bookkeeper": 10, "mysql": 12, "gone": 99}) == {
+    assert measure._tree_mib(procs, {"bookkeeper": 10, "mysql": 12, "gone": 99}) == {
         "bookkeeper": 150.0, "mysql": 20.0, "gone": 0.0,
     }  # fmt: skip
 

@@ -10,7 +10,7 @@ on a split fermenter (the workload VM's is the fake one, so it isn't used).
 A sample, per VM: CPU busy (%), load, memory used and total (MiB), swap
 used, pressure (PSI `some avg10`, cpu/memory/io), disk used (GiB) for the
 paths asked, and memory per process: each workload process's whole tree
-(its RSS summed, e.g. a JVM and what it forks) when the VM runs a workload,
+(its PSS summed: a JVM and what it forks, shared pages counted once) when the VM runs a workload,
 else the largest processes by name.
 
 Marks name stretches of time (an experiment, a stage being made, a segment
@@ -89,16 +89,24 @@ def _procs() -> dict[int, tuple[int, str, int]]:
             continue
         comm = stat[stat.find("(") + 1 : stat.rfind(")")]
         fields = stat[stat.rfind(")") + 2 :].split()
-        rss = 0
-        for line in _read(f"/proc/{d}/status").splitlines():
-            if line.startswith("VmRSS:"):
-                rss = int(line.split()[1])
-                break
-        out[int(d)] = (int(fields[1]), comm, rss)
+        out[int(d)] = (int(fields[1]), comm, _pss_kib(d))
     return out
 
 
-def _tree_rss_mib(procs: dict[int, tuple[int, str, int]], roots: dict[str, int]) -> dict[str, float]:
+def _pss_kib(pid: str) -> int:
+    """A process's proportional set size: its share of the pages it shares with
+    others (forked workers share most of theirs), so a tree's sum is what it
+    really takes. RSS where smaps_rollup can't be read (another user's process)."""
+    for line in _read(f"/proc/{pid}/smaps_rollup").splitlines():
+        if line.startswith("Pss:"):
+            return int(line.split()[1])
+    for line in _read(f"/proc/{pid}/status").splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1])
+    return 0
+
+
+def _tree_mib(procs: dict[int, tuple[int, str, int]], roots: dict[str, int]) -> dict[str, float]:
     """Each named root pid's RSS with all its descendants', in MiB."""
     children: dict[int, list[int]] = defaultdict(list)
     for pid, (ppid, _, _) in procs.items():
@@ -142,7 +150,7 @@ def collect(cpu: CpuMeter, disks: dict[str, Path] | None = None, workload: Itera
         "psi_mem": _psi("memory"),
         "psi_io": _psi("io"),
         "disk_used_gib": {},
-        "processes_mib": _tree_rss_mib(procs, roots) if roots else _top_by_name(procs),
+        "processes_mib": _tree_mib(procs, roots) if roots else _top_by_name(procs),
     }
     for label, path in (disks or {}).items():
         with contextlib.suppress(OSError):
@@ -200,7 +208,7 @@ def summarize(samples: list[dict]) -> dict:
         out[vm] = {
             k: {
                 "peak": max(vs),
-                "p95": statistics.quantiles(vs, n=20)[-1] if len(vs) >= 2 else vs[0],
+                "p95": statistics.quantiles(vs, n=20, method="inclusive")[-1] if len(vs) >= 2 else vs[0],
                 "mean": round(statistics.fmean(vs), 2),
                 "n": len(vs),
             }
