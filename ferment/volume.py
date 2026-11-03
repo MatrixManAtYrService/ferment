@@ -198,6 +198,11 @@ class VolumeSnapshots:
             parts[BINLOG_PART] = snap["binlog"]
         return parts
 
+    def drop(self, parts: dict[str, str]) -> None:
+        """Free what the checkpoint's snapshot holds (it can't be restored after)."""
+        if PART in parts:
+            self.agent.drop_volume(parts[PART])
+
     def restore(self, parts: dict[str, str]) -> None:
         if PART not in parts:
             raise VolumeError("that checkpoint has no volume snapshot (it was taken before snapshots were on)")

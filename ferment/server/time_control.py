@@ -37,6 +37,8 @@ class Versioned(Protocol):
 
     def restore(self, parts: dict[str, str]) -> None: ...
 
+    # Optional: `drop(parts)` frees a checkpoint's part for good.
+
 
 # Told each step of a clock change, restore, or relaunch as it finishes:
 # stop, checkpoint, restore, clock, start, ready (only those that apply).
@@ -176,6 +178,38 @@ class TimeController:
                 message=message, kind="stage" if stage else "manual", who=who, name=name,
                 running=self.supervisor.running, stage=stage,
             )  # fmt: skip
+
+    def drop(self, ref: str) -> dict:
+        """Free checkpoint `ref`'s data (a volume snapshot holds what's changed
+        since, and they add up). Named and stage checkpoints are kept, and so is
+        the one the workload is on. It stays in the tree, unrestorable."""
+        cp = self.store.checkpoint(ref)
+        if cp is None:
+            raise CheckpointError(f"no checkpoint {ref!r}")
+        if cp["name"] or cp.get("stage"):
+            raise CheckpointError(f"checkpoint {cp['id']} is named or a stage's: keeping it")
+        with self.lock:
+            if cp["id"] == self.store.head():
+                raise CheckpointError(f"checkpoint {cp['id']} is where the workload is: keeping it")
+            for store in self.versioned:
+                drop = getattr(store, "drop", None)
+                if drop is not None and cp["parts"]:
+                    drop(cp["parts"])
+            self.store.drop_parts(cp["id"])
+        return {**cp, "parts": {}}
+
+    def prune(self, kind: str = "before-restore", keep: int = 3) -> list[int]:
+        """Drop every restorable checkpoint of `kind` but the newest `keep`
+        (named, stage and current ones are kept anyway); the ids dropped."""
+        cps = [c for c in self.store.checkpoints(limit=1_000_000) if c["kind"] == kind and c["parts"]]
+        dropped = []
+        for cp in cps[keep:]:  # newest first
+            try:
+                self.drop(str(cp["id"]))
+            except CheckpointError:
+                continue
+            dropped.append(cp["id"])
+        return dropped
 
     def restore(self, ref: str, wait_ready: bool = True, who: str = "unknown", step: Step = _nothing) -> dict:
         """Put every versioned store back to checkpoint `ref` (id or name) and

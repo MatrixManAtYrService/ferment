@@ -394,6 +394,12 @@ class Store:
         ids = [r["id"] for r in self._rows(sql + " ORDER BY id DESC", stage, *([fingerprint] if fingerprint else []))]
         return [self.checkpoint(str(i)) for i in ids]  # type: ignore[misc]
 
+    def drop_parts(self, checkpoint_id: int) -> None:
+        """Forget a checkpoint's parts (their data was freed): it stays in the
+        tree, a clock reading that can't be restored."""
+        with self.lock:
+            self.db.execute("DELETE FROM checkpoint_parts WHERE checkpoint_id = ?", (checkpoint_id,))
+
     def checkpoints(self, limit: int = 50) -> list[dict]:
         ids = [r["id"] for r in self._rows("SELECT id FROM checkpoints ORDER BY id DESC LIMIT ?", limit)]
         return [self.checkpoint(str(i)) for i in ids]  # type: ignore[misc]

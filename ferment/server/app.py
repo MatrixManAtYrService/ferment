@@ -241,6 +241,24 @@ def create_app(
         broadcast("checkpoint", w, f"{w} adopted checkpoint {cp['id']} as stage {req.stage}")
         return out
 
+    @app.delete("/checkpoints/{ref}")
+    def drop_checkpoint(ref: str, request: Request):
+        """Free a checkpoint's data (kept in the tree, unrestorable). Not named, stage or current ones."""
+        try:
+            out = controller.drop(ref)
+        except CheckpointError as e:
+            raise HTTPException(409, str(e)) from e
+        broadcast("checkpoint", who(request), f"{who(request)} dropped checkpoint {out['id']}'s data")
+        return out
+
+    @app.post("/checkpoints/prune")
+    def prune_checkpoints(request: Request, kind: str = "before-restore", keep: int = 3):
+        """Drop all but the newest `keep` restorable checkpoints of `kind` (the automatic
+        ones taken before each restore pile up and fill the disk)."""
+        dropped = controller.prune(kind, keep)
+        broadcast("checkpoint", who(request), f"{who(request)} pruned {len(dropped)} {kind} checkpoint(s)")
+        return {"dropped": dropped}
+
     @app.get("/stages/{stage}")
     def stage(stage: str, fingerprint: str | None = None):
         """A stage's checkpoints, newest first (only those with `fingerprint`, if given)."""

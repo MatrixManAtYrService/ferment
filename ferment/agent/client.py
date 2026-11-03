@@ -151,6 +151,9 @@ class AgentClient:
     def restore_volume(self, sid: str) -> None:
         self._request("POST", f"/volume/snapshots/{sid}/restore")
 
+    def drop_volume(self, sid: str) -> None:
+        self._request("DELETE", f"/volume/snapshots/{sid}")
+
     def db_changes(self, start: str, stop: str | None = None) -> dict:
         params = {"start": start} | ({"stop": stop} if stop else {})
         return self._request("GET", "/db/changes", params=params)

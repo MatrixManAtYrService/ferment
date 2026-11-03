@@ -61,6 +61,9 @@ class FakeStore:
         self.data = self.commits[parts["fake:billing"]]
         self.calls.append(("restore", parts))
 
+    def drop(self, parts):
+        del self.commits[parts["fake:billing"]]
+
 
 @pytest.fixture
 def setup(tmp_path):
@@ -471,3 +474,25 @@ def test_checkpoints_form_a_tree_and_a_restore_starts_a_branch(setup):
     with TestClient(create_app(tc)) as client:
         rows = {r["id"]: r for r in client.get("/checkpoints").json()}
         assert rows[c["id"]]["head"] and not rows[b["id"]]["head"]
+
+
+def test_checkpoints_data_is_freed_but_named_stage_and_current_ones_are_kept(setup):
+    tc, store = setup
+    named = tc.checkpoint("loaded", name="loaded")
+    for _ in range(4):  # each restore leaves an automatic checkpoint behind
+        tc.restore("loaded", wait_ready=False)
+    autos = [c for c in tc.store.checkpoints() if c["kind"] == "before-restore"]
+    assert len(autos) == 4 and len(store.commits) == 5
+    assert tc.prune("before-restore", keep=1) == [c["id"] for c in autos[1:]]  # all but the newest
+    assert len(store.commits) == 2
+    dropped = tc.store.checkpoint(str(autos[-1]["id"]))
+    assert dropped is not None and dropped["parts"] == {}  # still in the tree, a clock reading
+    with pytest.raises(CheckpointError, match="no versioned data"):
+        tc.restore(str(autos[-1]["id"]), wait_ready=False)
+    with pytest.raises(CheckpointError, match="named or a stage"):
+        tc.drop("loaded")
+    with TestClient(create_app(tc)) as client:
+        head = next(c for c in client.get("/checkpoints").json() if c["head"])
+        assert client.delete(f"/checkpoints/{head['id']}").status_code == 409  # where the workload is
+        assert client.post("/checkpoints/prune", params={"keep": 0}).json() == {"dropped": [autos[0]["id"]]}
+    assert named["id"] in {c["id"] for c in tc.store.checkpoints() if c["parts"]}
