@@ -43,7 +43,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 GIB = 1 << 30
-RESERVE = 15 * GIB  # what a full volume still leaves on the VM's disk
+RESERVE = 8 * GIB  # what a full volume still leaves on the VM's disk (logs, the journal, builds' scratch)
 SNAPSHOT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PART = "volume:data"
 BINLOG_PART = "volume:binlog"  # where the binlog was at the snapshot: file:position

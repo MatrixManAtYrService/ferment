@@ -55,6 +55,7 @@ def _volume(tmp_path, monkeypatch, disk: list[int] | None = None) -> tuple[Volum
         run=fake,
         disk=lambda: (disk[0] * GIB, disk[1] * GIB),
         scratch={"mysql84-tmp": tmp_path / "mysql84-tmp"},
+        reserve=15 * GIB,
     )
     monkeypatch.setattr(Volume, "mounted", lambda self: fake.mounted)
     return v, fake
