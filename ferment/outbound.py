@@ -254,14 +254,15 @@ NIX_CONFIG = "http2 = false"
 
 def probe_script(allow: list[str]) -> str | None:
     """Shell for the VM: one HTTPS request through VM_PORT to an allowlisted
-    host (the first plain name on 443), printing curl's status and when its
-    TLS handshake finished. None if the list has no such host."""
+    host (the first plain name on 443), printing curl's status, when its TLS
+    handshake finished, and the certificate's verification result. None if
+    the list has no such host."""
     for entry in allow:
         host, sep, port = entry.rpartition(":")
         host = host if sep and port.isdigit() else entry
         if "*" not in host and (not sep or not port.isdigit() or port == "443"):
             proxy = f"http://127.0.0.1:{VM_PORT}"
-            fmt = "%{http_code} %{time_appconnect}"
+            fmt = "%{http_code} %{time_appconnect} %{ssl_verify_result}"
             return f"curl -s -o /dev/null --max-time 10 -x {proxy} -w {shlex.quote(fmt)} https://{host}/"
     return None
 
@@ -270,10 +271,18 @@ def carried(probe_output: str) -> bool:
     """Did probe_script's request get through? Its TLS handshake finished: a
     forward that's stuck still answers CONNECT, then passes nothing more."""
     try:
-        _, tls = probe_output.split()
-        return float(tls) > 0
-    except ValueError:
+        return float(probe_output.split()[1]) > 0
+    except (IndexError, ValueError):
         return False
+
+
+def untrusted(probe_output: str) -> bool:
+    """Did probe_script's request reach a server whose certificate the VM
+    doesn't trust? The client carrying it is behind TLS interception (a
+    corporate proxy re-signing with a root that client trusts and the VM
+    doesn't): no forward restart helps."""
+    parts = probe_output.split()
+    return len(parts) >= 3 and parts[2] not in ("0", "")
 
 
 def env(no_proxy: list[str] = ()) -> dict[str, str]:

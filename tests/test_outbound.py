@@ -189,7 +189,10 @@ def test_the_probe_asks_for_a_whole_tls_handshake():
     script = outbound.probe_script(["*.wild.example", "github.com:22", "cache.nixos.org", "pypi.org"])
     assert f"-x http://127.0.0.1:{outbound.VM_PORT}" in script and "https://cache.nixos.org/" in script
     assert outbound.probe_script(["*.wild.example", "github.com:22"]) is None
-    assert outbound.carried("200 0.18")
-    assert outbound.carried("404 0.2")  # the host's answer doesn't matter: it got through
-    assert not outbound.carried("000 0.000000")  # a stuck forward: CONNECT answered, TLS never finished
+    assert outbound.carried("200 0.18 0")
+    assert outbound.carried("404 0.2 0")  # the host's answer doesn't matter: it got through
+    assert not outbound.carried("000 0.000000 0")  # a stuck forward: CONNECT answered, TLS never finished
     assert not outbound.carried("")
+    # Behind TLS interception: a certificate the VM doesn't trust (curl's 20: no local issuer)
+    assert outbound.untrusted("000 0.000000 20") and not outbound.carried("000 0.000000 20")
+    assert not outbound.untrusted("000 0.000000 0") and not outbound.untrusted("")
