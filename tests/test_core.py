@@ -607,3 +607,27 @@ def test_a_supervised_forward_restarts_when_its_check_says_it_carries_nothing(mo
     assert [s for s, _ in states] == ["up", "restarted", "up"]
     assert states[1][1] == "restarted: nothing got through"
     assert first.returncode is not None and side.proc is not first
+
+
+def test_a_tunnel_that_was_up_is_reconnected_one_that_never_came_up_returns(monkeypatch):
+    from ferment import ssh
+    from ferment.vm.base import SshTarget
+
+    monkeypatch.setattr(ssh, "UP_AFTER", 0.2)
+    monkeypatch.setattr(ssh, "RETRY", 0.05)
+    # Never up: ssh fails at once (a key the VM won't take), and that's the answer.
+    monkeypatch.setattr(ssh, "tunnel_argv", lambda target, forwards, strict=True: ["sh", "-c", "exit 255"])
+    assert ssh.hold_tunnel(SshTarget(host="vm"), []) == 255
+
+    # Up a while, then lost (the laptop slept): reconnected, again and again, until detach.
+    monkeypatch.setattr(ssh, "tunnel_argv", lambda target, forwards, strict=True: ["sh", "-c", "sleep 0.4; exit 255"])
+    states, detached = [], []
+
+    def report(label, state, msg):
+        states.append((label, state))
+        if states.count(("tunnel", "lost")) == 2:
+            raise KeyboardInterrupt  # the person detaches
+
+    rc = ssh.hold_tunnel(SshTarget(host="vm"), [], on_detach=lambda: detached.append(True), report=report)
+    assert rc == 0 and detached == [True]
+    assert states == [("tunnel", "lost"), ("tunnel", "up"), ("tunnel", "lost")]

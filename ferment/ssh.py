@@ -222,6 +222,12 @@ class _Supervised(threading.Thread):
             self.proc.wait()
 
 
+# hold_tunnel: a tunnel that survived this long was up (bind and auth failures exit fast);
+# losing one that was up retries this often.
+UP_AFTER = 10.0
+RETRY = 15.0
+
+
 def hold_tunnel(
     target: SshTarget,
     forwards: list[Forward],
@@ -242,10 +248,17 @@ def hold_tunnel(
     `check()`, every `check_every` seconds while they're up: None if they
     carry, else why not, and they're restarted (a forward can come up and
     then pass nothing, for reasons not found yet).
+
+    The tunnel is reconnected once it has been up (`UP_AFTER` seconds): a
+    client that slept, a network that dropped or a VM that rebooted comes
+    back by itself, retried every `RETRY` seconds until detached, with
+    report("tunnel", "lost"/"up", ...). One that never came up (a key the VM
+    won't take, a local port in use) returns its exit status.
     """
     # Own sessions: a terminal's ctrl-c reaches only us, so the tunnel is
     # still there while on_detach runs; then we stop it.
     proc = subprocess.Popen(tunnel_argv(target, forwards), start_new_session=True)
+    started, was_up = time.monotonic(), False
     side = (
         _Supervised(target, best_effort, "relay " + ", ".join(f.label or f.dest or "" for f in best_effort), report)
         if best_effort
@@ -264,7 +277,21 @@ def hold_tunnel(
     signal.signal(signal.SIGTERM, _detach)
     signal.signal(signal.SIGHUP, _detach)
     try:
-        return proc.wait()
+        while True:
+            rc = proc.wait()
+            was_up = was_up or time.monotonic() - started >= UP_AFTER
+            if not was_up:
+                return rc
+            if report is not None:
+                report("tunnel", "lost", f"lost (ssh exit {rc}); reconnecting every {RETRY:.0f}s")
+            time.sleep(RETRY)
+            proc = subprocess.Popen(tunnel_argv(target, forwards), start_new_session=True)
+            started = time.monotonic()
+            try:
+                proc.wait(timeout=UP_AFTER)
+            except subprocess.TimeoutExpired:
+                if report is not None:
+                    report("tunnel", "up", "reconnected")
     except KeyboardInterrupt:
         if on_detach is not None:
             try:
