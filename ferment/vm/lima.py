@@ -132,15 +132,19 @@ def lima_config(
     private_network: bool = False,
     cache_root: str = CACHE_ROOT,
     cache_locations: dict[str, str] | None = None,
+    vm_type: str = "vz",
+    image: str = "",
 ) -> dict:
     """`private_network`: on Lima's user-v2 network, where instances reach
     each other (lima-<name>.internal) and still reach the internet.
     `cache_root`: where spec.caches live on the Lima host, unless
-    `cache_locations` names a directory for one."""
+    `cache_locations` names a directory for one. `vm_type`: vz (macOS) or
+    qemu (Linux). `image`: a file on the Lima host to boot instead of
+    downloading IMAGES (one of them, fetched ahead: ferment.bootstrap)."""
     where = cache_locations or {}
     cfg = {
-        "vmType": "vz",
-        "images": IMAGES,
+        "vmType": vm_type,
+        "images": [{"location": image}] if image else IMAGES,
         "cpus": spec.cpus,
         "memory": f"{spec.memory_gib}GiB",
         "disk": f"{spec.disk_gib}GiB",
@@ -212,13 +216,17 @@ class LimaProvider(Provider):
         control_disk_gib: int | None = None,
         cache_root: str = CACHE_ROOT,
         cache_locations: dict[str, str] | None = None,
+        vm_type: str = "vz",
+        image: str = "",
     ):
         """cpus, memory_gib, disk_gib: the VM that runs the workload (the only
         VM, or a split fermenter's workload VM). control_*: a split
         fermenter's control VM (the server, builds, the archive).
         cache_locations: cache name -> a directory on the Lima host for it
-        other than cache_root/<name>."""
+        other than cache_root/<name>. vm_type, image: as lima_config."""
         self.lima = LimaHost(host, limactl)
+        self.vm_type = vm_type
+        self.image = image
         self.cache_root = cache_root
         self.cache_locations = dict(cache_locations or {})
         # Names whose guest rebooted since last seen (noticed by ssh_target):
@@ -348,7 +356,12 @@ class LimaProvider(Provider):
             self.lima.run("mkdir -p " + " ".join(dirs))
         cfg = yaml.safe_dump(
             lima_config(
-                spec, private_network=private_network, cache_root=self.cache_root, cache_locations=self.cache_locations
+                spec,
+                private_network=private_network,
+                cache_root=self.cache_root,
+                cache_locations=self.cache_locations,
+                vm_type=self.vm_type,
+                image=self.image,
             ),
             sort_keys=False,
         )

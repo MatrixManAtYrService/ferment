@@ -10,6 +10,14 @@ Kinds of host:
 - `macos`: an Apple Silicon Mac that runs Lima for this client
   (`[backend.lima] host`). Lima comes from a pinned nixpkgs, built on the
   host into a fixed path, so limactl doesn't depend on a login shell's PATH.
+- `debian`: a Linux machine (Debian, KVM) that does the same with qemu. Its
+  VMs get no egress, as a cloud fermenter on a locked-down subnet gets none:
+  the account the client logs in as (which runs Lima, qemu and Lima's
+  user-mode network) may answer connections and use the host's loopback,
+  but not open connections out (`egress_rules`). So the VM image is fetched
+  up front, by the nix daemon, which isn't that account.
+
+How much of the host the VMs get is `Sizing`.
 
 Other kinds (a cloud project, say) come later; `steps()` raises
 NotImplementedError for them.
@@ -24,7 +32,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ferment.vm.lima import CACHE_ROOT
+from ferment.vm.lima import CACHE_ROOT, IMAGES
 
 # Same nixpkgs as ferment's flake.lock (and so the same Lima as its devShell);
 # a test keeps them in step.
@@ -38,9 +46,25 @@ LIMA_LINK = ".local/share/ferment/lima"
 # power cut. Lima VMs stop when the host sleeps.
 POWER = {"sleep": "0", "disksleep": "0", "autorestart": "1"}
 
-# What the host keeps for itself when sizing VMs.
-RESERVE_MEMORY_GIB = 2
-CONTROL = {"cpus": 4, "memory_gib": 4}
+# On the host: nix out-links (GC roots) to the VM images, for Lima to boot
+# from a local file when its own downloads have no egress.
+IMAGE_LINK = ".local/share/ferment/images"
+
+
+@dataclass
+class Sizing:
+    """How much of the host a fermenter's VMs get: the control VM what's
+    asked for it, the workload VM the rest of what the host doesn't reserve.
+    Disks are sparse (a VM takes what it writes), so they're ceilings; the
+    disk reserve is room for the host itself, the caches beside the VMs
+    (VMSpec.caches) and the images."""
+
+    reserve_cpus: int = 0
+    reserve_memory_gib: int = 2
+    reserve_disk_gib: int | None = None  # None: a third of the free disk
+    control_cpus: int = 4
+    control_memory_gib: int = 4
+    control_disk_gib: int | None = None  # None: a third of the VMs' disk
 
 
 @dataclass
@@ -219,32 +243,238 @@ def trust_step(pubkey: Path) -> Callable[[Host], Outcome]:
     return step
 
 
-def lima_backend(h: Host) -> dict:
-    """`[backend.lima]` for a client using this host: most of its memory and
-    cpus for the workload VM, the rest for the control VM and the host."""
+# -- debian -------------------------------------------------------------------
+
+
+def step_debian(h: Host) -> Outcome:
+    p = h.sh(
+        'uname -s; uname -m; (. /etc/os-release && echo "$PRETTY_NAME"); '
+        "awk '/^MemTotal:/ {print $2 * 1024}' /proc/meminfo; nproc; "
+        'echo "$HOME"; id -un; id -u; df -k "$HOME" | tail -1'
+    )
+    lines = p.stdout.split("\n")
+    if p.returncode != 0 or len(lines) < 9:
+        return Outcome("debian", "failed", _err(p))
+    system, arch, release, mem, ncpu, home, user, uid, df = lines[:9]
+    if system != "Linux" or arch not in ("x86_64", "aarch64"):
+        return Outcome("debian", "failed", f"{h.dest} is {system}/{arch}; this kind wants x86_64 or aarch64 Linux")
+    h.facts.update(
+        release=release,
+        arch=arch,
+        memory_gib=int(mem) // 2**30,
+        cpus=int(ncpu),
+        home=home,
+        user=user,
+        uid=int(uid),
+        free_disk_gib=int(df.split()[3]) // 2**20,
+        vm_type="qemu",
+    )
+    return Outcome(
+        "debian",
+        "ok",
+        f"{release} {arch}, {h.facts['cpus']} cpus, {h.facts['memory_gib']} GiB, "
+        f"{h.facts['free_disk_gib']} GiB free; VMs run as {user}",
+    )
+
+
+def step_kvm(h: Host) -> Outcome:
+    if h.sh("test -r /dev/kvm && test -w /dev/kvm").returncode == 0:
+        return Outcome("kvm", "ok", "/dev/kvm")
+    if h.sh("test -e /dev/kvm").returncode != 0:
+        return Outcome("kvm", "failed", "no /dev/kvm: turn on virtualization (VT-x / AMD-V) in the firmware")
+    command = f"sudo usermod -aG kvm {shlex.quote(h.facts['user'])}"
+    if h.run_tty is None:
+        return Outcome("kvm", "manual", f"on {h.dest}: `{command}`, or re-run in a terminal")
+    h.run_tty(command)
+    # Each step is a new ssh login, so it has the new group, unless ssh
+    # multiplexes it onto an old connection.
+    if h.sh("test -r /dev/kvm && test -w /dev/kvm").returncode != 0:
+        return Outcome("kvm", "manual", f"ran `{command}`; re-run once a new login to {h.dest} picks up the group")
+    return Outcome("kvm", "changed", f"{h.facts['user']} in group kvm")
+
+
+def image_expr(image: dict) -> str:
+    """A nix expression for one of lima.IMAGES, fetched by the nix daemon
+    and checked against the image's digest."""
+    algo, _, digest = image["digest"].partition(":")
+    name = image["location"].rsplit("/", 1)[-1]
+    return (
+        f'derivation {{ name = "{name}"; builder = "builtin:fetchurl"; system = "builtin"; '
+        f'url = "{image["location"]}"; outputHashMode = "flat"; '
+        f'outputHashAlgo = "{algo}"; outputHash = "{digest}"; }}'
+    )
+
+
+def step_images(h: Host) -> Outcome:
+    image = next((i for i in IMAGES if i["arch"] == h.facts["arch"]), None)
+    if image is None:
+        return Outcome("images", "failed", f"no VM image for {h.facts['arch']}")
+    name = image["location"].rsplit("/", 1)[-1]
+    link = f"$HOME/{IMAGE_LINK}/{name}"
+    before = h.sh(f"readlink {link}").stdout.strip()
+    p = h.sh(
+        f"mkdir -p $HOME/{IMAGE_LINK} && "
+        f"{NIX} --extra-experimental-features nix-command build --out-link {link} --print-out-paths "
+        f"--expr {shlex.quote(image_expr(image))}"
+    )
+    if p.returncode != 0:
+        return Outcome("images", "failed", f"fetching {image['location']}: {_err(p)}")
+    h.facts["image"] = f"{h.facts['home']}/{IMAGE_LINK}/{name}"
+    return Outcome("images", "ok" if before == p.stdout.strip() else "changed", h.facts["image"])
+
+
+SLEEP_TARGETS = ("sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target")
+
+
+def step_sleep(h: Host) -> Outcome:
+    """A desktop install suspends when idle, and the VMs stop with it."""
+    check = "systemctl is-enabled " + " ".join(SLEEP_TARGETS)
+    if set(h.sh(check).stdout.split()) == {"masked"}:
+        return Outcome("sleep", "ok", "suspend and hibernate masked")
+    command = "sudo systemctl mask " + " ".join(SLEEP_TARGETS)
+    if h.run_tty is None:
+        return Outcome("sleep", "manual", f"on {h.dest}: `{command}`, or re-run in a terminal")
+    h.run_tty(command)
+    if set(h.sh(check).stdout.split()) != {"masked"}:
+        return Outcome("sleep", "failed", f"still not masked after `{command}`")
+    return Outcome("sleep", "changed", "suspend and hibernate masked")
+
+
+EGRESS_TABLE = "ferment_egress"
+EGRESS_FILE = "/etc/ferment/egress.nft"
+EGRESS_UNIT = "ferment-egress.service"
+# Somewhere on the internet, by address (so DNS doesn't decide the answer).
+EGRESS_PROBE = "timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null"
+
+
+def egress_rules(uid: int) -> str:
+    """nftables rules: `uid` (the account that runs the VMs) opens no
+    connections off the host. What a cloud VM on a locked-down subnet still
+    has from its metadata server, DNS and NTP, it keeps."""
+    return f"""\
+# Written by ferment's bootstrap: fermenter VMs get no egress. Lima, qemu and
+# Lima's user-mode network run as uid {uid}, so their traffic leaves the host as
+# that uid's. It may answer ssh, use loopback (Lima's port forwards), resolve
+# names and keep time, and open nothing else. Dropped attempts are logged:
+#   journalctl -k -g ferment-egress
+table inet {EGRESS_TABLE}
+delete table inet {EGRESS_TABLE}
+table inet {EGRESS_TABLE} {{
+  chain output {{
+    type filter hook output priority filter; policy accept;
+    meta skuid {uid} oifname "lo" accept
+    meta skuid {uid} ct state established,related accept
+    meta skuid {uid} meta l4proto {{ tcp, udp }} th dport 53 accept
+    meta skuid {uid} udp dport 123 accept
+    meta skuid {uid} limit rate 10/second burst 20 packets log prefix "ferment-egress: "
+    meta skuid {uid} counter drop
+  }}
+}}
+"""
+
+
+EGRESS_UNIT_TEXT = f"""\
+[Unit]
+Description=ferment: no egress for the account that runs fermenter VMs
+# nftables.service flushes the whole ruleset when it (re)starts
+After=nftables.service
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f {EGRESS_FILE}
+ExecStop=/usr/sbin/nft delete table inet {EGRESS_TABLE}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def egress_install_script(uid: int) -> str:
+    return "\n".join(
+        [
+            "set -e",
+            "[ -x /usr/sbin/nft ] || sudo apt-get install -y nftables",
+            "sudo install -d /etc/ferment",
+            f"printf '%s' {shlex.quote(egress_rules(uid))} | sudo tee {EGRESS_FILE} >/dev/null",
+            f"printf '%s' {shlex.quote(EGRESS_UNIT_TEXT)} | sudo tee /etc/systemd/system/{EGRESS_UNIT} >/dev/null",
+            "sudo systemctl daemon-reload",
+            f"sudo systemctl enable {EGRESS_UNIT}",
+            f"sudo systemctl restart {EGRESS_UNIT}",
+        ]
+    )
+
+
+def step_egress(h: Host) -> Outcome:
+    uid = h.facts["uid"]
+    want = egress_rules(uid) + EGRESS_UNIT_TEXT + "enabled\nactive\n"
+    look = (
+        f"cat {EGRESS_FILE} /etc/systemd/system/{EGRESS_UNIT} 2>/dev/null; "
+        f"systemctl is-enabled {EGRESS_UNIT}; systemctl is-active {EGRESS_UNIT}"
+    )
+    undo = f"undo: `sudo systemctl disable --now {EGRESS_UNIT}`"
+    status = "ok"
+    if h.sh(look).stdout != want:
+        if h.run_tty is None:
+            return Outcome("egress", "manual", f"re-run in a terminal to block {h.facts['user']}'s egress (sudo)")
+        h.run_tty(egress_install_script(uid))
+        if h.sh(look).stdout != want:
+            return Outcome("egress", "failed", f"{EGRESS_UNIT} isn't enabled and running {EGRESS_FILE}")
+        status = "changed"
+    if h.sh(EGRESS_PROBE).returncode == 0:
+        return Outcome("egress", "failed", f"rules in place, but {h.facts['user']} still reached 1.1.1.1:443")
+    return Outcome("egress", status, f"{h.facts['user']} (uid {uid}) opens no connections off the host; {undo}")
+
+
+# -- both ---------------------------------------------------------------------
+
+
+def lima_backend(h: Host, sizing: Sizing | None = None) -> dict:
+    """`[backend.lima]` for a client using this host: the control VM what
+    `sizing` asks for it, the workload VM the rest of what the host doesn't
+    reserve."""
+    sizing = sizing or Sizing()
     mem, cpus, disk = h.facts["memory_gib"], h.facts["cpus"], h.facts["free_disk_gib"]
+    vms_disk = disk - (sizing.reserve_disk_gib if sizing.reserve_disk_gib is not None else disk // 3)
+    control_disk = sizing.control_disk_gib or max(50, vms_disk // 3)
     return {
         "host": h.dest,
         "limactl": h.facts["limactl"],
-        "cpus": max(2, cpus - CONTROL["cpus"]),
-        "memory_gib": max(4, mem - CONTROL["memory_gib"] - RESERVE_MEMORY_GIB),
-        # Sparse: a VM takes what it writes, so these are ceilings. Leave
-        # room for the caches and dumps beside them.
-        "disk_gib": max(50, min(150, disk // 2)),
-        "control_cpus": CONTROL["cpus"],
-        "control_memory_gib": CONTROL["memory_gib"],
-        "control_disk_gib": max(50, min(100, disk // 3)),
+        # Always both, so configuring a different kind of host replaces them.
+        "vm_type": h.facts.get("vm_type", "vz"),
+        "image": h.facts.get("image", ""),
+        "cpus": max(2, cpus - sizing.reserve_cpus - sizing.control_cpus),
+        "memory_gib": max(4, mem - sizing.reserve_memory_gib - sizing.control_memory_gib),
+        "disk_gib": max(50, vms_disk - control_disk),
+        "control_cpus": sizing.control_cpus,
+        "control_memory_gib": sizing.control_memory_gib,
+        "control_disk_gib": control_disk,
     }
 
 
 def steps(kind: str, trust: list[Path] = ()) -> list[Callable[[Host], Outcome]]:
+    trusted = [trust_step(k) for k in trust]
     if kind == "macos":
-        return [step_ssh, step_macos, step_nix, step_lima, step_caches, step_power, *map(trust_step, trust)]
+        return [step_ssh, step_macos, step_nix, step_lima, step_caches, step_power, *trusted]
+    if kind == "debian":
+        return [
+            step_ssh,
+            step_debian,
+            step_kvm,
+            step_nix,
+            step_lima,
+            step_images,
+            step_caches,
+            step_sleep,
+            step_egress,
+            *trusted,
+        ]
     raise NotImplementedError(f"bootstrapping a {kind!r} host isn't built yet")
 
 
-# Later steps assume these (no ssh, no nix, no Lima): stop when one isn't done.
-PREREQUISITES = {"ssh", "macos", "nix", "lima"}
+# Later steps assume these (no ssh, no host facts, no nix, no Lima): stop when one isn't done.
+PREREQUISITES = {"ssh", "macos", "debian", "nix", "lima"}
 
 
 def run(h: Host, plan: list[Callable[[Host], Outcome]]) -> Iterator[Outcome]:

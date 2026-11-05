@@ -18,6 +18,7 @@ requests without flags.
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import tomllib
@@ -42,8 +43,9 @@ def state_dir() -> Path:
 
 
 def _merge(defaults: dict, found: dict) -> dict:
-    """Defaults fill in keys the file lacks; the file wins everywhere else."""
-    out = dict(defaults)
+    """Defaults fill in keys the file lacks; the file wins everywhere else.
+    Never shares a dict with `defaults`: callers change what they load."""
+    out = copy.deepcopy(defaults)
     for key, value in found.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = _merge(out[key], value)
@@ -58,7 +60,7 @@ def load(defaults: dict) -> dict:
     if not path.exists():
         save(defaults)
         print(f"ferment: initialized {path}", file=sys.stderr)
-        return dict(defaults)
+        return copy.deepcopy(defaults)
     with path.open("rb") as f:
         return _merge(defaults, tomllib.load(f))
 

@@ -26,6 +26,14 @@ def test_config_initializes_then_merges_new_defaults(tmp_path, monkeypatch):
     assert cfg["backend"]["lima"] == {"cpus": 4}
 
 
+def test_changing_a_loaded_config_leaves_the_defaults_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv("FERMENT_CONFIG", str(tmp_path / "config.toml"))
+    defaults = {"backend": {"lima": {"host": ""}}, "attached": {}}
+    config.load(defaults)["backend"]["lima"]["host"] = "first"  # initializes the file
+    config.load(defaults)["backend"]["lima"]["host"] = "merged"
+    assert defaults == {"backend": {"lima": {"host": ""}}, "attached": {}}
+
+
 def test_guest_clock_keeps_real_time_and_survives_a_reboot(tmp_path):
     import datetime as dt
 
@@ -536,3 +544,16 @@ def test_lima_mounts_only_the_caches_a_vm_asks_for():
         cache_locations={"shelf": "/Volumes/Ferment/shelf"},
     )
     assert [m["location"] for m in elsewhere["mounts"]] == ["/c/maven", "/Volumes/Ferment/shelf"]
+
+
+def test_lima_on_linux_boots_a_local_image_with_qemu():
+    import datetime as dt
+
+    from ferment.vm import lima
+    from ferment.vm.base import VMSpec
+
+    spec = VMSpec(name="a", ttl=dt.timedelta(hours=1))
+    mac = lima.lima_config(spec)
+    assert (mac["vmType"], mac["images"]) == ("vz", lima.IMAGES)
+    linux = lima.lima_config(spec, vm_type="qemu", image="/home/f/.local/share/ferment/images/n.qcow2")
+    assert (linux["vmType"], linux["images"]) == ("qemu", [{"location": "/home/f/.local/share/ferment/images/n.qcow2"}])

@@ -31,7 +31,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/progress.py` | `Task`: a client's long work on the board with done/total (server: `Tasks` in `server/board.py`, lapses when its client stops reporting) |
 | `ferment/needs.py` | capabilities (`relay:`, `fetch:`, `data:`) and `Waiting`: a client waiting for one says so on the board |
 | `ferment/data.py`, `ferment/server/data.py` | data for the workload: fragments (gzip'd SQL by sha256, keyed by source/database/table/selector/version) in the `data` cache, datasets, data requests an attached client fulfills (`DataFulfiller` + a per-source handler), loading a dataset into MySQL |
-| `ferment/bootstrap.py` | prepare a machine to host fermenters, once, over ssh: idempotent steps (ok/changed/manual/failed); `macos` = a Mac running Lima from a pinned nixpkgs |
+| `ferment/bootstrap.py` | prepare a machine to host fermenters, once, over ssh: idempotent steps (ok/changed/manual/failed); `macos` = a Mac running Lima from a pinned nixpkgs; `debian` = a KVM box running Lima with qemu, its VMs' account denied egress by nftables (`egress_rules`); `Sizing` = what the host keeps and the control VM gets |
 
 ## Dev environment (nix)
 
