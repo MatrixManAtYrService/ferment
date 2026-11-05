@@ -90,6 +90,31 @@ def connect(host: str, port: int) -> socket.socket:
     raise error
 
 
+def unreachable(allow: list[str], timeout: float = 5.0) -> list[str]:
+    """The allowlist's hosts this machine can't open a connection to, all
+    tried at once within `timeout` (DNS included: a VPN's resolver may hang
+    on names it won't serve). Wildcard entries can't be tried, and aren't.
+    The VM gets one proxy, whoever's: a client that can't reach some of its
+    hosts shouldn't be it."""
+    entries = [e for e in allow if "*" not in e]
+    reached: set[str] = set()
+
+    def attempt(entry: str) -> None:
+        host, sep, port = entry.rpartition(":")
+        host, port = (host, int(port)) if sep and port.isdigit() else (entry, 443)
+        with contextlib.suppress(OSError):
+            connect(host, port).close()
+            reached.add(entry)
+
+    threads = [threading.Thread(target=attempt, args=(e,), daemon=True) for e in entries]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    return [e for e in entries if e not in reached]
+
+
 def _split(target: str, default_port: int) -> tuple[str, int]:
     host, sep, port = target.rpartition(":")
     if not sep or not port.isdigit():

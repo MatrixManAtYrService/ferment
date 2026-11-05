@@ -149,3 +149,22 @@ def test_ipv4_is_tried_first_and_a_dead_address_costs_seconds_not_minutes(monkey
     with pytest.raises(OSError):
         outbound.connect("pypi.org", 443)
     assert clock.monotonic() - t < 1.5
+
+
+def test_hosts_this_machine_cant_reach_are_named_and_a_hung_lookup_doesnt_hold_it_up(monkeypatch, echo):
+    import time as clock
+
+    real = socket.getaddrinfo
+
+    def resolve(host, port, *a, **k):
+        if host == "hangs.example":
+            clock.sleep(30)  # a VPN resolver that never answers
+        if host == "fine.example":
+            return real("127.0.0.1", echo, *a, **k)
+        raise socket.gaierror("no such host")
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    t = clock.monotonic()
+    out = outbound.unreachable([f"fine.example:{echo}", "nxdomain.example", "hangs.example", "*.wild.example"], 0.5)
+    assert out == ["nxdomain.example", "hangs.example"]
+    assert clock.monotonic() - t < 1.5
