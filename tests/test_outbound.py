@@ -168,3 +168,18 @@ def test_hosts_this_machine_cant_reach_are_named_and_a_hung_lookup_doesnt_hold_i
     out = outbound.unreachable([f"fine.example:{echo}", "nxdomain.example", "hangs.example", "*.wild.example"], 0.5)
     assert out == ["nxdomain.example", "hangs.example"]
     assert clock.monotonic() - t < 1.5
+
+
+def test_a_host_whose_tls_never_completes_is_unreachable(monkeypatch):
+    """A network that lets the connection open, then holds the handshake."""
+    import time as clock
+
+    with socket.socket() as silent:
+        silent.bind(("127.0.0.1", 0))
+        silent.listen()  # accepts (the kernel does), never speaks TLS
+        port = silent.getsockname()[1]
+        real = socket.getaddrinfo
+        monkeypatch.setattr(socket, "getaddrinfo", lambda host, p, *a, **k: real("127.0.0.1", port, *a, **k))
+        t = clock.monotonic()
+        assert outbound.unreachable(["pypi.org"], 0.5) == ["pypi.org"]
+        assert clock.monotonic() - t < 1.5

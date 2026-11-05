@@ -28,6 +28,7 @@ import fnmatch
 import shlex
 import socket
 import socketserver
+import ssl
 import threading
 import time
 from collections.abc import Callable
@@ -91,9 +92,12 @@ def connect(host: str, port: int) -> socket.socket:
 
 
 def unreachable(allow: list[str], timeout: float = 5.0) -> list[str]:
-    """The allowlist's hosts this machine can't open a connection to, all
-    tried at once within `timeout` (DNS included: a VPN's resolver may hang
-    on names it won't serve). Wildcard entries can't be tried, and aren't.
+    """The allowlist's hosts this machine can't reach, all tried at once
+    within `timeout`: DNS (a VPN's resolver may hang on names it won't serve),
+    the connection, and on 443 a verified TLS handshake, as the VM's own
+    will be (a network may let the connection open, then hold or intercept
+    the TLS: a VPN machine passed for pypi.org on TCP alone, and every
+    request through it hung). Wildcard entries can't be tried, and aren't.
     The VM gets one proxy, whoever's: a client that can't reach some of its
     hosts shouldn't be it."""
     entries = [e for e in allow if "*" not in e]
@@ -102,8 +106,11 @@ def unreachable(allow: list[str], timeout: float = 5.0) -> list[str]:
     def attempt(entry: str) -> None:
         host, sep, port = entry.rpartition(":")
         host, port = (host, int(port)) if sep and port.isdigit() else (entry, 443)
-        with contextlib.suppress(OSError):
-            connect(host, port).close()
+        with contextlib.suppress(OSError), connect(host, port) as s:
+            if port == 443:
+                s.settimeout(timeout)
+                with ssl.create_default_context().wrap_socket(s, server_hostname=host):
+                    pass
             reached.add(entry)
 
     threads = [threading.Thread(target=attempt, args=(e,), daemon=True) for e in entries]
