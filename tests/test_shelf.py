@@ -90,7 +90,7 @@ def test_dropped_checkpoints_are_archived_first_and_restore_from_the_shelf(shelv
     tc.restore("loaded", wait_ready=False)  # leaves a before-restore checkpoint; head is loaded
     assert tc.drop(str(b["id"]))["archive"]["base"] == a["id"]  # relative to the nearest ancestor that's here
     assert tc.drop(str(a["id"]))["archive"]["base"] == 1  # a's base: loaded
-    assert len(shelf.list("snapshots/toaster/")) == 2
+    assert len(shelf.list("snapshots/toaster/")) == 3  # b, a, and loaded: what a was sent relative to
     meta = shelf.meta(f"snapshots/toaster/{b['id']}/fake.bin")
     assert meta["provenance"] == "prod" and meta["checkpoint"]["message"] == "b" and meta["base"] == a["id"]
 
@@ -98,7 +98,7 @@ def test_dropped_checkpoints_are_archived_first_and_restore_from_the_shelf(shelv
     assert store.data == 2 and out["restored"]["parts"]
     assert tc.store.checkpoint(str(a["id"]))["parts"]  # restorable again too
     assert tc.archive(str(b["id"]))["checkpoint_id"] == b["id"]  # once: nothing sent again
-    assert len(shelf.list()) == 2
+    assert len(shelf.list()) == 3
 
 
 def test_a_shelf_that_refuses_the_data_keeps_the_checkpoint(shelved):
@@ -119,7 +119,7 @@ def test_archive_over_http_and_prune_archives_what_it_drops(shelved):
         tc.restore("loaded", wait_ready=False)
     with TestClient(create_app(tc)) as client:
         dropped = client.post("/checkpoints/prune", params={"keep": 1}).json()["dropped"]
-        assert len(dropped) == 2 and len(shelf.list()) == 2
+        assert len(dropped) == 2 and len(shelf.list()) == 3  # and loaded, their base
         assert client.post(f"/checkpoints/{dropped[0]}/unarchive").json()["parts"]
         assert client.post("/checkpoints/nope/archive").status_code == 409
 
@@ -149,7 +149,7 @@ def test_forever_drops_named_ones_on_request_and_takes_the_shelf_copy_too(shelve
     with pytest.raises(CheckpointError, match=rf"base of archived checkpoint\(s\) \[{b['id']}\]"):
         tc.drop("a", forever=True)
     tc.drop(str(b["id"]), forever=True)  # already dropped: just its shelf copy
-    assert shelf.list() == [] and tc.store.checkpoint(str(b["id"]))["archive"] is None
+    assert not shelf.list(f"snapshots/toaster/{b['id']}/") and tc.store.checkpoint(str(b["id"]))["archive"] is None
     tc.drop("a", forever=True)
     assert not tc.store.checkpoint("a")["parts"] and sorted(store.commits) == ["c1", "c4"]  # loaded, the before-restore
     with pytest.raises(CheckpointError, match="no versioned data"):
