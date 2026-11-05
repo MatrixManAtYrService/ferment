@@ -70,6 +70,10 @@ class GuestClock:
         self.lock = threading.Lock()
         self.samples: deque[dt.timedelta] = deque(maxlen=self.SAMPLES)
         self.checked: dict | None = None  # the last client report: who, when, how far off we were
+        # Told (real time, offset seconds, why) each time the offset changes, to
+        # keep its history: converting a fake timestamp to real time needs the
+        # offset at that moment, not now's.
+        self.on_change: Callable[[dt.datetime, float, str], None] | None = None
         if state_file.exists():
             s = json.loads(state_file.read_text())
             self.offset = dt.timedelta(seconds=s["offset_seconds"])
@@ -95,7 +99,7 @@ class GuestClock:
             self.offset = target - real
             self.samples.clear()  # they measured the old offset
             self.set_to, self.set_at, self.boot = target.isoformat(), real.isoformat(), self._boot()
-            self._save()
+            self._save("set")
 
     def observe(self, client_time: dt.datetime, who: str = "unknown") -> None:
         """A client with real time says it's `client_time` (as of now, give or
@@ -115,7 +119,7 @@ class GuestClock:
             }
             if abs(error) > self.TOLERANCE:
                 self.offset = estimate
-                self._save()
+                self._save("drift")
 
     def ensure(self) -> bool:
         """After a reboot the guest is back on real time: put the fake date
@@ -126,15 +130,35 @@ class GuestClock:
             self._set(self._now() + self.offset)  # the clock reads real time right now
             self.samples.clear()
             self.boot = self._boot()
-            self._save()
+            self._save()  # the same offset, put back
             return True
 
-    def _save(self) -> None:
+    def _save(self, why: str | None = None) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.write_text(json.dumps({
             "offset_seconds": self.offset.total_seconds(),
             "set_to": self.set_to, "set_at": self.set_at, "boot": self.boot,
         }, indent=2))  # fmt: skip
+        if why and self.on_change is not None:
+            self.on_change(self.real_now(), self.offset.total_seconds(), why)
+
+
+def fake_to_real(fake: dt.datetime, history: list[dict], now: dt.datetime | None = None) -> dt.datetime | None:
+    """The real time the guest clock read `fake`, by the offset history
+    (`Store.offsets`: real_time, offset_seconds, oldest first). After the
+    clock went back, a fake time can have been read more than once: the
+    latest is the one. None if no stretch of the history read it."""
+    if fake.tzinfo is None:
+        fake = fake.replace(tzinfo=dt.UTC)
+    now = now or real_now()
+    found = None
+    for i, h in enumerate(history):
+        start = dt.datetime.fromisoformat(h["real_time"])
+        end = dt.datetime.fromisoformat(history[i + 1]["real_time"]) if i + 1 < len(history) else now
+        real = fake - dt.timedelta(seconds=h["offset_seconds"])
+        if start <= real <= end:
+            found = real
+    return found
 
 
 # The fermenter's real time, for records that should be in real time (event

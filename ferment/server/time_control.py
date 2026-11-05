@@ -102,6 +102,11 @@ class TimeController:
         self.clock = clock or GuestClock(state_dir / "time.json")
         clock_mod.use(self.clock)
         self.store = store or Store(state_dir / "fermenter.db")
+        # The offset's history (fake <-> real at any moment): from the first time it's kept, then each change.
+        if not self.store.offsets():
+            since = self.clock.set_at or clock_mod.real_now().isoformat()
+            self.store.add_offset(since, self.clock.offset.total_seconds(), "initial")
+        self.clock.on_change = lambda real, offset, why: self.store.add_offset(real.isoformat(), offset, why)
         self.supervisor = supervisor
         self.state_dir = state_dir
         self.lock = threading.Lock()

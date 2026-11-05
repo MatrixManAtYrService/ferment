@@ -27,7 +27,7 @@ from ferment.board import Board, Service
 from ferment.client import WHO_HEADER
 from ferment.databases import Database
 from ferment.server import clock as clock_mod
-from ferment.server import logs
+from ferment.server import logs, telemetry
 from ferment.server.board import Publisher, Steps, Tasks, board_router, tasks_router
 from ferment.server.builds import Builder
 from ferment.server.data import DataStore, Loader, data_root, data_router
@@ -133,13 +133,17 @@ def create_app(
     before_deploy: Callable[[str, dict, Callable[[str], None]], None] | None = None,
     services: Callable[[], list[Service]] | None = None,
     measure: dict[str, Callable[[], dict]] | None = None,
+    loki_url: str | None = None,
+    log_files: Callable[[], dict[str, tuple[dict[str, str], Path]]] | None = None,
 ) -> FastAPI:
     """`before_deploy(name, build, say)` runs before a service is (re)deployed,
     e.g. its schema migrations; raising stops the deploy. `services` lists
     what people can open or connect to, for the board (ferment.board); their
     up/down state comes from the workload process of the same name.
     `measure`: VM name -> a sample of it (ferment.measure), taken every
-    interval and kept; default, this machine as "vm"."""
+    interval and kept; default, this machine as "vm". `loki_url`: ship the
+    workload's process logs there, and `log_files()` (stream name -> (labels,
+    path)), stamped with real time (ferment.server.telemetry)."""
     store = controller.store
     log_path = controller.state_dir / "logs" / "fermenter.jsonl"
     logs.configure(log_path)
@@ -153,9 +157,36 @@ def create_app(
             measure = {"control": lambda: measure_mod.collect(cpu, {"root": Path("/")}), "workload": remote}
         else:
             measure = {"vm": lambda: measure_mod.collect(cpu, {"root": Path("/")}, controller.supervisor.processes())}
-    sampler = measure_mod.Sampler(
-        measure, lambda vm, sample: store.add_sample(clock_mod.real_now().isoformat(), vm, sample)
-    )
+    latest: dict[str, tuple[float, dict]] = {}  # VM -> (real unix time, its last sample), for /metrics
+
+    def keep_sample(vm: str, sample: dict) -> None:
+        now = clock_mod.real_now()
+        store.add_sample(now.isoformat(), vm, sample)
+        latest[vm] = (now.timestamp(), sample)
+
+    sampler = measure_mod.Sampler(measure, keep_sample)
+    shipper = None
+    if loki_url:
+        workload_role = "workload" if getattr(controller.supervisor, "measure_now", None) is not None else "vm"
+
+        def log_sources() -> dict[str, tuple[dict[str, str], telemetry.Reader]]:
+            sup = controller.supervisor
+            out: dict[str, tuple[dict[str, str], telemetry.Reader]] = {
+                f"process/{p['name']}": (
+                    {"source": "process", "vm": workload_role, "process": p["name"]},
+                    lambda offset, name=p["name"]: sup.log(name, offset),
+                )
+                for p in sup.processes()
+                if p.get("name")
+            }
+            for name, (labels, path) in (log_files() if log_files else {}).items():
+                out[name] = (labels, telemetry.file_reader(path))
+            return out
+
+        shipper = telemetry.LogShipper(
+            loki_url, log_sources, controller.state_dir / "logship.json",
+            fake_now=controller.clock.now, real_now=clock_mod.real_now,
+        )  # fmt: skip
 
     def broadcast(event: str, who_: str, message: str, **fields) -> None:
         logs.broadcast(event, who_, message, **fields)
@@ -175,7 +206,11 @@ def create_app(
         publisher.refresh()
         publisher.start()
         sampler.start()
+        if shipper is not None:
+            shipper.start()
         yield
+        if shipper is not None:
+            shipper.stop()
         sampler.stop()
         publisher.stop()
         controller.stop()
@@ -362,6 +397,18 @@ def create_app(
     @app.get("/measure/marks")
     def list_marks(label: str | None = None, limit: int = 100):
         return store.marks(label, limit)
+
+    @app.get("/metrics")
+    def metrics():
+        """The latest sample of each VM and the clock, for Prometheus (ferment.server.telemetry)."""
+        text = telemetry.render_metrics(latest, controller.clock.offset.total_seconds(), controller.clock.now())
+        return Response(text, media_type="text/plain; version=0.0.4")
+
+    @app.get("/clock/offsets")
+    def clock_offsets(start: str = "0000", end: str = "9999"):
+        """The guest clock's offset (fake - real, s) in force over a real-time window: the one
+        at `start`, then each change. Converting a fake time to real needs the offset then."""
+        return store.offsets(start, end)
 
     @app.get("/stages/{stage}")
     def stage(stage: str, fingerprint: str | None = None):

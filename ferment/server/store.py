@@ -205,6 +205,17 @@ MIGRATIONS = [
     );
     CREATE INDEX marks_label ON marks (label);
     """,
+    """
+    -- The guest clock's offset (fake minus real, seconds) from each real time
+    -- on: a fake timestamp's real time is it minus the offset then in force.
+    CREATE TABLE clock_offsets (
+        id              INTEGER PRIMARY KEY,
+        real_time       TEXT NOT NULL,
+        offset_seconds  REAL NOT NULL,
+        why             TEXT NOT NULL       -- set, drift, initial
+    );
+    CREATE INDEX clock_offsets_time ON clock_offsets (real_time);
+    """,
 ]
 
 # A claimed source request not finished in this long is up for grabs again
@@ -440,6 +451,29 @@ class Store:
         sql = "SELECT real_time, vm, sample FROM samples WHERE real_time >= ? AND real_time <= ?"
         rows = self._rows(sql + (" AND vm = ?" if vm else "") + " ORDER BY id", start, end, *([vm] if vm else []))
         return [{**r, "sample": json.loads(r["sample"])} for r in rows]
+
+    def add_offset(self, real_time: str, offset_seconds: float, why: str) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO clock_offsets (real_time, offset_seconds, why) VALUES (?, ?, ?)",
+                (real_time, offset_seconds, why),
+            )
+
+    def offsets(self, start: str = "0000", end: str = "9999") -> list[dict]:
+        """The offsets in force from `start` to `end` (real time, ISO): the one
+        already in force at `start`, then each change, oldest first."""
+        before = self._rows(
+            "SELECT real_time, offset_seconds, why FROM clock_offsets WHERE real_time <= ? "
+            "ORDER BY real_time DESC, id DESC LIMIT 1",
+            start,
+        )
+        during = self._rows(
+            "SELECT real_time, offset_seconds, why FROM clock_offsets WHERE real_time > ? AND real_time <= ? "
+            "ORDER BY real_time, id",
+            start,
+            end,
+        )
+        return before + during
 
     def add_mark(self, label: str, who: str, started: str) -> dict:
         with self.lock:
