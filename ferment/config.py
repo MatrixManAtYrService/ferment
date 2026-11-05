@@ -28,10 +28,11 @@ import tomli_w
 
 
 def config_path() -> Path:
-    """FERMENT_CONFIG wins (tests, multiple identities); else XDG."""
+    """FERMENT_CONFIG wins (tests, multiple identities, one per Lima host); else
+    XDG. A quoted `~` in it reaches us unexpanded: expand it here."""
     override = os.environ.get("FERMENT_CONFIG")
     if override:
-        return Path(override)
+        return Path(override).expanduser()
     base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "ferment" / "config.toml"
 

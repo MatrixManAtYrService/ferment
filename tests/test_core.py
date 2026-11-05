@@ -26,6 +26,12 @@ def test_config_initializes_then_merges_new_defaults(tmp_path, monkeypatch):
     assert cfg["backend"]["lima"] == {"cpus": 4}
 
 
+def test_config_override_expands_a_tilde(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("FERMENT_CONFIG", "~/.config/ferment/skillet.toml")
+    assert config.config_path() == tmp_path / ".config/ferment/skillet.toml"
+
+
 def test_changing_a_loaded_config_leaves_the_defaults_alone(tmp_path, monkeypatch):
     monkeypatch.setenv("FERMENT_CONFIG", str(tmp_path / "config.toml"))
     defaults = {"backend": {"lima": {"host": ""}}, "attached": {}}
