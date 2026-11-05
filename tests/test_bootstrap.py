@@ -129,6 +129,7 @@ class FakeDebian:
         self.links: dict[str, str] = {}
         self.egress_files = ""
         self.egress_unit = "disabled\ninactive\n"
+        self.qemu_files = ""
         self.tty: list[str] = []
 
     def run(self, dest, script, input=None):
@@ -148,8 +149,16 @@ class FakeDebian:
             return done(self.links.get(script.split()[1], ""))
         if " build --out-link " in script:
             link = script.split("--out-link ")[1].split()[0]
-            self.links[link] = "/nix/store/x-lima-2.1.3\n" if "lima" in link else "/nix/store/x-nixos.qcow2\n"
+            kind = "lima" if link.endswith("/lima") else "qemu" if link.endswith("/qemu") else "image"
+            self.links[link] = f"/nix/store/x-{kind}\n"
             return done(self.links[link])
+        if script.startswith("cat /home/f/.local/share/ferment/qemu-wrap/bin/"):
+            return done(self.qemu_files)
+        if script.startswith("mkdir -p /home/f/.local/share/ferment/qemu-wrap/bin"):
+            self.qemu_files = input + "/home/f/.local/share/ferment/qemu/share\n"
+            return done()
+        if script.endswith("qemu-system-x86_64 --version"):
+            return done("QEMU emulator version 10.2.4\n")
         if script.startswith("systemctl is-enabled sleep.target"):
             return done("masked\n" * 4 if self.masked else "static\n" * 4)
         if script.startswith(f"cat {bootstrap.EGRESS_FILE}"):
@@ -183,14 +192,17 @@ def test_debian_bootstrap_converges_then_is_all_ok():
     assert {s: o.status for s, o in first.items() if o.status != "ok"} == {
         "kvm": "changed",
         "lima": "changed",
+        "qemu": "changed",
         "images": "changed",
         "sleep": "changed",
         "egress": "changed",
     }
     assert (h.facts["uid"], h.facts["vm_type"]) == (1001, "qemu")
     assert h.facts["image"] == "/home/f/.local/share/ferment/images/nixos-lima-v0.2.2-x86_64.qcow2"
+    assert h.facts["qemu"] == "/home/f/.local/share/ferment/qemu-wrap/bin/qemu-system-x86_64"
+    assert "exec /home/f/.local/share/ferment/qemu/bin/qemu-system-x86_64" in box.qemu_files
     b = bootstrap.lima_backend(h)
-    assert (b["vm_type"], b["image"]) == ("qemu", h.facts["image"])
+    assert (b["vm_type"], b["image"], b["qemu"]) == ("qemu", h.facts["image"], h.facts["qemu"])
 
     box.tty.clear()
     _, second = _run_debian(box)
@@ -225,6 +237,28 @@ def test_egress_rules_bind_only_the_vms_account():
     assert body and all(line.startswith("meta skuid 1001 ") for line in body)
     assert body[-1] == "meta skuid 1001 counter drop"
     assert 'oifname "lo" accept' in body[0] and "established,related accept" in body[1]
+
+
+def test_the_qemu_wrapper_swaps_only_limas_socket_netdev(tmp_path):
+    import os
+
+    real = tmp_path / "qemu"
+    real.write_text('#!/bin/sh\nfor a do printf "%s\\n" "$a"; done\n')
+    wrapper = tmp_path / "qemu-system-x86_64"
+    wrapper.write_text(bootstrap.qemu_wrapper(str(real)))
+    os.chmod(real, 0o755)
+    os.chmod(wrapper, 0o755)
+    args = ["-netdev", "socket,id=net0,fd=3", "-device", "virtio-net-pci,netdev=net0", "-name", "a b"]
+    out = subprocess.run([str(wrapper), *args], capture_output=True, text=True, check=True).stdout
+    assert out.splitlines() == ["-netdev", "stream,id=net0,addr.type=fd,addr.str=3", *args[2:]]
+
+
+def test_limactl_runs_with_the_hosts_qemu():
+    from ferment.vm.lima import LimaHost
+
+    assert LimaHost("f@box", "/l").limactl_cmd("list") == "/l list"
+    with_qemu = LimaHost("f@box", "/l", "/home/f/w/bin/qemu-system-x86_64").limactl_cmd("start", "x")
+    assert with_qemu == "QEMU_SYSTEM_X86_64=/home/f/w/bin/qemu-system-x86_64 /l start x"
 
 
 def test_images_are_fetched_by_digest():

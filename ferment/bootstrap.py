@@ -46,6 +46,13 @@ LIMA_LINK = ".local/share/ferment/lima"
 # power cut. Lima VMs stop when the host sleeps.
 POWER = {"sleep": "0", "disksleep": "0", "autorestart": "1"}
 
+# On the host: QEMU from the same nixpkgs (the build Lima's limactl wraps),
+# and a wrapper Lima runs instead (QEMU_SYSTEM_<ARCH>): bin/qemu-system-<arch>,
+# with share/ beside it, where Lima looks for QEMU's firmware.
+QEMU_FLAKE = f"github:NixOS/nixpkgs/{NIXPKGS_REV}#qemu"
+QEMU_LINK = ".local/share/ferment/qemu"
+QEMU_WRAP = ".local/share/ferment/qemu-wrap"
+
 # On the host: nix out-links (GC roots) to the VM images, for Lima to boot
 # from a local file when its own downloads have no egress.
 IMAGE_LINK = ".local/share/ferment/images"
@@ -323,6 +330,56 @@ def step_images(h: Host) -> Outcome:
     return Outcome("images", "ok" if before == p.stdout.strip() else "changed", h.facts["image"])
 
 
+def qemu_wrapper(real: str) -> str:
+    """A qemu-system-<arch> that runs `real` with Lima's user-v2 netdev
+    swapped: `-netdev socket,id=X,fd=N` aborts QEMU (built with io_uring)
+    under sustained traffic, `net_fill_rstate: Assertion 'size == 0' failed`
+    (lima-vm/lima#5722); `-netdev stream` on the same fd doesn't use that code."""
+    return f"""\
+#!/bin/sh
+# Written by ferment's bootstrap: QEMU with Lima's user-v2 netdev as
+# `stream`, not `socket`, which aborts under sustained traffic
+# (https://github.com/lima-vm/lima/issues/5722).
+for a do
+  shift
+  case $a in
+    socket,id=*,fd=*) rest=${{a#socket,}}; set -- "$@" "stream,${{rest%%,fd=*}},addr.type=fd,addr.str=${{a##*,fd=}}" ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+exec {shlex.quote(real)} "$@"
+"""
+
+
+def step_qemu(h: Host) -> Outcome:
+    name = f"qemu-system-{h.facts['arch']}"
+    home = h.facts["home"]
+    link, wrap = f"{home}/{QEMU_LINK}", f"{home}/{QEMU_WRAP}"
+    wrapper, script = f"{wrap}/bin/{name}", qemu_wrapper(f"{link}/bin/{name}")
+    before = h.sh(f"readlink {link}").stdout.strip()
+    p = h.sh(
+        f"{NIX} --extra-experimental-features 'nix-command flakes' build --out-link {link} "
+        f"--print-out-paths {QEMU_FLAKE}"
+    )
+    if p.returncode != 0:
+        return Outcome("qemu", "failed", f"building {QEMU_FLAKE}: {_err(p)}")
+    look = f"cat {wrapper} 2>/dev/null; readlink {wrap}/share"
+    status = "ok" if before == p.stdout.strip() else "changed"
+    if h.sh(look).stdout != script + f"{link}/share\n":
+        w = h.sh(
+            f"mkdir -p {wrap}/bin && cat > {wrapper} && chmod 755 {wrapper} && ln -sfn {link}/share {wrap}/share",
+            script,
+        )
+        if w.returncode != 0:
+            return Outcome("qemu", "failed", f"writing {wrapper}: {_err(w)}")
+        status = "changed"
+    v = h.sh(f"{wrapper} --version")
+    if v.returncode != 0:
+        return Outcome("qemu", "failed", f"{wrapper} --version: {_err(v)}")
+    h.facts["qemu"] = wrapper
+    return Outcome("qemu", status, f"{v.stdout.splitlines()[0]}, user-v2 as a stream netdev: {wrapper}")
+
+
 SLEEP_TARGETS = ("sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target")
 
 
@@ -444,6 +501,7 @@ def lima_backend(h: Host, sizing: Sizing | None = None) -> dict:
         # Always both, so configuring a different kind of host replaces them.
         "vm_type": h.facts.get("vm_type", "vz"),
         "image": h.facts.get("image", ""),
+        "qemu": h.facts.get("qemu", ""),
         "cpus": max(2, cpus - sizing.reserve_cpus - sizing.control_cpus),
         "memory_gib": max(4, mem - sizing.reserve_memory_gib - sizing.control_memory_gib),
         "disk_gib": max(50, vms_disk - control_disk),
@@ -464,6 +522,7 @@ def steps(kind: str, trust: list[Path] = ()) -> list[Callable[[Host], Outcome]]:
             step_kvm,
             step_nix,
             step_lima,
+            step_qemu,
             step_images,
             step_caches,
             step_sleep,

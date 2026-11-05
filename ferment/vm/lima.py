@@ -177,16 +177,25 @@ def lima_config(
     return cfg
 
 
+def qemu_env(qemu: str) -> str:
+    """The variable Lima reads a QEMU binary from: QEMU_SYSTEM_X86_64 for
+    .../qemu-system-x86_64."""
+    return "QEMU_SYSTEM_" + qemu.rsplit("/", 1)[-1].removeprefix("qemu-system-").upper()
+
+
 class LimaHost:
     """Where limactl runs: here (host=None) or over ssh on `host`.
 
     Commands are shell scripts; remotely they're interpreted by the login
-    shell of the host (often zsh on macOS), so keep them POSIX.
+    shell of the host (often zsh on macOS), so keep them POSIX. `qemu`: a
+    qemu-system-<arch> for Lima to run instead of its own (ferment.bootstrap's
+    wrapper), passed to every limactl (its host agent starts QEMU).
     """
 
-    def __init__(self, host: str | None, limactl: str = "limactl"):
+    def __init__(self, host: str | None, limactl: str = "limactl", qemu: str = ""):
         self.host = host or None
         self.limactl = limactl
+        self.qemu = qemu
 
     def run(self, script: str, *, input: str | None = None, capture: bool = True) -> str:
         argv = ["ssh", "-o", "BatchMode=yes", self.host, "--", script] if self.host else ["bash", "-c", script]
@@ -201,7 +210,8 @@ class LimaHost:
         return result.stdout if capture else ""
 
     def limactl_cmd(self, *args: str) -> str:
-        return " ".join(shlex.quote(a) for a in (self.limactl, *args))
+        env = f"{qemu_env(self.qemu)}={shlex.quote(self.qemu)} " if self.qemu else ""
+        return env + " ".join(shlex.quote(a) for a in (self.limactl, *args))
 
 
 class LimaProvider(Provider):
@@ -221,13 +231,15 @@ class LimaProvider(Provider):
         cache_locations: dict[str, str] | None = None,
         vm_type: str = "vz",
         image: str = "",
+        qemu: str = "",
     ):
         """cpus, memory_gib, disk_gib: the VM that runs the workload (the only
         VM, or a split fermenter's workload VM). control_*: a split
         fermenter's control VM (the server, builds, the archive).
         cache_locations: cache name -> a directory on the Lima host for it
-        other than cache_root/<name>. vm_type, image: as lima_config."""
-        self.lima = LimaHost(host, limactl)
+        other than cache_root/<name>. vm_type, image: as lima_config. qemu:
+        as LimaHost."""
+        self.lima = LimaHost(host, limactl, qemu)
         self.vm_type = vm_type
         self.image = image
         self.cache_root = cache_root
