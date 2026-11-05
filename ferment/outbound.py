@@ -29,6 +29,7 @@ import shlex
 import socket
 import socketserver
 import threading
+import time
 from collections.abc import Callable
 from urllib.parse import urlsplit
 
@@ -41,6 +42,10 @@ ENV_FILE = "/etc/ferment/outbound.env"
 # the provider's private names (Lima's lima-*.internal, GCE's
 # metadata.google.internal) and the metadata server.
 NO_PROXY = ["localhost", "127.0.0.1", "::1", ".internal", "169.254.169.254"]
+# Per address, and for all of a host's together. Tried IPv4 first: a client
+# on a VPN may get IPv6 addresses its routes then drop, each attempt waiting
+# out its timeout before the next (a CONNECT to pypi.org took 133s that way).
+ADDRESS_TIMEOUT = 4
 CONNECT_TIMEOUT = 15
 # Shell that puts ENV_FILE's settings in the environment, if there are any.
 PRELUDE = f"if [ -f {ENV_FILE} ]; then set -a; . {ENV_FILE}; set +a; fi\n"
@@ -59,6 +64,30 @@ def allowed(allow: list[str], host: str, port: int) -> bool:
         if port in ports and fnmatch.fnmatchcase(host, name.lower()):
             return True
     return False
+
+
+def connect(host: str, port: int) -> socket.socket:
+    """A connection to host:port: its IPv4 addresses first, then IPv6, a few
+    seconds each, within CONNECT_TIMEOUT for them all."""
+    deadline = time.monotonic() + CONNECT_TIMEOUT
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    infos.sort(key=lambda info: info[0] != socket.AF_INET)  # stable: the resolver's order within each
+    error: OSError = OSError(f"no addresses for {host}")
+    for family, kind, proto, _, address in infos:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        s = socket.socket(family, kind, proto)
+        s.settimeout(min(ADDRESS_TIMEOUT, left))
+        try:
+            s.connect(address)
+        except OSError as e:
+            s.close()
+            error = e
+            continue
+        s.settimeout(None)
+        return s
+    raise error
 
 
 def _split(target: str, default_port: int) -> tuple[str, int]:
@@ -108,11 +137,10 @@ class _Handler(socketserver.StreamRequestHandler):
             self.server.event("denied", where)
             return self._refuse("403 Forbidden", f"{where} isn't on this client's allowlist")
         try:
-            upstream = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+            upstream = connect(host, port)
         except OSError as e:
             self.server.event("failed", where)
             return self._refuse("502 Bad Gateway", f"{where}: {e}")
-        upstream.settimeout(None)
         self.server.event("allowed", where)
         with upstream:
             if method == "CONNECT":

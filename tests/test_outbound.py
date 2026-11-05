@@ -127,3 +127,25 @@ def test_the_forward_reaches_the_proxy_from_the_vms_port():
     with outbound.Proxy([]) as proxy:
         fwd = proxy.forward()
         assert fwd.ssh_args() == ["-R", f"127.0.0.1:{outbound.VM_PORT}:127.0.0.1:{proxy.port}"]
+
+
+def test_ipv4_is_tried_first_and_a_dead_address_costs_seconds_not_minutes(monkeypatch, echo):
+    """A VPN client may resolve IPv6 addresses whose routes go nowhere."""
+    import time as clock
+
+    v6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", echo, 0, 0))
+    v4 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", echo))
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [v6, v6, v4])
+    t = clock.monotonic()
+    with outbound.connect("pypi.org", echo) as s:
+        assert s.family == socket.AF_INET
+    assert clock.monotonic() - t < 1
+
+    monkeypatch.setattr(outbound, "ADDRESS_TIMEOUT", 0.2)
+    monkeypatch.setattr(outbound, "CONNECT_TIMEOUT", 0.5)
+    blackhole = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.255.255.1", 443))  # unroutable: times out
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [blackhole] * 10)
+    t = clock.monotonic()
+    with pytest.raises(OSError):
+        outbound.connect("pypi.org", 443)
+    assert clock.monotonic() - t < 1.5
