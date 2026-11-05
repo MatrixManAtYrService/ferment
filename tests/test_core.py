@@ -582,3 +582,28 @@ def test_mysql_sizes_its_buffer_pool_where_it_starts_and_the_shell_agrees_with_p
         assert int(out.stdout) == buffer_pool_bytes(total)
     (cmd,) = [p.command for p in MySQL(tmp_path, bin_dir="/m").processes()]
     assert "--innodb-buffer-pool-size=$POOL" in cmd and "--innodb-flush-log-at-trx-commit=2" in cmd
+
+
+def test_a_supervised_forward_restarts_when_its_check_says_it_carries_nothing(monkeypatch):
+    import time
+
+    from ferment import ssh
+    from ferment.vm.base import SshTarget
+
+    states = []
+    side = ssh._Supervised(SshTarget(host="vm"), [], "relay x", lambda label, state, msg: states.append((state, msg)))
+    side.argv = ["sleep", "30"]  # stands in for ssh holding the forwards
+    side.start()
+    deadline = time.monotonic() + 10
+    while side.state != "up" and time.monotonic() < deadline:
+        time.sleep(0.1)
+    first = side.proc
+    checks = iter(["nothing got through", None])
+    watcher = __import__("threading").Thread(target=side.watch, args=(lambda: next(checks, None), 0.2), daemon=True)
+    watcher.start()
+    while (len(states) < 3 or side.proc is first) and time.monotonic() < deadline + 10:
+        time.sleep(0.1)
+    side.stop()
+    assert [s for s, _ in states] == ["up", "restarted", "up"]
+    assert states[1][1] == "restarted: nothing got through"
+    assert first.returncode is not None and side.proc is not first

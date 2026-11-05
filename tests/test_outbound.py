@@ -183,3 +183,13 @@ def test_a_host_whose_tls_never_completes_is_unreachable(monkeypatch):
         t = clock.monotonic()
         assert outbound.unreachable(["pypi.org"], 0.5) == ["pypi.org"]
         assert clock.monotonic() - t < 1.5
+
+
+def test_the_probe_asks_for_a_whole_tls_handshake():
+    script = outbound.probe_script(["*.wild.example", "github.com:22", "cache.nixos.org", "pypi.org"])
+    assert f"-x http://127.0.0.1:{outbound.VM_PORT}" in script and "https://cache.nixos.org/" in script
+    assert outbound.probe_script(["*.wild.example", "github.com:22"]) is None
+    assert outbound.carried("200 0.18")
+    assert outbound.carried("404 0.2")  # the host's answer doesn't matter: it got through
+    assert not outbound.carried("000 0.000000")  # a stuck forward: CONNECT answered, TLS never finished
+    assert not outbound.carried("")

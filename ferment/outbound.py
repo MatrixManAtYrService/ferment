@@ -252,6 +252,30 @@ class Proxy:
 NIX_CONFIG = "http2 = false"
 
 
+def probe_script(allow: list[str]) -> str | None:
+    """Shell for the VM: one HTTPS request through VM_PORT to an allowlisted
+    host (the first plain name on 443), printing curl's status and when its
+    TLS handshake finished. None if the list has no such host."""
+    for entry in allow:
+        host, sep, port = entry.rpartition(":")
+        host = host if sep and port.isdigit() else entry
+        if "*" not in host and (not sep or not port.isdigit() or port == "443"):
+            proxy = f"http://127.0.0.1:{VM_PORT}"
+            fmt = "%{http_code} %{time_appconnect}"
+            return f"curl -s -o /dev/null --max-time 10 -x {proxy} -w {shlex.quote(fmt)} https://{host}/"
+    return None
+
+
+def carried(probe_output: str) -> bool:
+    """Did probe_script's request get through? Its TLS handshake finished: a
+    forward that's stuck still answers CONNECT, then passes nothing more."""
+    try:
+        _, tls = probe_output.split()
+        return float(tls) > 0
+    except ValueError:
+        return False
+
+
 def env(no_proxy: list[str] = ()) -> dict[str, str]:
     """What points a VM's tools at the proxy: both spellings, since tools
     differ in which they read; and nix's settings for going through one."""

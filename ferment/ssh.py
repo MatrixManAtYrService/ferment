@@ -166,6 +166,7 @@ class _Supervised(threading.Thread):
         self.stopping = threading.Event()
         self.proc: subprocess.Popen | None = None
         self.state = ""
+        self._restart: str | None = None
 
     def _say(self, state: str, msg: str) -> None:
         if state != self.state:
@@ -187,6 +188,10 @@ class _Supervised(threading.Thread):
                 self.proc.wait()
             if self.stopping.is_set():
                 return
+            if self._restart is not None:  # asked for: start another right away
+                self._say("restarted", f"restarted: {self._restart}")
+                self._restart = None
+                continue
             err = self.proc.stderr.read() if self.proc.stderr else ""
             if "forwarding failed" in err:
                 self._say("busy", f"port held by another session; retrying every {self.RETRY:.0f}s")
@@ -195,6 +200,20 @@ class _Supervised(threading.Thread):
             else:
                 self._say("failed", f"couldn't start ({err.strip() or 'ssh exited'}); retrying")
             self.stopping.wait(self.RETRY)
+
+    def restart(self, reason: str) -> None:
+        """Drop this ssh and start another now: its forwards are up, but
+        `reason` says they don't carry."""
+        self._restart = reason
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def watch(self, check: Callable[[], str | None], every: float) -> None:
+        """While the forwards are up, ask `check` every `every` seconds whether
+        they carry; when it names a problem, restart."""
+        while not self.stopping.wait(every):
+            if self.state == "up" and (problem := check()):
+                self.restart(problem)
 
     def stop(self) -> None:
         self.stopping.set()
@@ -209,6 +228,8 @@ def hold_tunnel(
     best_effort: list[Forward] | None = None,
     on_detach: Callable[[], None] | None = None,
     report: Callable[[str, str, str], None] | None = None,
+    check: Callable[[], str | None] | None = None,
+    check_every: float = 60.0,
 ) -> int:
     """Run the tunnel in the foreground until ssh exits (or ctrl-c).
 
@@ -217,7 +238,10 @@ def hold_tunnel(
     it can, reporting as it goes. `on_detach` runs on ctrl-c/SIGTERM/SIGHUP
     while the tunnel is still up (e.g. to say goodbye to the server through it).
     `report(label, state, message)` hears the best-effort forwards' states
-    (up, busy, lost, failed) instead of their being printed.
+    (up, busy, lost, failed, restarted) instead of their being printed.
+    `check()`, every `check_every` seconds while they're up: None if they
+    carry, else why not, and they're restarted (a forward can come up and
+    then pass nothing, for reasons not found yet).
     """
     # Own sessions: a terminal's ctrl-c reaches only us, so the tunnel is
     # still there while on_detach runs; then we stop it.
@@ -229,6 +253,8 @@ def hold_tunnel(
     )
     if side is not None:
         side.start()
+        if check is not None:
+            threading.Thread(target=side.watch, args=(check, check_every), daemon=True).start()
 
     # Closing the terminal (SIGHUP) or being killed (SIGTERM) is a detach too:
     # route both through the same cleanup as ctrl-c.
