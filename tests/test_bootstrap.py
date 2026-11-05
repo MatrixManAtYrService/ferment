@@ -188,7 +188,7 @@ def test_debian_bootstrap_converges_then_is_all_ok():
         "egress": "changed",
     }
     assert (h.facts["uid"], h.facts["vm_type"]) == (1001, "qemu")
-    assert h.facts["image"] == "/home/f/.local/share/ferment/images/nixos-lima-v0.0.5-x86_64.qcow2"
+    assert h.facts["image"] == "/home/f/.local/share/ferment/images/nixos-lima-v0.2.2-x86_64.qcow2"
     b = bootstrap.lima_backend(h)
     assert (b["vm_type"], b["image"]) == ("qemu", h.facts["image"])
 
@@ -230,8 +230,10 @@ def test_egress_rules_bind_only_the_vms_account():
 def test_images_are_fetched_by_digest():
     from ferment.vm.lima import IMAGES
 
-    expr = bootstrap.image_expr(IMAGES[1])
-    assert 'outputHashAlgo = "sha512"' in expr and IMAGES[1]["digest"].split(":")[1] in expr
+    for image in IMAGES:
+        algo, digest = image["digest"].split(":")
+        expr = bootstrap.image_expr(image)
+        assert f'outputHashAlgo = "{algo}"' in expr and f'outputHash = "{digest}"' in expr
     assert 'builder = "builtin:fetchurl"' in expr
 
 

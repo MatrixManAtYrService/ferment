@@ -43,17 +43,20 @@ from ferment.identity import client_key
 from ferment.lifetime import deadline_script, disarm_script
 from ferment.vm.base import CACHE_MOUNT, WORKLOAD_SSH_HOST, Provider, ProviderError, SshTarget, VMInfo, VMSpec, utcnow
 
-# Same image pixiebox runs on (nixos-lima v0.0.5): NixOS, nix preinstalled.
+# NixOS, nix preinstalled. aarch64: the image pixiebox runs on (nixos-lima v0.0.5).
 IMAGES = [
     {
         "location": "https://github.com/nixos-lima/nixos-lima/releases/download/v0.0.5/nixos-lima-v0.0.5-aarch64.qcow2",
         "arch": "aarch64",
         "digest": "sha512:e1daeb0dcec65c624253603ab5ec06f0831b0940cd95a88903f9bfd0ee4009b2c45806b868674c7e8cb12941e50799e85d710fc0e9ad659059108cebbc4d19c1",  # noqa: E501
     },
+    # x86_64 runs on qemu (a Linux host), where Lima 2.1.3 reaches the guest
+    # agent through a socket the image must give its user (--socket-owner):
+    # v0.2.1 and later do. vz uses vsock, so aarch64 can stay.
     {
-        "location": "https://github.com/nixos-lima/nixos-lima/releases/download/v0.0.5/nixos-lima-v0.0.5-x86_64.qcow2",
+        "location": "https://github.com/nixos-lima/nixos-lima/releases/download/v0.2.2/nixos-lima-v0.2.2-x86_64.qcow2",
         "arch": "x86_64",
-        "digest": "sha512:51fbe74c569736f1141f1c6efeaa21a0901dff0bec5bc1e863c04c7765e150c3bebd82b7f50905fb7a0a9a9b050852c250ffbdcacd17b0dc15aeb86d47587436",  # noqa: E501
+        "digest": "sha256:b43bf03d6e6cbd6af441ec66e8778442eb448616fc1371a08b4996b30c90f856",
     },
 ]
 
