@@ -223,6 +223,9 @@ class TimeController:
         if not cp["parts"]:
             raise CheckpointError(f"checkpoint {cp['id']}'s data was dropped before shelves: nothing to archive")
         base = self._present_ancestor(cp)
+        if base is not None and not base["archive"]:
+            # what it's sent relative to must be on the shelf too, or nothing else can make it
+            base = {**base, "archive": self._archive(base)}
         prefix = f"{self.shelf_prefix}/{cp['id']}"
         about = {
             k: cp.get(k)

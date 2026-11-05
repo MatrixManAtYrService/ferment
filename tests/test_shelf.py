@@ -191,3 +191,17 @@ def test_another_fermenter_imports_a_chain_from_the_shelf_with_its_stages(shelve
     assert sk.import_archive(f"snapshots/toaster/{rewound['id']}", "me")["id"] == got["id"]  # once
     with pytest.raises(CheckpointError, match="nothing on the shelf"):
         sk.import_archive("snapshots/toaster/999", "me")
+
+
+def test_archiving_one_archives_what_its_sent_relative_to(shelved):
+    tc, store, shelf = shelved
+    tc.checkpoint("loaded", name="loaded")
+    store.data = 3
+    tc.restore("loaded", wait_ready=False)  # a before-restore checkpoint in between, unarchived
+    store.data = 4
+    later = tc.checkpoint("later")
+    out = tc.archive(str(later["id"]))
+    base = tc.store.checkpoint(str(out["base"]))
+    assert base is not None and base["archive"] is not None  # on the shelf too
+    keys = shelf.list("snapshots/toaster/")
+    assert all(any(k.startswith(f"snapshots/toaster/{i}/") for k in keys) for i in (later["id"], base["id"]))
