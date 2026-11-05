@@ -12,6 +12,7 @@ this repo: no corp hostnames, package mirrors, service names, or credentials.
 | `ferment/vm/` | provider contract (`base.py`), `lima.py`, placeholders for gcp/aws |
 | `ferment/ssh.py` | run (optionally holding forwards), push_dir (tar over ssh), tunnels (`Forward`, -L and -R) |
 | `ferment/relay.py` | make a client-reachable `host:port` appear on a NixOS VM under its own name (`-R` + /etc/hosts + socat) |
+| `ferment/outbound.py` | carry a no-egress VM's outbound connections through the client: an allowlisting HTTP CONNECT proxy on the client, one `-R`, `https_proxy` on the VM (env file + systemd's manager environment) |
 | `ferment/lifetime.py` | durations, in-guest poweroff timer |
 | `ferment/server/clock.py` | `GuestClock`: the VM's clock is the workload's; offset to real time |
 | `ferment/procompose.py` | `Process`, `render`, `WorkloadSupervisor` |
