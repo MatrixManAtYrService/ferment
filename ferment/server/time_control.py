@@ -274,7 +274,8 @@ class TimeController:
         for store in self.versioned:
             receive = getattr(store, "receive", None)
             if receive is not None:
-                receive(archive["parts"], self.shelf.get(f"{archive['prefix']}/{store.archive_name}"))  # type: ignore[attr-defined]
+                stream = self.shelf.get(f"{archive['prefix']}/{store.archive_name}")  # type: ignore[attr-defined]
+                receive(archive["parts"], stream, source=archive["parts"])  # archived from here: the same names
         self.store.set_parts(cp["id"], archive["parts"])
         return self._get(str(cp["id"]))
 
@@ -309,7 +310,8 @@ class TimeController:
         for store in stores:
             parts.update(store.parts_for(cid))  # type: ignore[attr-defined]
         for store in stores:
-            store.receive(parts, self.shelf.get(f"{prefix}/{store.archive_name}"))  # type: ignore[attr-defined]
+            stream = self.shelf.get(f"{prefix}/{store.archive_name}")  # type: ignore[attr-defined]
+            store.receive(parts, stream, source=meta["parts"])  # type: ignore[attr-defined]
         name = about.get("name")
         if name and self.store.name_taken(name):
             name = None  # ours already: the import goes by its id

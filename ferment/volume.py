@@ -35,6 +35,7 @@ TABLE to find the tables that differ, then a keyed row diff of just those.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -273,26 +274,60 @@ class Volume:
         if send.returncode or z.returncode:
             raise VolumeError(f"{' '.join(argv)}: {err or f'zstd exited {z.returncode}'}")
 
-    def receive(self, sid: str) -> Receiver:
+    def receive(self, sid: str, source: str) -> Receiver:
         """Where a stream from `send` goes to make snapshot `sid` here (read-only,
-        like any snapshot): write its chunks, then `close()`. The stream may be
-        another volume's, whose snapshot had another name: it's received apart,
-        then named `sid`."""
-        made = self._snapshot_path(sid)
+        like any snapshot): write its chunks, then `close()`. `source`: the
+        snapshot's name on the volume it was sent from, which btrfs gives what
+        it receives. btrfs won't move a received (read-only) snapshot to another
+        directory, only rename it in its own: so it's received among the
+        snapshots as `source`, then renamed `sid`, and a snapshot of ours that
+        has the name `source` stands aside meanwhile (renamed, and back)."""
+        made, arrives = self._snapshot_path(sid), self._snapshot_path(source)
         if made.exists():
             raise VolumeError(f"snapshot {sid} exists")
+        self.snapshots.mkdir(parents=True, exist_ok=True)
+        self._settle()
+        aside, ours = self.snapshots / f".aside-{source}", arrives.exists()
+        # What to undo if this receive dies before it's done (_settle): written
+        # before anything moves.
+        marker = self.snapshots / f".receiving-{sid}"
+        marker.write_text(json.dumps({"source": source, "ours": ours}))
+        if ours:
+            arrives.rename(aside)
         btrfs = f"{self.bin}/btrfs" if self.bin else "btrfs"
-        incoming = self.snapshots / f".incoming-{sid}"
-        if incoming.exists():  # a receive that died: whatever it left goes
-            self._drop_incoming(incoming)
-        incoming.mkdir(parents=True)
-        receive = ["sudo", "-n", btrfs, "receive", "-q", str(incoming)]
-        return Receiver(self._zstd(), receive, made, incoming, drop=lambda: self._drop_incoming(incoming))
+        receive = ["sudo", "-n", btrfs, "receive", "-q", str(self.snapshots)]
 
-    def _drop_incoming(self, incoming: Path) -> None:
-        for sub in incoming.iterdir() if incoming.exists() else []:
-            self._btrfs("subvolume", "delete", str(sub))
-        if incoming.exists():
+        def done() -> None:
+            if aside.exists():
+                aside.rename(arrives)
+            marker.unlink(missing_ok=True)
+
+        def drop() -> None:
+            if arrives.exists():  # half received: writable and incomplete
+                self._btrfs("subvolume", "delete", str(arrives))
+            done()
+
+        return Receiver(self._zstd(), receive, made, arrives, done=done, drop=drop)
+
+    def _settle(self) -> None:
+        """Undo what a receive that died left (its marker says what it was
+        doing): what it received goes, under either name, and ours it set
+        aside comes back."""
+        for marker in self.snapshots.glob(".receiving-*"):
+            sid, said = marker.name.removeprefix(".receiving-"), json.loads(marker.read_text())
+            arrives, aside = self.snapshots / said["source"], self.snapshots / f".aside-{said['source']}"
+            received = [self.snapshots / sid]
+            if not said["ours"] or aside.exists():  # else ours never moved: `arrives` is still ours
+                received.append(arrives)
+            for p in dict.fromkeys(received):
+                if p.exists():
+                    self._btrfs("subvolume", "delete", str(p))
+            if aside.exists():
+                aside.rename(arrives)
+            marker.unlink()
+        for incoming in self.snapshots.glob(".incoming-*"):  # where receives went before
+            for sub in incoming.iterdir():
+                self._btrfs("subvolume", "delete", str(sub))
             incoming.rmdir()
 
     def usage(self) -> dict:
@@ -308,10 +343,19 @@ class Volume:
 
 class Receiver:
     """`zstd -d | btrfs receive`, fed a chunk at a time. A stream that ends
-    short or fails leaves no snapshot behind."""
+    short or fails leaves no snapshot behind. What btrfs makes, `arrives`,
+    becomes `made` (a rename in one directory); then `done()`."""
 
-    def __init__(self, zstd: str, receive: list[str], made: Path, incoming: Path, drop: Callable[[], None]):
-        self.made, self.incoming, self.drop = made, incoming, drop
+    def __init__(
+        self,
+        zstd: str,
+        receive: list[str],
+        made: Path,
+        arrives: Path,
+        done: Callable[[], None],
+        drop: Callable[[], None],
+    ):
+        self.made, self.arrives, self.done, self.drop = made, arrives, done, drop
         self.recv = subprocess.Popen(receive, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         self.unz = subprocess.Popen([zstd, "-q", "-d", "-c"], stdin=subprocess.PIPE, stdout=self.recv.stdin)
         assert self.recv.stdin is not None
@@ -328,19 +372,19 @@ class Receiver:
         self.unz.wait()
         self.recv.wait()
         err = self.recv.stderr.read().decode().strip()
-        got = list(self.incoming.iterdir()) if self.incoming.exists() else []
-        if self.unz.returncode or self.recv.returncode or len(got) != 1:
+        if self.unz.returncode or self.recv.returncode or not self.arrives.exists():
             self.abort()
             raise VolumeError(f"receiving {self.made.name}: {err or f'zstd exited {self.unz.returncode}'}")
-        got[0].rename(self.made)  # its name on the volume it came from -> ours
-        self.incoming.rmdir()
+        if self.arrives != self.made:
+            self.arrives.rename(self.made)  # its name on the volume it came from -> ours
+        self.done()
 
     def abort(self) -> None:
         for p in (self.unz, self.recv):
             if p.poll() is None:
                 p.kill()
                 p.wait()
-        self.drop()  # half received: btrfs left a subvolume, writable and incomplete
+        self.drop()
 
 
 def _disk(path: Path) -> tuple[int, int]:
@@ -384,8 +428,9 @@ class VolumeSnapshots:
             raise VolumeError("that checkpoint has no volume snapshot")
         return self.agent.send_volume(parts[PART], (base or {}).get(PART))
 
-    def receive(self, parts: dict[str, str], chunks: Iterator[bytes]) -> None:
-        self.agent.receive_volume(parts[PART], chunks)
+    def receive(self, parts: dict[str, str], chunks: Iterator[bytes], source: dict[str, str]) -> None:
+        """`source`: the parts the checkpoint had where it was archived (its snapshot's name there)."""
+        self.agent.receive_volume(parts[PART], chunks, source[PART])
 
     def parts_for(self, checkpoint_id: int) -> dict[str, str]:
         """The parts a checkpoint imported here as `checkpoint_id` gets (its snapshot's

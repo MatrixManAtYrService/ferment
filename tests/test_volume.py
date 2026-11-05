@@ -1,10 +1,12 @@
+import contextlib
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from ferment.volume import BINLOG_PART, PART, Receiver, Volume, VolumeError, VolumeSnapshots
+from ferment.volume import BINLOG_PART, PART, Volume, VolumeError, VolumeSnapshots
 
 
 class FakeBtrfs:
@@ -281,25 +283,51 @@ def test_send_and_receive_pipe_through_zstd_and_a_broken_stream_leaves_nothing(t
     sent = b"".join(v._stream(["cat", str(tmp_path / "stream")], 1 << 16))
     assert sent != payload and len(sent) < len(payload) + 1024  # zstd'd
 
-    def receiver(sid):
-        made, incoming = v.snapshots / sid, v.snapshots / f".incoming-{sid}"
-        incoming.mkdir()
-        # what btrfs receive does: the snapshot, under the name it had where it was sent from
-        recv = ["sh", "-c", f"mkdir {incoming}/ckpt-146 && cat > {incoming}/ckpt-146/data"]
-        return Receiver("zstd", recv, made, incoming, drop=lambda: shutil.rmtree(incoming))
+    # `btrfs receive DIR` makes the snapshot in DIR under the name it had where it was sent from
+    real_popen = subprocess.Popen
 
-    r = receiver("ckpt-2")
+    def popen(argv, **kw):
+        if argv[:2] == ["sudo", "-n"] and argv[3] == "receive":
+            return real_popen(["sh", "-c", 'mkdir "$1/ckpt-146" && cat > "$1/ckpt-146/data"', "-", argv[-1]], **kw)
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr("ferment.volume.subprocess.Popen", popen)
+    r = v.receive("ckpt-2", source="ckpt-146")
     for i in range(0, len(sent), 1000):
         r.write(sent[i : i + 1000])
     r.close()
     assert (v.snapshots / "ckpt-2" / "data").read_bytes() == payload
 
-    r = receiver("ckpt-3")
+    r = v.receive("ckpt-3", source="ckpt-146")
     r.write(sent[: len(sent) // 2])  # the sender died partway
     with pytest.raises(VolumeError, match="receiving ckpt-3"):
         r.close()
-    assert not (v.snapshots / "ckpt-3").exists() and not (v.snapshots / ".incoming-ckpt-3").exists()
     assert v.list() == ["ckpt-1", "ckpt-2"]  # received as ckpt-2, though it was ckpt-146 where it was sent from
+    assert sorted(p.name for p in v.snapshots.iterdir()) == ["ckpt-1", "ckpt-2"]  # no marker, nothing aside
+
+    # Ours has the name the stream's snapshot had: it stands aside, and comes back.
+    (v.snapshots / "ckpt-146").mkdir()
+    (v.snapshots / "ckpt-146" / "data").write_text("ours")
+    r = v.receive("ckpt-4", source="ckpt-146")
+    r.write(sent)
+    r.close()
+    assert (v.snapshots / "ckpt-4" / "data").read_bytes() == payload
+    assert (v.snapshots / "ckpt-146" / "data").read_text() == "ours"
+
+    # A receive that died with ours aside: the next one puts things back first.
+    r = v.receive("ckpt-5", source="ckpt-146")
+    r.write(sent[:1000])
+    for proc in (r.unz, r.recv):  # the agent died; nothing cleaned up
+        proc.kill()
+        proc.wait()
+    with contextlib.suppress(BrokenPipeError):
+        r.unz.stdin.close()
+    assert (v.snapshots / ".aside-ckpt-146").exists()
+    r = v.receive("ckpt-6", source="ckpt-146")
+    r.write(sent)
+    r.close()
+    assert (v.snapshots / "ckpt-146" / "data").read_text() == "ours" and not (v.snapshots / "ckpt-5").exists()
+    assert v.list() == ["ckpt-1", "ckpt-146", "ckpt-2", "ckpt-4", "ckpt-6"]
 
     with pytest.raises(VolumeError, match="no snapshot ckpt-9"):
         v.send("ckpt-9")  # before any byte

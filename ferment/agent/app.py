@@ -242,10 +242,11 @@ def create_agent_app(
             raise HTTPException(404, str(e))
 
     @app.put("/volume/snapshots/{sid}/receive")
-    async def receive(sid: str, request: Request):
-        """Make snapshot `sid` again from a stream `send` gave."""
+    async def receive(sid: str, request: Request, source: str):
+        """Make snapshot `sid` again from a stream `send` gave; `source`: the
+        snapshot's name where it was sent from."""
         try:
-            r = _volume().receive(sid)
+            r = _volume().receive(sid, source)
         except VolumeError as e:
             raise HTTPException(409, str(e))
         try:

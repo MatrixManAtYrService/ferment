@@ -59,7 +59,8 @@ class ShelvingStore(FakeStore):
     def parts_for(self, checkpoint_id):
         return {"fake:billing": f"imported-{checkpoint_id}"}
 
-    def receive(self, parts, chunks):
+    def receive(self, parts, chunks, source):
+        assert source and "fake:billing" in source  # the parts it had where it was archived
         data, base = b"".join(chunks).decode().split("|")
         assert base == "-" or base in self.commits, f"received {parts} without its base {base}"
         self.commits[parts["fake:billing"]] = int(data)

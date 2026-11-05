@@ -167,9 +167,9 @@ class AgentClient:
                 raise AgentError(f"GET /volume/snapshots/{sid}/send: {r.status_code} {r.text}")
             yield from r.iter_bytes(1 << 20)
 
-    def receive_volume(self, sid: str, chunks: Iterable[bytes]) -> None:
-        """Make snapshot `sid` from a stream `send_volume` gave."""
-        r = self.http.put(f"/volume/snapshots/{sid}/receive", content=chunks, timeout=None)
+    def receive_volume(self, sid: str, chunks: Iterable[bytes], source: str) -> None:
+        """Make snapshot `sid` from a stream `send_volume` gave of snapshot `source`."""
+        r = self.http.put(f"/volume/snapshots/{sid}/receive", params={"source": source}, content=chunks, timeout=None)
         if r.status_code >= 400:
             raise AgentError(f"PUT /volume/snapshots/{sid}/receive: {r.status_code} {r.text}")
 
