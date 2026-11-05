@@ -189,6 +189,7 @@ def test_a_host_whose_tls_never_completes_is_unreachable(monkeypatch):
 def test_the_probe_asks_for_a_whole_tls_handshake():
     script = outbound.probe_script(["*.wild.example", "github.com:22", "cache.nixos.org", "pypi.org"])
     assert f"-x http://127.0.0.1:{outbound.VM_PORT}" in script and "https://cache.nixos.org/" in script
+    assert script.startswith(outbound.PRELUDE)  # the roots the VM trusts, as its own tools would
     assert outbound.probe_script(["*.wild.example", "github.com:22"]) is None
     assert outbound.carried("200 0.18 0")
     assert outbound.carried("404 0.2 0")  # the host's answer doesn't matter: it got through

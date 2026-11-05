@@ -365,7 +365,8 @@ def probe_script(allow: list[str]) -> str | None:
         if "*" not in host and (not sep or not port.isdigit() or port == "443"):
             proxy = f"http://127.0.0.1:{VM_PORT}"
             fmt = "%{http_code} %{time_appconnect} %{ssl_verify_result}"
-            return f"curl -s -o /dev/null --max-time 10 -x {proxy} -w {shlex.quote(fmt)} https://{host}/"
+            # With the VM's own settings (PRELUDE: the roots it trusts), as its tools go out.
+            return PRELUDE + f"curl -s -o /dev/null --max-time 10 -x {proxy} -w {shlex.quote(fmt)} https://{host}/"
     return None
 
 
