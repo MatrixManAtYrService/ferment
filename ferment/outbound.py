@@ -29,6 +29,8 @@ import shlex
 import socket
 import socketserver
 import ssl
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -113,6 +115,82 @@ def vm_trust(ca: str = "") -> ssl.SSLContext:
     if ca.strip():
         ctx.load_verify_locations(cadata=ca)
     return ctx
+
+
+def _der(cert) -> bytes:  # noqa: ANN001
+    """A chain entry as DER: bytes from 3.13's public API, objects from 3.12's private one."""
+    return cert if isinstance(cert, bytes) else cert.public_bytes(ssl._ssl.ENCODING_DER)  # type: ignore[attr-defined]
+
+
+def _handshake(host: str, port: int, ctx: ssl.SSLContext, timeout: float) -> list[bytes]:
+    """The certificate chain (DER, leaf first) `ctx` verified for host:port."""
+    with connect(host, port) as s:
+        s.settimeout(timeout)
+        with ctx.wrap_socket(s, server_hostname=host) as tls:
+            chain = getattr(tls, "get_verified_chain", None) or tls._sslobj.get_verified_chain  # private before 3.13
+            return [_der(c) for c in chain()]
+
+
+def _unverified_top(host: str, port: int, timeout: float) -> bytes | None:
+    """The last certificate host:port sends (DER), trusted or not."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    with connect(host, port) as s:
+        s.settimeout(timeout)
+        with ctx.wrap_socket(s, server_hostname=host) as tls:
+            chain = getattr(tls, "get_unverified_chain", None) or tls._sslobj.get_unverified_chain
+            certs = [_der(c) for c in chain()]
+    return certs[-1] if certs else None
+
+
+def _keychain_candidates(top: bytes) -> list[str]:
+    """macOS: roots in the keychains named like the issuer of `top` (Python's
+    OpenSSL doesn't read the keychain, where a managed Mac keeps its corporate
+    roots). Empty elsewhere, or when `security` finds nothing."""
+    if sys.platform != "darwin":
+        return []
+    pem = ssl.DER_cert_to_PEM_cert(top)
+    issuer = subprocess.run(
+        ["openssl", "x509", "-noout", "-issuer", "-nameopt", "multiline"], input=pem, capture_output=True, text=True
+    ).stdout
+    names = [line.split("=", 1)[1].strip() for line in issuer.splitlines() if "commonName" in line]
+    found = []
+    for name in names:
+        out = subprocess.run(["security", "find-certificate", "-a", "-c", name, "-p"], capture_output=True, text=True)
+        found += [f"-----BEGIN CERTIFICATE-----{b}" for b in out.stdout.split("-----BEGIN CERTIFICATE-----")[1:]]
+    return found
+
+
+def interception_root(
+    host: str, port: int = 443, timeout: float = 10.0, machine: ssl.SSLContext | None = None
+) -> str | None:
+    """The root this machine's network re-signs TLS with, as PEM, for the VM to
+    trust (outbound_ca); None if the VM's trust (public roots) already accepts
+    what host:port presents, i.e. nothing intercepts. `machine`: this machine's
+    own trust (default: OpenSSL's); on macOS the keychain is tried too.
+    Raises OSError when no root it can find makes the VM's trust accept it."""
+    try:
+        _handshake(host, port, vm_trust(), timeout)
+        return None
+    except ssl.SSLCertVerificationError:
+        pass
+    candidates = []
+    try:
+        chain = _handshake(host, port, machine or ssl.create_default_context(), timeout)
+        candidates.append(ssl.DER_cert_to_PEM_cert(chain[-1]))  # the anchor this machine trusts
+    except ssl.SSLCertVerificationError:
+        if (top := _unverified_top(host, port, timeout)) is not None:
+            candidates += _keychain_candidates(top)
+    for pem in candidates:
+        try:
+            _handshake(host, port, vm_trust(pem), timeout)
+            return pem
+        except ssl.SSLCertVerificationError:
+            continue
+    raise OSError(
+        f"{host}:{port}'s certificate isn't one the VM would trust, and no root this machine has makes it so"
+        + ("" if candidates else " (none found: is this machine set up to trust its network's TLS inspection?)")
+    )
 
 
 def unreachable(allow: list[str], timeout: float = 5.0, ca: str = "") -> list[str]:

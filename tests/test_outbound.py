@@ -272,3 +272,30 @@ def test_the_vm_trusts_each_named_root_beside_the_systems():
     e = outbound.env()
     assert all(e[v] == outbound.CA_BUNDLE for v in outbound.CA_VARS)
     assert outbound.CA_DIR in outbound.remove_script()
+
+
+def test_the_interception_root_is_the_one_this_machine_trusts_and_the_vm_lacks(monkeypatch, intercepted):
+    import ssl
+
+    port, root = intercepted
+    real = socket.getaddrinfo
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, p, *a, **k: real("127.0.0.1", port, *a, **k))
+    machine = ssl.create_default_context()
+    machine.load_verify_locations(cadata=root)  # a managed machine: its network's root installed
+    found = outbound.interception_root("pypi.org", machine=machine)
+    assert found is not None and ssl.PEM_cert_to_DER_cert(found) == ssl.PEM_cert_to_DER_cert(root)
+    assert outbound.unreachable(["pypi.org"], 5, ca=found) == []
+
+    monkeypatch.setattr(outbound, "_keychain_candidates", lambda top: [])
+    with pytest.raises(OSError, match="isn't one the VM would trust"):
+        outbound.interception_root("pypi.org", machine=ssl.create_default_context())
+
+
+def test_no_interception_needs_no_root():
+    import ssl
+
+    try:
+        socket.create_connection(("pypi.org", 443), timeout=3).close()
+    except OSError:
+        pytest.skip("needs the internet")
+    assert outbound.interception_root("pypi.org", machine=ssl.create_default_context()) is None
