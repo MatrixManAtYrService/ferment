@@ -116,6 +116,7 @@ def test_the_vm_gets_both_spellings_and_skips_its_own_hosts():
     assert e["https_proxy"] == e["HTTPS_PROXY"] == f"http://127.0.0.1:{outbound.VM_PORT}"
     skip = e["no_proxy"].split(",")
     assert skip.count("localhost") == 1 and ".internal" in skip and skip[-1] == "nexus.corp.example"
+    assert e["NIX_CONFIG"] == "http2 = false"
     script = outbound.install_script(["nexus.corp.example"])
     assert outbound.ENV_FILE in script and "systemctl set-environment" in script
     assert "try-restart nix-daemon" in script

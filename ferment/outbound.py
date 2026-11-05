@@ -185,14 +185,22 @@ class Proxy:
         self.close()
 
 
+# curl (nix's, and others) multiplexing HTTP/2 through a CONNECT proxy now
+# and then breaks every request on a connection at once ("Error in the HTTP2
+# framing layer"; through tinyproxy too, never direct). HTTP/1.1 doesn't, and
+# nix's parallel connections (http-connections) keep it as fast.
+NIX_CONFIG = "http2 = false"
+
+
 def env(no_proxy: list[str] = ()) -> dict[str, str]:
     """What points a VM's tools at the proxy: both spellings, since tools
-    differ in which they read."""
+    differ in which they read; and nix's settings for going through one."""
     proxy = f"http://127.0.0.1:{VM_PORT}"
     skip = ",".join(dict.fromkeys([*NO_PROXY, *no_proxy]))
     out = {}
     for key, value in {"http_proxy": proxy, "https_proxy": proxy, "no_proxy": skip}.items():
         out[key] = out[key.upper()] = value
+    out["NIX_CONFIG"] = NIX_CONFIG
     return out
 
 
