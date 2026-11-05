@@ -1,3 +1,4 @@
+import contextlib
 import http.server
 import socket
 import socketserver
@@ -196,3 +197,78 @@ def test_the_probe_asks_for_a_whole_tls_handshake():
     # Behind TLS interception: a certificate the VM doesn't trust (curl's 20: no local issuer)
     assert outbound.untrusted("000 0.000000 20") and not outbound.carried("000 0.000000 20")
     assert not outbound.untrusted("000 0.000000 0") and not outbound.untrusted("")
+
+
+@pytest.fixture
+def intercepted(tmp_path):
+    """A TLS server for pypi.org signed by a root of its own, as an inspecting
+    proxy re-signs: (port, that root's PEM)."""
+    import shutil
+    import ssl
+    import subprocess
+
+    if shutil.which("openssl") is None:
+        pytest.skip("needs openssl")
+
+    def sh(*argv):
+        subprocess.run(argv, cwd=tmp_path, check=True, capture_output=True)
+
+    sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem",
+       "-days", "2", "-subj", "/CN=Inspecting Root", "-addext", "basicConstraints=critical,CA:TRUE",
+       "-addext", "keyUsage=critical,keyCertSign", "-addext", "subjectKeyIdentifier=hash")  # fmt: skip
+    # Python 3.13+ verifies strictly (VERIFY_X509_STRICT): the key identifiers are required.
+    (tmp_path / "ext").write_text(
+        "subjectAltName=DNS:pypi.org\nbasicConstraints=CA:FALSE\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n"
+    )
+    sh(
+        "openssl",
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        "srv.key",
+        "-out",
+        "srv.csr",
+        "-subj",
+        "/CN=pypi.org",
+    )
+    sh("openssl", "x509", "-req", "-in", "srv.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+       "-out", "srv.pem", "-days", "2", "-extfile", "ext")  # fmt: skip
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(tmp_path / "srv.pem", tmp_path / "srv.key")
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+
+    def serve():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            with contextlib.suppress(OSError), ctx.wrap_socket(conn, server_side=True):
+                pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    yield port, (tmp_path / "ca.pem").read_text()
+    listener.close()
+
+
+def test_reachable_means_the_vm_would_trust_it_too(monkeypatch, intercepted):
+    port, root = intercepted
+    real = socket.getaddrinfo
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, p, *a, **k: real("127.0.0.1", port, *a, **k))
+    # This machine might trust the re-signing root; the VM only does if it's named.
+    assert outbound.unreachable(["pypi.org"], 5) == ["pypi.org"]
+    assert outbound.unreachable(["pypi.org"], 5, ca=root) == []
+
+
+def test_the_vm_trusts_each_named_root_beside_the_systems():
+    pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"
+    script = outbound.install_script(["nexus.example"], ca=pem)
+    assert "MIIB" in script and outbound.CA_DIR in script and outbound.SYSTEM_CAS in script
+    assert "MIIB" not in outbound.install_script(["nexus.example"])  # none named: the system's alone
+    e = outbound.env()
+    assert all(e[v] == outbound.CA_BUNDLE for v in outbound.CA_VARS)
+    assert outbound.CA_DIR in outbound.remove_script()

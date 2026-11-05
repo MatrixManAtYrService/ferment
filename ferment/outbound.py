@@ -39,6 +39,15 @@ from ferment.ssh import Forward
 # On the VM's loopback, just below relay.FIRST_VM_PORT.
 VM_PORT = 18439
 ENV_FILE = "/etc/ferment/outbound.env"
+# What the VM trusts for HTTPS while it goes through the proxy: the system's
+# roots plus every root a carrying client named (outbound_ca: the one its
+# network re-signs TLS with, e.g. a corporate inspection proxy's). Added,
+# never removed by another client: the port goes to whichever binds it.
+CA_DIR = "/etc/ferment/outbound-ca.d"
+CA_BUNDLE = "/etc/ferment/outbound-ca.pem"
+SYSTEM_CAS = "/etc/ssl/certs/ca-certificates.crt"
+# Who reads which: OpenSSL (Python, git, uv's native TLS), nix, curl, requests, git.
+CA_VARS = ("SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO")
 # Reached directly, never through the proxy: loopback (relays bind there too),
 # the provider's private names (Lima's lima-*.internal, GCE's
 # metadata.google.internal) and the metadata server.
@@ -91,17 +100,32 @@ def connect(host: str, port: int) -> socket.socket:
     raise error
 
 
-def unreachable(allow: list[str], timeout: float = 5.0) -> list[str]:
-    """The allowlist's hosts this machine can't reach, all tried at once
-    within `timeout`: DNS (a VPN's resolver may hang on names it won't serve),
-    the connection, and on 443 a verified TLS handshake, as the VM's own
-    will be (a network may let the connection open, then hold or intercept
-    the TLS: a VPN machine passed for pypi.org on TCP alone, and every
-    request through it hung). Wildcard entries can't be tried, and aren't.
+def vm_trust(ca: str = "") -> ssl.SSLContext:
+    """TLS verification as the VM will do it: public roots (certifi's, not
+    this machine's store, which may hold a corporate root the VM lacks) plus
+    `ca` (PEM), the root this client's network re-signs with, if any."""
+    try:
+        import certifi
+
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+    if ca.strip():
+        ctx.load_verify_locations(cadata=ca)
+    return ctx
+
+
+def unreachable(allow: list[str], timeout: float = 5.0, ca: str = "") -> list[str]:
+    """The allowlist's hosts this machine can't reach for the VM, all tried at
+    once within `timeout`: DNS (a VPN's resolver may hang on names it won't
+    serve), the connection, and on 443 a TLS handshake verified as the VM
+    will verify it (vm_trust: a network that intercepts TLS passes only if
+    `ca` names its root). Wildcard entries can't be tried, and aren't.
     The VM gets one proxy, whoever's: a client that can't reach some of its
     hosts shouldn't be it."""
     entries = [e for e in allow if "*" not in e]
     reached: set[str] = set()
+    trust = vm_trust(ca)
 
     def attempt(entry: str) -> None:
         host, sep, port = entry.rpartition(":")
@@ -109,7 +133,7 @@ def unreachable(allow: list[str], timeout: float = 5.0) -> list[str]:
         with contextlib.suppress(OSError), connect(host, port) as s:
             if port == 443:
                 s.settimeout(timeout)
-                with ssl.create_default_context().wrap_socket(s, server_hostname=host):
+                with trust.wrap_socket(s, server_hostname=host):
                     pass
             reached.add(entry)
 
@@ -294,21 +318,40 @@ def env(no_proxy: list[str] = ()) -> dict[str, str]:
     for key, value in {"http_proxy": proxy, "https_proxy": proxy, "no_proxy": skip}.items():
         out[key] = out[key.upper()] = value
     out["NIX_CONFIG"] = NIX_CONFIG
+    out.update(dict.fromkeys(CA_VARS, CA_BUNDLE))
     return out
 
 
-def install_script(no_proxy: list[str] = ()) -> str:
+def install_script(no_proxy: list[str] = (), ca: str = "") -> str:
     """Shell (the VM's ssh user, with sudo) that points the VM's outbound
     traffic at VM_PORT: ENV_FILE for shells (PRELUDE), systemd's manager
     environment for every unit started from now on, and a restarted
-    nix-daemon (it fetches substitutes) when that changed anything.
-    Idempotent; systemd's environment is runtime state, so deploy re-applies
-    it after a reboot."""
+    nix-daemon (it fetches substitutes) when that changed anything. `ca`
+    (PEM): a root to trust from now on (CA_DIR), beside the system's and any
+    other client's. Idempotent; systemd's environment is runtime state, so
+    it's applied again after a reboot (deploy, attach)."""
     settings = env(no_proxy)
     text = "".join(f"{k}={shlex.quote(v)}\n" for k, v in settings.items())
     assignments = " ".join(shlex.quote(f"{k}={v}") for k, v in settings.items())
+    pem = ca.strip() + "\n" if ca.strip() else ""
+    add_ca = (
+        f"ca={shlex.quote(pem)}\n"
+        f'name=$(printf "%s" "$ca" | sha256sum | cut -c1-16).pem\n'
+        f'if [ ! -f {CA_DIR}/"$name" ]; then\n'
+        f"  sudo install -d {CA_DIR}\n"
+        f'  printf "%s" "$ca" | sudo tee {CA_DIR}/"$name" >/dev/null\n'
+        f"fi\n"
+        if pem
+        else ""
+    )
     return f"""\
 set -eu
+{add_ca}sudo install -d /etc/ferment
+bundle=$(cat {SYSTEM_CAS}; cat {CA_DIR}/*.pem 2>/dev/null || true)
+if [ "$(cat {CA_BUNDLE} 2>/dev/null)" != "$bundle" ]; then
+  printf '%s\\n' "$bundle" | sudo tee {CA_BUNDLE} >/dev/null
+  changed=1
+fi
 want={shlex.quote(text)}
 if [ "$(cat {ENV_FILE} 2>/dev/null)" != "$(printf '%s' "$want")" ]; then
   sudo install -d /etc/ferment
@@ -329,7 +372,7 @@ def remove_script() -> str:
     return f"""\
 set -eu
 if [ -f {ENV_FILE} ] || systemctl show-environment | grep -q '^https_proxy='; then
-  sudo rm -f {ENV_FILE}
+  sudo rm -rf {ENV_FILE} {CA_BUNDLE} {CA_DIR}
   sudo systemctl unset-environment {names}
   sudo systemctl try-restart nix-daemon.service
 fi
