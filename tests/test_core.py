@@ -557,3 +557,22 @@ def test_lima_on_linux_boots_a_local_image_with_qemu():
     assert (mac["vmType"], mac["images"]) == ("vz", lima.IMAGES)
     linux = lima.lima_config(spec, vm_type="qemu", image="/home/f/.local/share/ferment/images/n.qcow2")
     assert (linux["vmType"], linux["images"]) == ("qemu", [{"location": "/home/f/.local/share/ferment/images/n.qcow2"}])
+
+
+def test_mysql_sizes_its_buffer_pool_where_it_starts_and_the_shell_agrees_with_python(tmp_path):
+    import subprocess
+
+    from ferment.databases import GIB, POOL_SH, MySQL, buffer_pool_bytes
+
+    assert buffer_pool_bytes(10 * GIB) == int(4 * GIB // (1 << 27)) * (1 << 27)  # 10 GiB VM: leave 6 for services
+    assert buffer_pool_bytes(105 * GIB) == int(63 * GIB // (1 << 27)) * (1 << 27)  # a big one: 60%
+    assert buffer_pool_bytes(2 * GIB) == 1 << 28  # never under 256 MiB
+    meminfo = tmp_path / "meminfo"
+    for total in (10 * GIB, 105 * GIB, 2 * GIB):
+        meminfo.write_text(f"MemTotal:       {total // 1024} kB\\nMemFree: 1 kB\\n")
+        out = subprocess.run(
+            ["sh", "-c", POOL_SH.replace("/proc/meminfo", str(meminfo))], capture_output=True, text=True
+        )
+        assert int(out.stdout) == buffer_pool_bytes(total)
+    (cmd,) = [p.command for p in MySQL(tmp_path, bin_dir="/m").processes()]
+    assert "--innodb-buffer-pool-size=$POOL" in cmd and "--innodb-flush-log-at-trx-commit=2" in cmd

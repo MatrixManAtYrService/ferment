@@ -88,6 +88,30 @@ class MariaDB(Database):
         ]
 
 
+GIB = 1 << 30
+REDO_LOG_BYTES = 2 * GIB  # on the snapshot volume: more would add to every snapshot's own size
+# The buffer pool, from the memory of the machine MySQL starts on (the workload VM,
+# not where the process list is made): 60% of it, leaving the services at least
+# 6 GiB, never under 256 MiB; in 128 MiB chunks.
+POOL_SH = (
+    "awk '/^MemTotal:/ { m = $2 * 1024; p = m * 0.6; q = m - 6 * 2^30; if (q < p) p = q; "
+    'if (p < 2^28) p = 2^28; printf "%d", int(p / 2^27) * 2^27 }\' /proc/meminfo'
+)
+
+
+def buffer_pool_bytes(mem_total: int) -> int:
+    """POOL_SH in Python (the offline server, started from here)."""
+    pool = min(mem_total * 0.6, mem_total - 6 * GIB)
+    return int(max(pool, 1 << 28) // (1 << 27)) * (1 << 27)
+
+
+def _mem_total() -> int:
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemTotal:"):
+            return int(line.split()[1]) * 1024
+    return 8 * GIB
+
+
 class MySQL(Database):
     """MySQL 8.4 from FERMENT_MYSQL_BIN (by path: MariaDB's packages also
     install `mysql`/`mysqldump` names).
@@ -176,6 +200,13 @@ class MySQL(Database):
             # checks it (Java's, by default when the server offers TLS) refuse
             # to connect. Nothing here leaves the VMs' private network.
             "--tls-version=",
+            # A lab, not a bank: durability comes from snapshots taken at quiet
+            # points, not an fsync per commit (with a default 128 MB buffer pool
+            # and a 100 MB redo log, a month-start back-out rewrote 283 GB to
+            # delete a few). The buffer pool is sized where it starts (POOL_SH).
+            f"--innodb-redo-log-capacity={REDO_LOG_BYTES}",
+            "--innodb-flush-log-at-trx-commit=2",
+            "--sync-binlog=0",
         ]  # fmt: skip
 
     def processes(self) -> list[Process]:
@@ -183,7 +214,7 @@ class MySQL(Database):
         return [
             Process(
                 "mysql",
-                f"{self._init_script()} && exec {server}",
+                f"{self._init_script()} && POOL=$({POOL_SH}) && exec {server} --innodb-buffer-pool-size=$POOL",
                 readiness_exec=f"{self.client} -e 'SELECT 1'",
                 readiness_initial_delay=2,
             )
@@ -206,7 +237,9 @@ class MySQL(Database):
         subprocess.run(["bash", "-c", self._init_script()], check=True)
         log_path = self.state_dir / "mysql84-offline.log"
         with log_path.open("a") as log:
-            proc = subprocess.Popen(self._server_args(port, self._socket(f"mysql84-{port}")), stdout=log, stderr=log)
+            args = [*self._server_args(port, self._socket(f"mysql84-{port}")),
+                    f"--innodb-buffer-pool-size={buffer_pool_bytes(_mem_total())}"]  # fmt: skip
+            proc = subprocess.Popen(args, stdout=log, stderr=log)
         try:
             deadline = time.monotonic() + 120
             while subprocess.run([*self.client_args(port), "-e", "SELECT 1"], capture_output=True).returncode:
