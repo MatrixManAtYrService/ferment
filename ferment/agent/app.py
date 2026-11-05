@@ -7,6 +7,7 @@ GET    /workload           {running, processes}: each process with a `ready` ver
 PUT    /workload           {processes}: (re)start the workload as exactly these
 DELETE /workload           stop it
 GET    /logs/{name}        a process's output from byte `offset` on
+GET    /logtrees/{tree}    files under a log tree (e.g. Airflow's task logs) written lately; /file: one, from `offset`
 POST   /db/offline         run mysqld on the live data dir (workload stopped): {port}
 DELETE /db/offline         stop it
 GET    /volume             the data volume (ferment.volume): its snapshots, what it takes on disk
@@ -69,6 +70,7 @@ def create_agent_app(
     volume: Volume | None = None,
     probes: Path | None = None,
     artifacts: Path | None = None,
+    log_trees: dict[str, Path] | None = None,
     set_system_time: Callable[[dt.datetime], None] = sudo_date,
     system_now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
     current_boot: Callable[[], str] = boot_id,
@@ -169,6 +171,41 @@ def create_agent_app(
     def log(name: str, offset: int = 0):
         text, next_offset = supervisor.log(name, offset)
         return {"text": text, "offset": next_offset}
+
+    def _tree(tree: str) -> Path:
+        root = (log_trees or {}).get(tree)
+        if root is None:
+            raise HTTPException(404, f"no log tree {tree!r}")
+        return root
+
+    @app.get("/logtrees/{tree}")
+    def tree_files(tree: str, within_s: float = 86400):
+        """The files under a log tree (e.g. Airflow's task logs) written in the
+        last `within_s` seconds of this machine's clock, or later than now (the
+        clock went back): {path (relative), size}."""
+        root = _tree(tree)
+        cutoff = system_now().timestamp() - within_s
+        out = []
+        for f in root.rglob("*") if root.is_dir() else []:
+            with contextlib.suppress(OSError):
+                st = f.stat()
+                if f.is_file() and st.st_mtime >= cutoff:
+                    out.append({"path": str(f.relative_to(root)), "size": st.st_size})
+        return out
+
+    @app.get("/logtrees/{tree}/file")
+    def tree_file(tree: str, path: str, offset: int = 0):
+        root = _tree(tree).resolve()
+        f = (root / path).resolve()
+        if not f.is_relative_to(root):
+            raise HTTPException(400, "outside the tree")
+        if not f.is_file():
+            return {"text": "", "offset": offset}
+        offset = min(offset, f.stat().st_size)
+        with f.open("rb") as fh:
+            fh.seek(offset)
+            data = fh.read(1_000_000)
+        return {"text": data.decode(errors="replace"), "offset": offset + len(data)}
 
     @app.post("/db/offline")
     def start_offline():

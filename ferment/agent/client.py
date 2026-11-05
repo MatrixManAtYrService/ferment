@@ -133,6 +133,14 @@ class AgentClient:
         out = self._request("GET", f"/logs/{name}", params={"offset": offset})
         return out["text"], out["offset"]
 
+    def tree_files(self, tree: str, within_s: float = 86400) -> list[dict]:
+        """Files under one of the agent's log trees written lately: {path, size}."""
+        return self._request("GET", f"/logtrees/{tree}", params={"within_s": within_s})  # type: ignore[return-value]
+
+    def tree_read(self, tree: str, path: str, offset: int = 0) -> tuple[str, int]:
+        out = self._request("GET", f"/logtrees/{tree}/file", params={"path": path, "offset": offset})
+        return out["text"], out["offset"]  # type: ignore[index]
+
     # -- what only the workload's machine can read -------------------------------------
 
     @contextlib.contextmanager

@@ -136,6 +136,7 @@ def create_app(
     loki_url: str | None = None,
     log_files: Callable[[], dict[str, tuple[dict[str, str], Path]]] | None = None,
     grafana_url: str | None = None,
+    log_trees: dict[str, Callable[[str], tuple[dict[str, str], dict[str, str]]]] | None = None,
 ) -> FastAPI:
     """`before_deploy(name, build, say)` runs before a service is (re)deployed,
     e.g. its schema migrations; raising stops the deploy. `services` lists
@@ -144,7 +145,9 @@ def create_app(
     `measure`: VM name -> a sample of it (ferment.measure), taken every
     interval and kept; default, this machine as "vm". `loki_url`: ship the
     workload's process logs there, and `log_files()` (stream name -> (labels,
-    path)), stamped with real time (ferment.server.telemetry). `grafana_url`:
+    path)), and the files the agent's log trees have lately (`log_trees`: tree ->
+    a file's path -> (labels, structured metadata)), stamped with real time
+    (ferment.server.telemetry). `grafana_url`:
     post marks, clock sets, checkpoints, restores and deploys there as
     annotations."""
     store = controller.store
@@ -172,9 +175,9 @@ def create_app(
     if loki_url:
         workload_role = "workload" if getattr(controller.supervisor, "measure_now", None) is not None else "vm"
 
-        def log_sources() -> dict[str, tuple[dict[str, str], telemetry.Reader]]:
+        def log_sources() -> dict[str, telemetry.Source]:
             sup = controller.supervisor
-            out: dict[str, tuple[dict[str, str], telemetry.Reader]] = {
+            out: dict[str, telemetry.Source] = {
                 f"process/{p['name']}": (
                     {"source": "process", "vm": workload_role, "process": p["name"]},
                     lambda offset, name=p["name"]: sup.log(name, offset),
@@ -184,6 +187,15 @@ def create_app(
             }
             for name, (labels, path) in (log_files() if log_files else {}).items():
                 out[name] = (labels, telemetry.file_reader(path))
+            for tree, describe in (log_trees or {}).items():
+                try:
+                    files = sup.tree_files(tree) if hasattr(sup, "tree_files") else []
+                except Exception:  # noqa: BLE001 - the agent restarting: this tree waits a round
+                    files = []
+                for f in files:
+                    labels, meta = describe(f["path"])
+                    read = lambda offset, tree=tree, path=f["path"]: sup.tree_read(tree, path, offset)  # noqa: E731
+                    out[f"{tree}/{f['path']}"] = ({"vm": workload_role, **labels}, read, meta)
             return out
 
         shipper = telemetry.LogShipper(

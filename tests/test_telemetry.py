@@ -160,3 +160,41 @@ def test_annotations_mark_regions_and_notable_events():
     assert calls[0][2]["tags"] == ["fermenter", "restored"]
     assert calls[1][2]["tags"] == ["fermenter", "mark", "mark-3"]
     assert calls[3][1] == "/grafana/api/annotations/41" and calls[3][2] == {"timeEnd": 1793876400000}
+
+
+def test_a_sources_metadata_rides_on_every_line(tmp_path):
+    log = tmp_path / "attempt=1.log"
+    (tmp_path / "logship.json").write_text("{}")
+    log.write_text("[2026-11-01T03:10:00.000+0000] task ran\n")
+    pushed: list = []
+    s = LogShipper(
+        "http://loki",
+        lambda: {"airflow/x": ({"source": "airflow"}, file_reader(log), {"task_id": "post", "attempt": "1"})},
+        tmp_path / "logship.json",
+        fake_now=lambda: dt.datetime(2026, 11, 1, tzinfo=UTC),
+        real_now=lambda: dt.datetime(2026, 11, 5, tzinfo=UTC),
+        http=_loki(pushed),
+    )
+    assert s.tick() == 1
+    assert pushed[0]["values"][0][2] == {
+        "task_id": "post",
+        "attempt": "1",
+        "fake_time": "2026-11-01T03:10:00.000+00:00",
+    }
+
+
+def test_the_agent_serves_its_log_trees_and_only_inside_them(tmp_path):
+    from ferment.agent.app import create_agent_app
+    from ferment.procompose import WorkloadSupervisor
+
+    logs = tmp_path / "airflow-logs"
+    (logs / "dag_id=d" / "run_id=r").mkdir(parents=True)
+    (logs / "dag_id=d" / "run_id=r" / "attempt=1.log").write_text("hello\n")
+    (tmp_path / "secret").write_text("no\n")
+    app = create_agent_app(WorkloadSupervisor(tmp_path / "w", 1), log_trees={"airflow": logs})
+    with TestClient(app) as c:
+        assert c.get("/logtrees/airflow").json() == [{"path": "dag_id=d/run_id=r/attempt=1.log", "size": 6}]
+        got = c.get("/logtrees/airflow/file", params={"path": "dag_id=d/run_id=r/attempt=1.log", "offset": 2}).json()
+        assert got == {"text": "llo\n", "offset": 6}
+        assert c.get("/logtrees/airflow/file", params={"path": "../secret"}).status_code == 400
+        assert c.get("/logtrees/nope").status_code == 404

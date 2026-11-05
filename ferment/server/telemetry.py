@@ -112,6 +112,9 @@ def fake_stamp(line: str) -> str | None:
 
 
 Reader = Callable[[int], tuple[str, int]]  # offset -> (text from there, the next offset)
+# A stream to ship: its labels, its reader, and (optionally) structured
+# metadata for every line (high-cardinality ids that shouldn't be labels).
+Source = tuple[dict[str, str], Reader] | tuple[dict[str, str], Reader, dict[str, str]]
 
 
 def file_reader(path: Path) -> Reader:
@@ -130,14 +133,14 @@ def file_reader(path: Path) -> Reader:
 class LogShipper:
     """Every `interval` s, what each source wrote since last time, to Loki.
 
-    `sources()` -> {stream name: (labels, reader)}; the name keys the offset.
+    `sources()` -> {stream name: (labels, reader[, metadata])}; the name keys the offset.
     `fake_now()` is the guest clock's reading now (for lines without a stamp).
     """
 
     def __init__(
         self,
         loki_url: str,
-        sources: Callable[[], dict[str, tuple[dict[str, str], Reader]]],
+        sources: Callable[[], dict[str, Source]],
         state_file: Path,
         fake_now: Callable[[], dt.datetime],
         real_now: Callable[[], dt.datetime],
@@ -157,19 +160,19 @@ class LogShipper:
     def tick(self) -> int:
         """Ship what's new; the number of lines shipped."""
         shipped = 0
-        for name, (labels, read) in self.sources().items():
+        for name, (labels, read, *meta) in self.sources().items():
             if name not in self.offsets:
                 # Skip what was there before shipping ever started; ship a new log from its start.
                 self.offsets[name] = 2**62 if self.first_start else 0
             try:
-                shipped += self._ship(name, labels, read)
+                shipped += self._ship(name, labels, read, meta[0] if meta else {})
             except (httpx.HTTPError, OSError):  # Loki or the agent not up yet: try again next time
                 continue
         self.first_start = False
         self._save()
         return shipped
 
-    def _ship(self, name: str, labels: dict[str, str], read: Reader) -> int:
+    def _ship(self, name: str, labels: dict[str, str], read: Reader, meta: dict[str, str]) -> int:
         n = 0
         while True:
             start = self.offsets[name]
@@ -188,7 +191,7 @@ class LogShipper:
             for line in body.splitlines():
                 if line.strip():
                     self._ns = max(self._ns + 1, int(real.timestamp() * 1e9))
-                    values.append([str(self._ns), line, {"fake_time": fake_stamp(line) or fake}])
+                    values.append([str(self._ns), line, {**meta, "fake_time": fake_stamp(line) or fake}])
             if values:
                 self.http.post(self.url, json={"streams": [{"stream": labels, "values": values}]}).raise_for_status()
                 n += len(values)
