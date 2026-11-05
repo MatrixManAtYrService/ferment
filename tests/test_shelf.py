@@ -56,6 +56,9 @@ class ShelvingStore(FakeStore):
         ref = parts["fake:billing"]
         yield f"{self.commits[ref]}|{base['fake:billing'] if base else '-'}".encode()
 
+    def parts_for(self, checkpoint_id):
+        return {"fake:billing": f"imported-{checkpoint_id}"}
+
     def receive(self, parts, chunks):
         data, base = b"".join(chunks).decode().split("|")
         assert base == "-" or base in self.commits, f"received {parts} without its base {base}"
@@ -156,3 +159,35 @@ def test_forever_drops_named_ones_on_request_and_takes_the_shelf_copy_too(shelve
         tc.drop(str(head))
     tc.drop(str(head), forever=True)  # the live data stays; only the way back to it goes
     assert not tc.store.checkpoint(str(head))["parts"]
+
+
+def test_another_fermenter_imports_a_chain_from_the_shelf_with_its_stages(shelved, tmp_path):
+    tc, store, shelf = shelved  # "toaster"
+    tc.checkpoint("loaded", name="loaded")
+    store.data = 7
+    rewound = tc.checkpoint("rewound")
+    tc.store.adopt(rewound["id"], "rewound-11-03", "fp-1", {"run_started": "2026-11-03T00:31:00Z"})
+    loaded = tc.store.checkpoint("loaded")
+    tc.archive(str(loaded["id"]))
+    tc.archive(str(rewound["id"]))  # relative to loaded
+
+    other = ShelvingStore()  # "skillet": the same shelf, its own volume and store
+    clock = GuestClock(
+        tmp_path / "time2.json", set_system_time=lambda w: None, system_now=lambda: dt.datetime.now(dt.UTC)
+    )
+    (tmp_path / "skillet").mkdir()
+    sk = TimeController(Stack(), Supervisor(), tmp_path / "skillet", versioned=[other], clock=clock, shelf=shelf)
+    sk.checkpoint("its own", name="its-own")
+    head = sk.store.head()
+    got = sk.import_archive(f"snapshots/toaster/{rewound['id']}", "me")
+    assert got["stage"] == "rewound-11-03" and got["fingerprint"] == "fp-1"
+    assert got["value"] == {"run_started": "2026-11-03T00:31:00Z"}
+    base = sk.store.checkpoint(str(got["parent"]))
+    assert base is not None and base["name"] == "loaded"  # its base came first, by name
+    assert sk.store.head() == head  # the workload didn't move
+    assert sk.store.stage("rewound-11-03", "fp-1")[0]["id"] == got["id"]  # a script here finds it
+    sk.restore(str(got["id"]), wait_ready=False)
+    assert other.data == 7
+    assert sk.import_archive(f"snapshots/toaster/{rewound['id']}", "me")["id"] == got["id"]  # once
+    with pytest.raises(CheckpointError, match="nothing on the shelf"):
+        sk.import_archive("snapshots/toaster/999", "me")

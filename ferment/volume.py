@@ -232,7 +232,9 @@ class Volume:
             self._btrfs("subvolume", "delete", str(path))
 
     def list(self) -> list[str]:
-        return sorted(p.name for p in self.snapshots.iterdir()) if self.snapshots.exists() else []
+        if not self.snapshots.exists():
+            return []
+        return sorted(p.name for p in self.snapshots.iterdir() if not p.name.startswith("."))
 
     # -- to and from the shelf ---------------------------------------------------------
 
@@ -272,14 +274,26 @@ class Volume:
             raise VolumeError(f"{' '.join(argv)}: {err or f'zstd exited {z.returncode}'}")
 
     def receive(self, sid: str) -> Receiver:
-        """Where a stream from `send` goes to make snapshot `sid` here again
-        (read-only, like any snapshot): write its chunks, then `close()`."""
-        if self._snapshot_path(sid).exists():
+        """Where a stream from `send` goes to make snapshot `sid` here (read-only,
+        like any snapshot): write its chunks, then `close()`. The stream may be
+        another volume's, whose snapshot had another name: it's received apart,
+        then named `sid`."""
+        made = self._snapshot_path(sid)
+        if made.exists():
             raise VolumeError(f"snapshot {sid} exists")
         btrfs = f"{self.bin}/btrfs" if self.bin else "btrfs"
-        made = self._snapshot_path(sid)
-        receive = ["sudo", "-n", btrfs, "receive", "-q", str(self.snapshots)]
-        return Receiver(self._zstd(), receive, made, drop=lambda: self.delete(sid))
+        incoming = self.snapshots / f".incoming-{sid}"
+        if incoming.exists():  # a receive that died: whatever it left goes
+            self._drop_incoming(incoming)
+        incoming.mkdir(parents=True)
+        receive = ["sudo", "-n", btrfs, "receive", "-q", str(incoming)]
+        return Receiver(self._zstd(), receive, made, incoming, drop=lambda: self._drop_incoming(incoming))
+
+    def _drop_incoming(self, incoming: Path) -> None:
+        for sub in incoming.iterdir() if incoming.exists() else []:
+            self._btrfs("subvolume", "delete", str(sub))
+        if incoming.exists():
+            incoming.rmdir()
 
     def usage(self) -> dict:
         """What the volume takes on the VM's disk, what it may grow to, and what the VM's disk has left."""
@@ -296,8 +310,8 @@ class Receiver:
     """`zstd -d | btrfs receive`, fed a chunk at a time. A stream that ends
     short or fails leaves no snapshot behind."""
 
-    def __init__(self, zstd: str, receive: list[str], made: Path, drop: Callable[[], None]):
-        self.made, self.drop = made, drop
+    def __init__(self, zstd: str, receive: list[str], made: Path, incoming: Path, drop: Callable[[], None]):
+        self.made, self.incoming, self.drop = made, incoming, drop
         self.recv = subprocess.Popen(receive, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         self.unz = subprocess.Popen([zstd, "-q", "-d", "-c"], stdin=subprocess.PIPE, stdout=self.recv.stdin)
         assert self.recv.stdin is not None
@@ -314,17 +328,19 @@ class Receiver:
         self.unz.wait()
         self.recv.wait()
         err = self.recv.stderr.read().decode().strip()
-        if self.unz.returncode or self.recv.returncode or not self.made.exists():
+        got = list(self.incoming.iterdir()) if self.incoming.exists() else []
+        if self.unz.returncode or self.recv.returncode or len(got) != 1:
             self.abort()
             raise VolumeError(f"receiving {self.made.name}: {err or f'zstd exited {self.unz.returncode}'}")
+        got[0].rename(self.made)  # its name on the volume it came from -> ours
+        self.incoming.rmdir()
 
     def abort(self) -> None:
         for p in (self.unz, self.recv):
             if p.poll() is None:
                 p.kill()
                 p.wait()
-        if self.made.exists():  # half received: btrfs left a subvolume, writable and incomplete
-            self.drop()
+        self.drop()  # half received: btrfs left a subvolume, writable and incomplete
 
 
 def _disk(path: Path) -> tuple[int, int]:
@@ -370,3 +386,8 @@ class VolumeSnapshots:
 
     def receive(self, parts: dict[str, str], chunks: Iterator[bytes]) -> None:
         self.agent.receive_volume(parts[PART], chunks)
+
+    def parts_for(self, checkpoint_id: int) -> dict[str, str]:
+        """The parts a checkpoint imported here as `checkpoint_id` gets (its snapshot's
+        name here; no binlog position: that was the other volume's binlog)."""
+        return {PART: f"ckpt-{checkpoint_id}"}

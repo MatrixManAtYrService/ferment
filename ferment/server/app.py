@@ -39,6 +39,10 @@ class SetTime(BaseModel):
     at: dt.datetime
 
 
+class ImportReq(BaseModel):
+    prefix: str
+
+
 class NewMark(BaseModel):
     label: str
 
@@ -293,6 +297,24 @@ def create_app(
             raise HTTPException(409, str(e)) from e
         broadcast("checkpoint", who(request), f"{who(request)} brought checkpoint {out['id']} back from the shelf")
         return out
+
+    @app.post("/checkpoints/import")
+    def import_checkpoint(req: ImportReq, request: Request):
+        """Make a checkpoint here from one archived on the shelf (by any fermenter),
+        its base first; the workload stays where it is."""
+        try:
+            out = controller.import_archive(req.prefix, who(request))
+        except CheckpointError as e:
+            raise HTTPException(409, str(e)) from e
+        broadcast("checkpoint", who(request), f"{who(request)} imported checkpoint {out['id']} from {req.prefix}")
+        return out
+
+    @app.get("/shelf")
+    def shelf_list(prefix: str = ""):
+        """What's on the shelf under `prefix` (keys), with each object's metadata."""
+        if controller.shelf is None:
+            raise HTTPException(404, "this fermenter has no shelf")
+        return [{"key": k, "meta": controller.shelf.meta(k)} for k in controller.shelf.list(prefix)]
 
     @app.post("/checkpoints/prune")
     def prune_checkpoints(request: Request, kind: str = "before-restore", keep: int = 3):

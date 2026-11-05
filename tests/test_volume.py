@@ -282,10 +282,11 @@ def test_send_and_receive_pipe_through_zstd_and_a_broken_stream_leaves_nothing(t
     assert sent != payload and len(sent) < len(payload) + 1024  # zstd'd
 
     def receiver(sid):
-        made = v.snapshots / sid
-        return Receiver(
-            "zstd", ["sh", "-c", f"mkdir {made} && cat > {made}/data"], made, drop=lambda: shutil.rmtree(made)
-        )
+        made, incoming = v.snapshots / sid, v.snapshots / f".incoming-{sid}"
+        incoming.mkdir()
+        # what btrfs receive does: the snapshot, under the name it had where it was sent from
+        recv = ["sh", "-c", f"mkdir {incoming}/ckpt-146 && cat > {incoming}/ckpt-146/data"]
+        return Receiver("zstd", recv, made, incoming, drop=lambda: shutil.rmtree(incoming))
 
     r = receiver("ckpt-2")
     for i in range(0, len(sent), 1000):
@@ -297,7 +298,8 @@ def test_send_and_receive_pipe_through_zstd_and_a_broken_stream_leaves_nothing(t
     r.write(sent[: len(sent) // 2])  # the sender died partway
     with pytest.raises(VolumeError, match="receiving ckpt-3"):
         r.close()
-    assert not (v.snapshots / "ckpt-3").exists()
+    assert not (v.snapshots / "ckpt-3").exists() and not (v.snapshots / ".incoming-ckpt-3").exists()
+    assert v.list() == ["ckpt-1", "ckpt-2"]  # received as ckpt-2, though it was ckpt-146 where it was sent from
 
     with pytest.raises(VolumeError, match="no snapshot ckpt-9"):
         v.send("ckpt-9")  # before any byte

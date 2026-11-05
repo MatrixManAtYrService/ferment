@@ -224,7 +224,21 @@ class TimeController:
             raise CheckpointError(f"checkpoint {cp['id']}'s data was dropped before shelves: nothing to archive")
         base = self._present_ancestor(cp)
         prefix = f"{self.shelf_prefix}/{cp['id']}"
-        about = {k: cp.get(k) for k in ("id", "name", "message", "kind", "fake_time", "parent", "stage", "fingerprint")}
+        about = {
+            k: cp.get(k)
+            for k in (
+                "id",
+                "name",
+                "message",
+                "kind",
+                "fake_time",
+                "offset_seconds",
+                "parent",
+                "stage",
+                "fingerprint",
+                "value",
+            )
+        }
         size = 0
         for store in self.versioned:
             send = getattr(store, "send", None)
@@ -259,6 +273,59 @@ class TimeController:
             if receive is not None:
                 receive(archive["parts"], self.shelf.get(f"{archive['prefix']}/{store.archive_name}"))  # type: ignore[attr-defined]
         self.store.set_parts(cp["id"], archive["parts"])
+        return self._get(str(cp["id"]))
+
+    def import_archive(self, prefix: str, who: str = "unknown") -> dict:
+        """Make a checkpoint here from one on the shelf at `prefix`, whichever
+        fermenter archived it (`snapshots/<fermenter>/<id>`): its base first (the
+        same way), then its stream, received under a name of ours. Its stage,
+        fingerprint and value come along, so a script here reuses it; the workload
+        stays where it is. Importing one already here gives it back."""
+        with self.lock:
+            return self._import(prefix, who)
+
+    def _import(self, prefix: str, who: str) -> dict:
+        if self.shelf is None:
+            raise CheckpointError("this fermenter has no shelf to import from")
+        done = self.store.archived_at(self.shelf.url, prefix)
+        if done is not None:
+            cp = self._get(str(done))
+            return cp if cp["parts"] else self._unarchive(cp)
+        stores = [s for s in self.versioned if getattr(s, "archive_name", None)]
+        metas = [self.shelf.meta(f"{prefix}/{s.archive_name}") for s in stores]  # type: ignore[attr-defined]
+        if not stores or any(m is None for m in metas):
+            raise CheckpointError(f"nothing on the shelf at {prefix}")
+        meta = metas[0]
+        assert meta is not None
+        about = meta["checkpoint"]
+        base = None
+        if meta.get("base") is not None:
+            base = self._import(f"{prefix.rsplit('/', 1)[0]}/{meta['base']}", who)
+        cid = self.store.next_checkpoint_id()
+        parts: dict[str, str] = {}
+        for store in stores:
+            parts.update(store.parts_for(cid))  # type: ignore[attr-defined]
+        for store in stores:
+            store.receive(parts, self.shelf.get(f"{prefix}/{store.archive_name}"))  # type: ignore[attr-defined]
+        name = about.get("name")
+        if name and self.store.name_taken(name):
+            name = None  # ours already: the import goes by its id
+        cp = self.store.add_checkpoint(
+            name=name,
+            message=f"imported from {prefix}: {about.get('message')}",
+            kind=about.get("kind") or "imported",
+            who=who,
+            fake_time=about["fake_time"],
+            offset_seconds=int(about.get("offset_seconds") or 0),
+            parts=parts,
+            parent=base["id"] if base else None,
+            stage=about.get("stage"),
+            fingerprint=about.get("fingerprint"),
+            value=about.get("value"),
+            head=False,
+        )
+        self.store.add_archive(cp["id"], shelf=self.shelf.url, prefix=prefix, base=base["id"] if base else None,
+                               parts=parts, size=sum(int(m["bytes"]) for m in metas if m))  # fmt: skip
         return self._get(str(cp["id"]))
 
     def unarchive(self, ref: str) -> dict:

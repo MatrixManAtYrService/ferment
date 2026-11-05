@@ -348,8 +348,10 @@ class Store:
         stage: str | None = None,
         fingerprint: str | None = None,
         value: object = None,
+        head: bool = True,
     ) -> dict:
-        """Records it as the head too: what later ones descend from."""
+        """Records it as the head too (what later ones descend from), unless `head` is
+        off (one imported: the workload isn't on it)."""
         with self.lock:
             self.db.execute("BEGIN")
             try:
@@ -371,7 +373,8 @@ class Store:
                     ),  # fmt: skip
                 )
                 cid = int(cur.lastrowid)
-                self.db.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('head', ?)", (str(cid),))
+                if head:
+                    self.db.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('head', ?)", (str(cid),))
                 self.db.executemany(
                     "INSERT INTO checkpoint_parts (checkpoint_id, store, ref) VALUES (?, ?, ?)",
                     [(cid, store, ref) for store, ref in parts.items()],
@@ -457,6 +460,11 @@ class Store:
         if label:
             return self._rows("SELECT * FROM marks WHERE label LIKE ? ORDER BY id DESC LIMIT ?", f"{label}%", limit)
         return self._rows("SELECT * FROM marks ORDER BY id DESC LIMIT ?", limit)
+
+    def archived_at(self, shelf: str, prefix: str) -> int | None:
+        """The checkpoint whose archive is `prefix` on `shelf` (one taken here, or imported)."""
+        rows = self._rows("SELECT checkpoint_id FROM checkpoint_archives WHERE shelf = ? AND prefix = ?", shelf, prefix)
+        return rows[0]["checkpoint_id"] if rows else None
 
     def archives_based_on(self, checkpoint_id: int) -> list[int]:
         """Archived checkpoints taken relative to this one."""
