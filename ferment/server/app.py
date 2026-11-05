@@ -135,6 +135,7 @@ def create_app(
     measure: dict[str, Callable[[], dict]] | None = None,
     loki_url: str | None = None,
     log_files: Callable[[], dict[str, tuple[dict[str, str], Path]]] | None = None,
+    grafana_url: str | None = None,
 ) -> FastAPI:
     """`before_deploy(name, build, say)` runs before a service is (re)deployed,
     e.g. its schema migrations; raising stops the deploy. `services` lists
@@ -143,7 +144,9 @@ def create_app(
     `measure`: VM name -> a sample of it (ferment.measure), taken every
     interval and kept; default, this machine as "vm". `loki_url`: ship the
     workload's process logs there, and `log_files()` (stream name -> (labels,
-    path)), stamped with real time (ferment.server.telemetry)."""
+    path)), stamped with real time (ferment.server.telemetry). `grafana_url`:
+    post marks, clock sets, checkpoints, restores and deploys there as
+    annotations."""
     store = controller.store
     log_path = controller.state_dir / "logs" / "fermenter.jsonl"
     logs.configure(log_path)
@@ -188,8 +191,12 @@ def create_app(
             fake_now=controller.clock.now, real_now=clock_mod.real_now,
         )  # fmt: skip
 
+    annotations = telemetry.Annotations(grafana_url) if grafana_url else None
+
     def broadcast(event: str, who_: str, message: str, **fields) -> None:
         logs.broadcast(event, who_, message, **fields)
+        if annotations is not None:
+            annotations.event(event, message, clock_mod.real_now())
         publisher.post(event, who_, message, controller.clock.now().isoformat(timespec="seconds"), fields)
 
     def steps(group: str, keys: list[str], **labels: str) -> Steps:
@@ -385,13 +392,18 @@ def create_app(
     @app.post("/measure/marks")
     def start_mark(req: NewMark, request: Request):
         """Name a stretch of time from now (`POST /measure/marks/{id}/end` ends it)."""
-        return store.add_mark(req.label, who(request), clock_mod.real_now().isoformat())
+        mark = store.add_mark(req.label, who(request), clock_mod.real_now().isoformat())
+        if annotations is not None:
+            annotations.mark_started(mark)
+        return mark
 
     @app.post("/measure/marks/{mark_id}/end")
     def end_mark(mark_id: int):
         out = store.end_mark(mark_id, clock_mod.real_now().isoformat())
         if out is None:
             raise HTTPException(404, f"no mark {mark_id}")
+        if annotations is not None:
+            annotations.mark_ended(out)
         return out
 
     @app.get("/measure/marks")

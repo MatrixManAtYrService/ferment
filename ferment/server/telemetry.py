@@ -217,3 +217,58 @@ class LogShipper:
             except Exception as e:  # noqa: BLE001 - a bad round is a gap, not a dead shipper
                 print(f"logship: {e}", flush=True)
                 time.sleep(self.interval)
+
+
+# -- Grafana annotations ----------------------------------------------------------
+
+# Broadcast events worth a line on every panel (server/app.py's broadcast()).
+ANNOTATED = {"clock_changed", "checkpoint", "restored", "deployed", "deploy_failed", "undeployed"}
+
+
+class Annotations:
+    """Marks (as regions), clock sets, checkpoints, restores and deploys, as
+    Grafana annotations tagged `fermenter`, so they show on every dashboard
+    that asks for that tag. Posted in the background: Grafana being down
+    costs a missing annotation, never a slow request."""
+
+    def __init__(self, grafana_url: str, http: httpx.Client | None = None, background: bool = True):
+        self.url = grafana_url.rstrip("/") + "/api/annotations"
+        self.http = http or httpx.Client(timeout=10)
+        self.background = background
+
+    def _do(self, fn: Callable[[], object]) -> None:
+        def run() -> None:
+            try:
+                fn()
+            except httpx.HTTPError as e:
+                print(f"annotations: {e}", flush=True)
+
+        if self.background:
+            threading.Thread(target=run, name="annotate", daemon=True).start()
+        else:
+            run()
+
+    @staticmethod
+    def _ms(iso: str) -> int:
+        return int(dt.datetime.fromisoformat(iso).timestamp() * 1000)
+
+    def event(self, kind: str, message: str, at: dt.datetime) -> None:
+        if kind not in ANNOTATED:
+            return
+        body = {"time": int(at.timestamp() * 1000), "tags": ["fermenter", kind], "text": message}
+        self._do(lambda: self.http.post(self.url, json=body).raise_for_status())
+
+    def mark_started(self, mark: dict) -> None:
+        body = {"time": self._ms(mark["started"]), "tags": ["fermenter", "mark", f"mark-{mark['id']}"],
+                "text": f"mark {mark['id']}: {mark['label']}"}  # fmt: skip
+        self._do(lambda: self.http.post(self.url, json=body).raise_for_status())
+
+    def mark_ended(self, mark: dict) -> None:
+        def end() -> None:
+            found = self.http.get(self.url, params={"tags": f"mark-{mark['id']}", "limit": 1})
+            found.raise_for_status()
+            for a in found.json():
+                self.http.patch(f"{self.url}/{a['id']}", json={"timeEnd": self._ms(mark["ended"])}).raise_for_status()
+
+        if mark.get("ended"):
+            self._do(end)

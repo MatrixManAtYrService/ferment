@@ -137,3 +137,26 @@ def test_a_new_log_after_the_first_start_ships_from_its_beginning(tmp_path):
         http=_loki(pushed),
     )
     assert s.tick() == 1 and pushed[0]["stream"] == {"process": "event"}
+
+
+def test_annotations_mark_regions_and_notable_events():
+    from ferment.server.telemetry import Annotations
+
+    calls: list = []
+
+    def grafana(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path, json.loads(request.content) if request.content else None))
+        if request.method == "GET":
+            return httpx.Response(200, json=[{"id": 41}])
+        return httpx.Response(200, json={"id": 41})
+
+    a = Annotations("http://g/grafana", http=httpx.Client(transport=httpx.MockTransport(grafana)), background=False)
+    a.event("attached", "alice attached", dt.datetime(2026, 11, 5, tzinfo=UTC))  # not worth a line
+    a.event("restored", "restored checkpoint 6", dt.datetime(2026, 11, 5, tzinfo=UTC))
+    a.mark_started({"id": 3, "label": "experiment 7 (replay)", "started": "2026-11-05T10:00:00+00:00"})
+    a.mark_ended({"id": 3, "label": "experiment 7 (replay)", "started": "2026-11-05T10:00:00+00:00",
+                  "ended": "2026-11-05T11:00:00+00:00"})  # fmt: skip
+    assert [c[0] for c in calls] == ["POST", "POST", "GET", "PATCH"]
+    assert calls[0][2]["tags"] == ["fermenter", "restored"]
+    assert calls[1][2]["tags"] == ["fermenter", "mark", "mark-3"]
+    assert calls[3][1] == "/grafana/api/annotations/41" and calls[3][2] == {"timeEnd": 1793876400000}
