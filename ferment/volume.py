@@ -223,9 +223,22 @@ class Volume:
             raise VolumeError(f"no snapshot {sid}")
         self._btrfs("subvolume", "delete", str(self.live))
         self._btrfs("subvolume", "snapshot", str(path), str(self.live))
+        self._own(self.live)  # before anything here writes to it
         self._relayout()  # a checkpoint from before `dirs`
         for name in self.dirs:  # ...or from before one of them was kept here
             (self.live / name).mkdir(exist_ok=True)
+
+    def _own(self, path: Path) -> None:
+        """Make `path` this user's: a snapshot received from another volume
+        carries that machine's user ids (btrfs send keeps them; toaster's VM
+        user was uid 501, skillet's 1001), and MySQL, running as this user,
+        couldn't open its own binlog index. Checked at the top two levels;
+        only if those differ is the whole tree changed."""
+        me = (os.getuid(), os.getgid())
+        top = [path, *path.iterdir()] if path.is_dir() else [path]
+        if all((p.lstat().st_uid, p.lstat().st_gid) == me for p in top):
+            return
+        self.run(["sudo", "-n", "chown", "-R", f"{me[0]}:{me[1]}", str(path)])
 
     def delete(self, sid: str) -> None:
         path = self._snapshot_path(sid)

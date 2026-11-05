@@ -333,3 +333,24 @@ def test_send_and_receive_pipe_through_zstd_and_a_broken_stream_leaves_nothing(t
         v.send("ckpt-9")  # before any byte
     with pytest.raises(VolumeError, match="cat"):
         b"".join(v._stream(["cat", str(tmp_path / "missing")], 1 << 16))
+
+
+def test_a_restore_takes_over_data_another_machine_owned(tmp_path, monkeypatch):
+    """btrfs send keeps the sender's user ids: a checkpoint imported from
+    another fermenter is owned by its VM user, not this one."""
+    v, fake = _volume(tmp_path, monkeypatch)
+    v.ensure()
+    (tmp_path / "mysql84" / "binlog.index").write_text("./binlog.000001\n")
+    v.snapshot("ckpt-1")
+    v.restore("ckpt-1")
+
+    def taken_over():
+        return [c for c in fake.calls if c[2:4] == ["chown", "-R"]]
+
+    assert not taken_over()  # ours already: nothing to do
+
+    mine = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: mine + 1)  # as if the files came from another machine's user
+    v.restore("ckpt-1")
+    (chown,) = taken_over()
+    assert chown == ["sudo", "-n", "chown", "-R", f"{mine + 1}:{os.getgid()}", str(v.live)]
