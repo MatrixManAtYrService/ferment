@@ -79,6 +79,15 @@ fi
 """
 
 
+# Outgoing connections take their local port from the IANA dynamic range only
+# (49152 and up), never from below, where the workload's services listen: with
+# Linux's default (32768-60999), a connection that happened to hold a service's
+# port (Airflow's to the OTel collector, on billing-event's admin port) kept
+# that service from starting until the connection closed. A runtime setting,
+# re-applied after a reboot by _sync_guest.
+EPHEMERAL_PORTS = "sudo sysctl -qw net.ipv4.ip_local_port_range='49152 60999'\n"
+
+
 # The workload runs at the guest's own clock (ferment.server.clock), so
 # nothing may sync it back to real time: NixOS's timesyncd, and Lima's guest
 # agent, which sets the time on the host's behalf every few seconds. The agent
@@ -313,7 +322,7 @@ class LimaProvider(Provider):
     def _apply_guest_state(self, inst: dict) -> str:
         """Put recorded guest state in place (idempotent); returns the boot id."""
         record = inst["record"]
-        script = SSHD_KEEPALIVE + _keys_script(record.get("authorized_keys", []))
+        script = SSHD_KEEPALIVE + EPHEMERAL_PORTS + _keys_script(record.get("authorized_keys", []))
         if record.get("role") == "control":  # keeps real time, and reaches its workload VM
             script += control_ssh_script(record["workload"])
         else:  # runs the workload, at its clock
