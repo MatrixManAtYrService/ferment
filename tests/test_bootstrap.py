@@ -261,6 +261,14 @@ def test_limactl_runs_with_the_hosts_qemu():
     assert with_qemu == "QEMU_SYSTEM_X86_64=/home/f/w/bin/qemu-system-x86_64 /l start x"
 
 
+def test_a_host_can_keep_its_instances_in_a_lima_home_of_its_own(monkeypatch):
+    from ferment.vm.lima import LimaHost
+
+    monkeypatch.delenv("LIMA_HOME", raising=False)
+    assert LimaHost(None, lima_home="/srv/b lima").run('echo "${LIMA_HOME:-$HOME/.lima}"') == "/srv/b lima\n"
+    assert LimaHost(None).run('echo "${LIMA_HOME:-unset}"') == "unset\n"
+
+
 def test_images_are_fetched_by_digest():
     from ferment.vm.lima import IMAGES
 

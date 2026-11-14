@@ -199,14 +199,20 @@ class LimaHost:
     shell of the host (often zsh on macOS), so keep them POSIX. `qemu`: a
     qemu-system-<arch> for Lima to run instead of its own (ferment.bootstrap's
     wrapper), passed to every limactl (its host agent starts QEMU).
+    `lima_home`: Lima's directory for this host's instances (LIMA_HOME) instead
+    of ~/.lima, e.g. on a drive of its own: two hosts in the config can then
+    name the same machine and keep their VMs on different drives.
     """
 
-    def __init__(self, host: str | None, limactl: str = "limactl", qemu: str = ""):
+    def __init__(self, host: str | None, limactl: str = "limactl", qemu: str = "", lima_home: str = ""):
         self.host = host or None
         self.limactl = limactl
         self.qemu = qemu
+        self.lima_home = lima_home
 
     def run(self, script: str, *, input: str | None = None, capture: bool = True) -> str:
+        if self.lima_home:  # Every script: limactl, and the ${LIMA_HOME:-$HOME/.lima} lookups beside it.
+            script = f"export LIMA_HOME={shlex.quote(self.lima_home)}; {script}"
         argv = ["ssh", "-o", "BatchMode=yes", self.host, "--", script] if self.host else ["bash", "-c", script]
         try:
             result = subprocess.run(argv, input=input, text=True, capture_output=capture, check=True)
@@ -241,14 +247,15 @@ class LimaProvider(Provider):
         vm_type: str = "vz",
         image: str = "",
         qemu: str = "",
+        lima_home: str = "",
     ):
         """cpus, memory_gib, disk_gib: the VM that runs the workload (the only
         VM, or a split fermenter's workload VM). control_*: a split
         fermenter's control VM (the server, builds, the archive).
         cache_locations: cache name -> a directory on the Lima host for it
-        other than cache_root/<name>. vm_type, image: as lima_config. qemu:
-        as LimaHost."""
-        self.lima = LimaHost(host, limactl, qemu)
+        other than cache_root/<name>. vm_type, image: as lima_config. qemu,
+        lima_home: as LimaHost."""
+        self.lima = LimaHost(host, limactl, qemu, lima_home)
         self.vm_type = vm_type
         self.image = image
         self.cache_root = cache_root
